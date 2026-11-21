@@ -3,13 +3,23 @@
 
 //! Where a node keeps the encrypted data its friends back up to it.
 
-use crate::crypto::Id;
-use anyhow::{Result, bail};
+use crate::{
+    crypto::Id,
+    proto::{ID_BATCH, MAX_BLOB, MAX_MSG, MAX_SNAPSHOT},
+};
+use anyhow::{Result, anyhow, bail};
+use rustix::{
+    fs::{AtFlags, FileType, Mode, OFlags},
+    io::Errno,
+};
 use std::{
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-    sync::Mutex,
+    collections::{HashMap, HashSet},
+    ffi::OsStr,
+    fs, io,
+    io::{Read, Write},
+    os::fd::{AsFd, OwnedFd},
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 /// Header of every stored chunk file: magic plus layout version.
@@ -18,27 +28,77 @@ const FILE_MAGIC: &[u8; 5] = b"SDBC\x01";
 /// Most restore points one owner may keep here, so tiny files cannot exhaust the disk's inodes.
 const MAX_SNAPSHOTS: usize = 50_000;
 
+/// The largest file the store ever writes: a chunk with its header and checksum.
+const MAX_FILE: usize = MAX_BLOB + 37;
+
+type Locks = Mutex<HashMap<String, Arc<Mutex<()>>>>;
+
+/// What the store knows about one owner's usage.
+#[derive(Default)]
+struct Count {
+    /// Bytes counted against their quota; None until their folder has been walked.
+    used: Option<u64>,
+    /// Bumped as each change to their files starts and ends, so a walk that overlapped a change
+    /// is not remembered.
+    generation: u64,
+    /// Changes under way.
+    open: u32,
+}
+
 pub struct Store {
     root: PathBuf,
     /// Writes are refused once the disk has less free space than this.
     min_free: u64,
-    usage: Mutex<HashMap<String, u64>>,
+    usage: Mutex<HashMap<String, Count>>,
+    /// One lock per owner, held while their files and their usage count change together.
+    /// Only ever taken off the async workers.
+    locks: Locks,
+    /// One first walk per owner at a time. Never held while taking an owner's lock.
+    walks: Locks,
+    /// Owners whose data was deleted on purpose; nothing is stored for them until they pair again.
+    banned: Mutex<HashSet<String>>,
 }
 
 /// What a stored file counts against a quota: never less than a disk block,
 /// so a flood of tiny files cannot hide inside a byte quota.
-fn cost(len: u64) -> u64 {
+pub fn cost(len: u64) -> u64 {
     len.max(4096)
 }
 
 fn dir_size(p: &Path) -> u64 {
     walkdir::WalkDir::new(p)
+        .follow_root_links(false)
         .into_iter()
         .flatten()
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| e.metadata().ok())
         .map(|m| cost(m.len()))
         .sum()
+}
+
+fn lock_in(locks: &Locks, owner: &str) -> Arc<Mutex<()>> {
+    locks.lock().unwrap().entry(owner.to_string()).or_default().clone()
+}
+
+fn is_file(st: &rustix::fs::Stat) -> bool {
+    FileType::from_raw_mode(st.st_mode).is_file()
+}
+
+/// Reads at most `max` bytes of a regular file. Type and size come from the open file itself,
+/// so a file swapped for a link, a device or a pipe after any check is not read.
+fn read_open(f: fs::File, max: usize) -> Option<Vec<u8>> {
+    let md = f.metadata().ok()?;
+    if !md.is_file() || md.len() > max as u64 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(md.len() as usize);
+    f.take(md.len()).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Opening never follows a link and never waits on a pipe.
+fn read_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
 }
 
 pub fn check_owner(owner: &str) -> Result<()> {
@@ -48,7 +108,7 @@ pub fn check_owner(owner: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_snap(id: &str) -> Result<()> {
+pub fn check_snap(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("bad snapshot id");
     }
@@ -57,11 +117,72 @@ fn check_snap(id: &str) -> Result<()> {
 
 impl Store {
     pub fn new(root: PathBuf, min_free: u64) -> Self {
-        use std::os::unix::fs::PermissionsExt;
         if fs::create_dir_all(&root).is_ok() {
-            let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+            // Through a handle that refuses a link, so a link swapped in cannot redirect the change.
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let _ = rustix::fs::open(&root, flags, Mode::empty()).and_then(|d| rustix::fs::fchmod(d, Mode::RWXU));
         }
-        Store { root, min_free, usage: Mutex::new(HashMap::new()) }
+        Store {
+            root,
+            min_free,
+            usage: Mutex::new(HashMap::new()),
+            locks: Mutex::new(HashMap::new()),
+            walks: Mutex::new(HashMap::new()),
+            banned: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn lock(&self, owner: &str) -> Arc<Mutex<()>> {
+        lock_in(&self.locks, owner)
+    }
+
+    /// Opens a folder under the root one step at a time, never following a link, so a link
+    /// planted (or swapped in after a check) anywhere below the root is refused, not followed.
+    fn open_dir(&self, dir: &Path, create: bool) -> io::Result<OwnedFd> {
+        let rel = dir.strip_prefix(&self.root).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut fd = rustix::fs::open(&self.root, flags, Mode::empty())?;
+        for c in rel.components() {
+            let Component::Normal(name) = c else { return Err(io::ErrorKind::InvalidInput.into()) };
+            let flags = flags | OFlags::NOFOLLOW;
+            fd = match rustix::fs::openat(&fd, name, flags, Mode::empty()) {
+                Err(Errno::NOENT) if create => {
+                    match rustix::fs::mkdirat(&fd, name, Mode::RWXU) {
+                        Ok(()) | Err(Errno::EXIST) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    rustix::fs::openat(&fd, name, flags, Mode::empty())?
+                }
+                r => r?,
+            };
+        }
+        Ok(fd)
+    }
+
+    fn read_at(dir: impl AsFd, name: &OsStr, max: usize) -> Option<Vec<u8>> {
+        read_open(fs::File::from(rustix::fs::openat(dir, name, read_flags(), Mode::empty()).ok()?), max)
+    }
+
+    /// Reads a regular file of at most `max` bytes that sits in plain folders under the root.
+    fn read_plain(&self, path: &Path, max: usize) -> Option<Vec<u8>> {
+        Self::read_at(self.open_dir(path.parent()?, false).ok()?, path.file_name()?, max)
+    }
+
+    /// Removes one stored file and returns what it counted; None if no regular file is there.
+    fn remove(&self, path: &Path) -> io::Result<Option<u64>> {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Ok(None) };
+        let dir = match self.open_dir(dir, false) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            r => r?,
+        };
+        match rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if is_file(&st) => {
+                rustix::fs::unlinkat(&dir, name, AtFlags::empty())?;
+                Ok(Some(cost(st.st_size as u64)))
+            }
+            Ok(_) | Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn chunk_path(&self, owner: &str, id: &Id) -> PathBuf {
@@ -75,36 +196,105 @@ impl Store {
 
     pub fn usage(&self, owner: &str) -> Result<u64> {
         check_owner(owner)?;
-        let mut u = self.usage.lock().unwrap();
-        Ok(*u.entry(owner.to_string()).or_insert_with(|| dir_size(&self.root.join(owner))))
+        Ok(self.used(owner))
     }
 
-    fn adjust(&self, owner: &str, delta: i64) {
-        if let Some(u) = self.usage.lock().unwrap().get_mut(owner) {
-            *u = u.saturating_add_signed(delta);
+    /// The owner's usage if it has been counted already. Never walks their folder, so views
+    /// may call it from the async workers.
+    pub fn usage_known(&self, owner: &str) -> Option<u64> {
+        check_owner(owner).ok()?;
+        self.counted(owner, |c| c.used)
+    }
+
+    fn counted<T>(&self, owner: &str, f: impl FnOnce(&mut Count) -> T) -> T {
+        f(self.usage.lock().unwrap().entry(owner.to_string()).or_default())
+    }
+
+    /// The owner's usage. The first count walks their folder without holding their lock, so
+    /// it stalls neither their other requests' bookkeeping nor this node's own views; a walk
+    /// that overlapped a change still answers, but is not remembered.
+    fn used(&self, owner: &str) -> u64 {
+        if let Some(n) = self.counted(owner, |c| c.used) {
+            return n;
         }
+        let walk = lock_in(&self.walks, owner);
+        let _one = walk.lock().unwrap();
+        let start = match self.counted(owner, |c| c.used.ok_or((c.generation, c.open))) {
+            Ok(n) => return n,
+            Err(start) => start,
+        };
+        let n = dir_size(&self.root.join(owner));
+        self.counted(owner, |c| match c.used {
+            Some(u) => u,
+            None => {
+                if start == (c.generation, 0) && c.open == 0 {
+                    c.used = Some(n);
+                }
+                n
+            }
+        })
     }
 
+    /// Makes one change to an owner's files, returning its result and its effect on their
+    /// usage, and keeps the count in step. The caller holds the owner's lock.
+    fn change<T>(&self, owner: &str, f: impl FnOnce() -> (T, i64)) -> T {
+        self.counted(owner, |c| {
+            c.generation += 1;
+            c.open += 1;
+        });
+        let (out, delta) = f();
+        self.counted(owner, |c| {
+            c.used = c.used.map(|u| u.saturating_add_signed(delta));
+            c.generation += 1;
+            c.open -= 1;
+        });
+        out
+    }
+
+    /// Stores one file for an owner; the caller holds the owner's lock.
     fn write(&self, owner: &str, path: &Path, data: &[u8], quota: u64) -> Result<()> {
-        let old = fs::metadata(path).map(|m| cost(m.len())).unwrap_or(0);
+        check_owner(owner)?;
+        if self.banned.lock().unwrap().contains(owner) {
+            bail!("you are not on this node's friend list");
+        }
+        let name = path.file_name().unwrap();
+        // Every step goes through this handle, so nothing swapped in above it can redirect the write.
+        let dir = self
+            .open_dir(path.parent().unwrap(), true)
+            .map_err(|e| anyhow!("the store folder has been tampered with or cannot be opened ({e})"))?;
+        let old = match rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if is_file(&st) => cost(st.st_size as u64),
+            _ => 0,
+        };
         let new = cost(data.len() as u64);
-        if self.usage(owner)? - old.min(self.usage(owner)?) + new > quota {
+        if self.used(owner).saturating_sub(old) + new > quota {
             bail!("storage quota exceeded ({} GB)", quota >> 30);
         }
         if self.min_free > 0 && fs2::available_space(&self.root).is_ok_and(|free| free < self.min_free + new) {
             bail!("this computer is too low on disk space to accept more backups");
         }
-        fs::create_dir_all(path.parent().unwrap())?;
-        let tmp = path.with_extension(format!("tmp{}", rand::random::<u32>()));
-        fs::write(&tmp, data)?;
-        fs::rename(&tmp, path)?;
-        self.adjust(owner, new as i64 - old as i64);
+        let mut tmp = name.to_os_string();
+        tmp.push(format!(".tmp{}", rand::random::<u64>()));
+        let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        self.change(owner, || {
+            let res = (|| -> io::Result<()> {
+                fs::File::from(rustix::fs::openat(&dir, &tmp, flags, Mode::RUSR | Mode::WUSR)?).write_all(data)?;
+                Ok(rustix::fs::renameat(&dir, &tmp, &dir, name)?)
+            })();
+            if res.is_err() {
+                let _ = rustix::fs::unlinkat(&dir, &tmp, AtFlags::empty());
+            }
+            let delta = if res.is_ok() { new as i64 - old as i64 } else { 0 };
+            (res, delta)
+        })?;
         Ok(())
     }
 
     pub fn put_chunk(&self, owner: &str, id: &Id, data: &[u8], quota: u64) -> Result<()> {
+        let lock = self.lock(owner);
+        let _held = lock.lock().unwrap();
         let p = self.chunk_path(owner, id);
-        if p.exists() {
+        if fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
             return Ok(());
         }
         // A checksum of the ciphertext rides along so this node can spot disk rot without any key.
@@ -124,11 +314,14 @@ impl Store {
     /// Returns a chunk only if it still matches its checksum; a damaged one is dropped so the owner sees it as missing.
     pub fn get_chunk(&self, owner: &str, id: &Id) -> Option<Vec<u8>> {
         let p = self.chunk_path(owner, id);
-        let mut buf = fs::read(&p).ok()?;
+        let mut buf = self.read_plain(&p, MAX_FILE)?;
         if !Self::intact(&buf) {
-            if fs::remove_file(&p).is_ok() {
-                self.adjust(owner, -(cost(buf.len() as u64) as i64));
-            }
+            let lock = self.lock(owner);
+            let _held = lock.lock().unwrap();
+            self.change(owner, || {
+                let gone = self.remove(&p).ok().flatten();
+                ((), -(gone.unwrap_or(0) as i64))
+            });
             return None;
         }
         buf.truncate(buf.len() - 32);
@@ -138,11 +331,13 @@ impl Store {
 
     /// Re-reads everything friends store here and removes chunks that no longer match their checksum.
     pub fn scrub(&self) -> (u64, u64) {
+        use std::os::unix::fs::OpenOptionsExt;
         let (mut checked, mut bad) = (0, 0);
         for e in
             walkdir::WalkDir::new(&self.root).min_depth(4).into_iter().flatten().filter(|e| e.file_type().is_file())
         {
-            let Ok(buf) = fs::read(e.path()) else {
+            let opened = fs::OpenOptions::new().read(true).custom_flags(read_flags().bits() as i32).open(e.path());
+            let Some(buf) = opened.ok().and_then(|f| read_open(f, MAX_FILE)) else {
                 continue;
             };
             checked += 1;
@@ -152,61 +347,102 @@ impl Store {
             }
         }
         if bad > 0 {
-            self.usage.lock().unwrap().clear();
+            for c in self.usage.lock().unwrap().values_mut() {
+                c.used = None;
+                c.generation += 1;
+            }
         }
         (checked, bad)
     }
 
-    pub fn list_chunks(&self, owner: &str) -> Vec<Id> {
-        walkdir::WalkDir::new(self.root.join(owner).join("chunks"))
+    /// Hands every chunk id an owner keeps here to `each`, a batch at a time, until it returns
+    /// false. Nothing is gathered in memory, however many chunks there are.
+    pub fn list_chunks(&self, owner: &str, mut each: impl FnMut(Vec<Id>) -> bool) {
+        let dir = self.root.join(owner).join("chunks");
+        if self.open_dir(&dir, false).is_err() {
+            return;
+        }
+        let ids = walkdir::WalkDir::new(dir)
+            .follow_root_links(false)
             .min_depth(2)
+            .max_depth(2)
             .into_iter()
             .flatten()
-            .filter_map(|e| hex::decode(e.file_name().to_str()?).ok()?.try_into().ok())
-            .collect()
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| hex::decode(e.file_name().to_str()?).ok()?.try_into().ok());
+        let mut batch = Vec::with_capacity(ID_BATCH);
+        for id in ids {
+            batch.push(id);
+            if batch.len() == ID_BATCH && !each(std::mem::replace(&mut batch, Vec::with_capacity(ID_BATCH))) {
+                return;
+            }
+        }
+        if !batch.is_empty() {
+            each(batch);
+        }
     }
 
+    /// Takes the owner's lock per chunk, so a long delete never keeps their other requests waiting for long.
     pub fn delete_chunks(&self, owner: &str, ids: &[Id]) {
+        let lock = self.lock(owner);
         for id in ids {
             let p = self.chunk_path(owner, id);
-            if let Ok(m) = fs::metadata(&p) {
-                if fs::remove_file(&p).is_ok() {
-                    self.adjust(owner, -(cost(m.len()) as i64));
-                }
-            }
+            let _held = lock.lock().unwrap();
+            self.change(owner, || {
+                let gone = self.remove(&p).ok().flatten();
+                ((), -(gone.unwrap_or(0) as i64))
+            });
         }
     }
 
     pub fn put_snapshot(&self, owner: &str, id: &str, data: &[u8], quota: u64) -> Result<()> {
         check_snap(id)?;
+        if data.len() > MAX_SNAPSHOT {
+            bail!("restore point record too large");
+        }
+        let lock = self.lock(owner);
+        let _held = lock.lock().unwrap();
         let path = self.snap_dir(owner).join(id);
-        if !path.exists() && fs::read_dir(self.snap_dir(owner)).map(|d| d.count()).unwrap_or(0) >= MAX_SNAPSHOTS {
+        if fs::symlink_metadata(&path).is_err()
+            && fs::read_dir(self.snap_dir(owner)).map(|d| d.count()).unwrap_or(0) >= MAX_SNAPSHOTS
+        {
             bail!("too many restore points stored here; prune some first");
         }
         self.write(owner, &path, data, quota)
     }
 
-    pub fn list_snapshots(&self, owner: &str) -> Vec<(String, Vec<u8>)> {
-        let Ok(rd) = fs::read_dir(self.snap_dir(owner)) else {
-            return vec![];
+    /// Every restore point record an owner keeps here. Fails rather than build a reply
+    /// larger than one message may be.
+    pub fn list_snapshots(&self, owner: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let dir = self.snap_dir(owner);
+        let (Ok(fd), Ok(rd)) = (self.open_dir(&dir, false), fs::read_dir(&dir)) else {
+            return Ok(vec![]);
         };
-        rd.flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                check_snap(&name).ok()?;
-                Some((name, fs::read(e.path()).ok()?))
-            })
-            .collect()
+        let (mut out, mut total) = (vec![], 0usize);
+        for e in rd.flatten() {
+            let Ok(name) = e.file_name().into_string() else { continue };
+            if check_snap(&name).is_err() {
+                continue;
+            }
+            let Some(data) = Self::read_at(&fd, name.as_ref(), MAX_SNAPSHOT) else { continue };
+            total += data.len() + name.len() + 16;
+            if total > MAX_MSG - (1 << 20) {
+                bail!("too many restore points are stored here to list; delete some");
+            }
+            out.push((name, data));
+        }
+        Ok(out)
     }
 
     pub fn delete_snapshot(&self, owner: &str, id: &str) -> Result<()> {
         check_snap(id)?;
+        let lock = self.lock(owner);
+        let _held = lock.lock().unwrap();
         let p = self.snap_dir(owner).join(id);
-        if let Ok(m) = fs::metadata(&p) {
-            fs::remove_file(&p)?;
-            self.adjust(owner, -(cost(m.len()) as i64));
-        }
-        Ok(())
+        self.change(owner, || match self.remove(&p) {
+            Ok(gone) => (Ok(()), -(gone.unwrap_or(0) as i64)),
+            Err(e) => (Err(anyhow!("cannot delete restore point: {e}")), 0),
+        })
     }
 
     /// When this owner last stored a restore point here.
@@ -220,14 +456,25 @@ impl Store {
             .and_then(|t| Some(t.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64))
     }
 
+    /// Deletes everything an owner stored here and refuses more until `allow` is called for them.
     pub fn forget_owner(&self, owner: &str) -> Result<()> {
         check_owner(owner)?;
-        self.usage.lock().unwrap().remove(owner);
+        let lock = self.lock(owner);
+        let _held = lock.lock().unwrap();
+        self.banned.lock().unwrap().insert(owner.to_string());
         let p = self.root.join(owner);
-        if p.exists() {
-            fs::remove_dir_all(p)?;
-        }
-        Ok(())
+        // Counted afresh next time; the bump also discards any walk running now.
+        let res = self.change(owner, || {
+            let res = if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) { fs::remove_dir_all(p) } else { Ok(()) };
+            self.counted(owner, |c| c.used = None);
+            (res, 0)
+        });
+        Ok(res?)
+    }
+
+    /// Lets an owner store here again after pairing anew.
+    pub fn allow(&self, owner: &str) {
+        self.banned.lock().unwrap().remove(owner);
     }
 }
 
@@ -236,6 +483,15 @@ mod tests {
     use super::*;
 
     const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn ids(s: &Store) -> Vec<Id> {
+        let mut v = vec![];
+        s.list_chunks(OWNER, |b| {
+            v.extend(b);
+            true
+        });
+        v
+    }
 
     fn store(min_free: u64) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("sdb-test-store-{}", rand::random::<u64>()));
@@ -248,10 +504,10 @@ mod tests {
         s.put_chunk(OWNER, &[1; 32], b"ciphertext", 1 << 20).unwrap();
         s.put_chunk(OWNER, &[1; 32], b"ignored: already stored", 1 << 20).unwrap();
         assert_eq!(s.get_chunk(OWNER, &[1; 32]).unwrap(), b"ciphertext");
-        assert_eq!(s.list_chunks(OWNER), vec![[1u8; 32]]);
+        assert_eq!(ids(&s), vec![[1u8; 32]]);
         assert!(s.get_chunk(OWNER, &[2; 32]).is_none());
         s.delete_chunks(OWNER, &[[1; 32]]);
-        assert!(s.list_chunks(OWNER).is_empty());
+        assert!(ids(&s).is_empty());
         assert_eq!(s.usage(OWNER).unwrap(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -268,9 +524,9 @@ mod tests {
             fs::write(&path, raw).unwrap();
         }
         assert!(s.get_chunk(OWNER, &[3; 32]).is_none(), "a damaged chunk must not be served");
-        assert_eq!(s.list_chunks(OWNER), vec![[4u8; 32]], "and it is removed so the owner sees it missing");
+        assert_eq!(ids(&s), vec![[4u8; 32]], "and it is removed so the owner sees it missing");
         assert_eq!(s.scrub(), (1, 1));
-        assert!(s.list_chunks(OWNER).is_empty());
+        assert!(ids(&s).is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -300,10 +556,10 @@ mod tests {
             assert!(s.delete_snapshot(OWNER, bad).is_err(), "{bad:?}");
         }
         s.put_snapshot(OWNER, "abc123", b"manifest", 1 << 20).unwrap();
-        assert_eq!(s.list_snapshots(OWNER), vec![("abc123".to_string(), b"manifest".to_vec())]);
+        assert_eq!(s.list_snapshots(OWNER).unwrap(), vec![("abc123".to_string(), b"manifest".to_vec())]);
         assert!(s.last_snapshot(OWNER).is_some());
         s.delete_snapshot(OWNER, "abc123").unwrap();
-        assert!(s.list_snapshots(OWNER).is_empty());
+        assert!(s.list_snapshots(OWNER).unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -312,6 +568,62 @@ mod tests {
         let (s, dir) = store(u64::MAX / 2);
         let err = s.put_chunk(OWNER, &[1; 32], b"x", 1 << 30).unwrap_err().to_string();
         assert!(err.contains("low on disk space"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writes_and_deletes_keep_the_count_right() {
+        let (s, dir) = store(0);
+        let s = Arc::new(s);
+        let quota = 64 << 10;
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for i in 0..200u32 {
+                        let _ = s.put_snapshot(OWNER, "aa", &vec![t; 5000 + (i as usize % 7) * 1000], quota);
+                        let _ = s.delete_snapshot(OWNER, "aa");
+                        let _ = s.put_chunk(OWNER, &[t; 32], &[t; 3000], quota);
+                        s.delete_chunks(OWNER, &[[t; 32]]);
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(s.usage(OWNER).unwrap(), dir_size(&dir.join(OWNER)), "the count matches the disk");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn links_planted_in_the_store_are_not_followed() {
+        let (s, dir) = store(0);
+        let outside = dir.with_extension("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big"), vec![0u8; 100]).unwrap();
+        fs::create_dir_all(dir.join(OWNER)).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(OWNER).join("chunks")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(OWNER).join("snapshots")).unwrap();
+        assert!(s.put_chunk(OWNER, &[1; 32], b"x", 1 << 20).is_err());
+        assert!(s.put_snapshot(OWNER, "abc", b"m", 1 << 20).is_err());
+        assert!(ids(&s).is_empty());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1, "nothing was written through the link");
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn oversize_records_and_forgotten_owners_are_refused() {
+        let (s, dir) = store(0);
+        assert!(s.put_snapshot(OWNER, "abc", &vec![0u8; MAX_SNAPSHOT + 1], 1 << 30).is_err());
+        s.put_snapshot(OWNER, "abc", b"m", 1 << 30).unwrap();
+        // A record that grew on disk behind our back is not read into memory.
+        fs::write(s.snap_dir(OWNER).join("abd"), vec![0u8; MAX_SNAPSHOT + 1]).unwrap();
+        assert_eq!(s.list_snapshots(OWNER).unwrap().len(), 1);
+        s.forget_owner(OWNER).unwrap();
+        assert!(s.put_chunk(OWNER, &[1; 32], b"x", 1 << 20).is_err(), "no uploads after a purge");
+        assert!(!dir.join(OWNER).exists());
+        s.allow(OWNER);
+        s.put_chunk(OWNER, &[1; 32], b"x", 1 << 20).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 }

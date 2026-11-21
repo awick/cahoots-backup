@@ -3,7 +3,10 @@
 
 use crate::{
     backup,
-    config::{BackupSet, Config, DEFAULT_SET, Friend, Identity, Invite, Retention, VersionRule},
+    config::{
+        BackupSet, Config, DEFAULT_SET, EVERYWHERE, Friend, Identity, Invite, NOWHERE, Retention, VersionRule,
+        write_private,
+    },
     crypto::{Id, Keys},
     net::{self, Handler, Link, Peer},
     proto::{ALPN, Req},
@@ -29,8 +32,14 @@ pub struct Out(pub mpsc::UnboundedSender<String>);
 
 impl Out {
     pub fn say(&self, s: impl Into<String>) {
-        let _ = self.0.send(s.into());
+        let _ = self.0.send(clean(&s.into()));
     }
+}
+
+/// Text for a terminal or the one-line-per-message control socket: names of files and
+/// words from other nodes may hold line breaks or escape codes, which become `?`.
+pub fn clean(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -221,6 +230,11 @@ pub struct Node {
     /// Absent means nothing is waiting to be sent; `i64::MAX` means held (paused or outside its hours).
     pub next: Mutex<HashMap<String, i64>>,
     pub op: tokio::sync::Mutex<()>,
+    /// "destination|id" of deleted restore points a destination still offered and was asked
+    /// again to drop during this run; it is not asked twice.
+    asked_gone: Mutex<HashSet<String>>,
+    /// Destinations with such a request still going.
+    deleting: Mutex<HashSet<String>>,
     paired: Notify,
     pub cfg_changed: Notify,
     pub daemon: bool,
@@ -237,13 +251,21 @@ fn clean_name(name: &str) -> String {
     if s.is_empty() { "friend".into() } else { s }
 }
 
+fn refuse_reserved(name: &str) -> Result<()> {
+    if crate::config::reserved(name) {
+        bail!("\"{name}\" has a special meaning in destination lists; choose another name");
+    }
+    Ok(())
+}
+
 fn add_friend(c: &mut Config, id: &str, name: &str, relay: Option<String>, addrs: Vec<SocketAddr>) -> String {
     if let Some(f) = c.friends.iter_mut().find(|f| f.id == id) {
         f.relay = relay;
         f.addrs = addrs;
         return f.name.clone();
     }
-    let base = clean_name(name);
+    // The name is the friend's choice, so a reserved word quietly becomes a plain one.
+    let base = Some(clean_name(name)).filter(|b| !crate::config::reserved(b)).unwrap_or_else(|| "friend".into());
     let mut name = base.clone();
     let mut n = 2;
     while c.friends.iter().any(|f| f.name == name) {
@@ -260,8 +282,17 @@ fn add_friend(c: &mut Config, id: &str, name: &str, relay: Option<String>, addrs
         every_minutes: 0,
         max_in_kbps: 0,
         path: None,
+        drive_key: None,
     });
     name
+}
+
+/// Direct addresses from an invite or a friend, at most a few, and outside offline tests only
+/// public ones: a code from someone else must not aim our packets into our own network. The
+/// relay still finds a friend on the same network.
+fn dialable(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let offline = net::offline();
+    addrs.iter().filter(|a| a.port() != 0 && (offline || net::public_ip(a.ip()))).take(8).copied().collect()
 }
 
 fn sig(chunks: &[Id], size: u64) -> u64 {
@@ -284,7 +315,7 @@ impl Node {
         let master = Identity::bytes(&ident.master)?;
         let node = Arc::new_cyclic(|me| Node {
             me: me.clone(),
-            store: Store::new(cfg.store_dir(&home), cfg.min_free_gb << 30),
+            store: Store::new(cfg.store_dir(&home), cfg.min_free_gb.saturating_mul(1 << 30)),
             keys: Arc::new(Keys::new(&master)),
             home,
             cfg: Mutex::new(cfg),
@@ -301,6 +332,8 @@ impl Node {
             quit: Notify::new(),
             next: Default::default(),
             op: Default::default(),
+            asked_gone: Default::default(),
+            deleting: Default::default(),
             paired: Notify::new(),
             cfg_changed: Notify::new(),
             daemon,
@@ -325,6 +358,63 @@ impl Node {
 
     pub fn id(&self) -> String {
         self.endpoint.id().to_string()
+    }
+
+    /// The friend with this node id, if they are (still) one.
+    pub fn friend(&self, id: &str) -> Option<Friend> {
+        self.cfg.lock().unwrap().friends.iter().find(|f| f.id == id && f.path.is_none()).cloned()
+    }
+
+    fn forgotten_path(&self) -> PathBuf {
+        self.home.join("forgotten.json")
+    }
+
+    /// Restore points deleted on purpose: an id everywhere, or "destination|id" at one place.
+    /// A destination that still offers one is not believed.
+    fn forgotten(&self) -> HashSet<String> {
+        fs::read(self.forgotten_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    fn forget_ids(&self, keys: impl IntoIterator<Item = String>) {
+        let mut all = self.forgotten();
+        all.extend(keys);
+        let _ = write_private(&self.forgotten_path(), &serde_json::to_vec(&all).unwrap_or_default());
+    }
+
+    /// Makes sure the disk at a drive's path is the one that was added, marking it on first use.
+    fn check_drive(&self, f: &Friend, dir: &Path) -> Result<()> {
+        use std::io::Write;
+        let mark = dir.join("sdb-drive-id");
+        let key = self.cfg.lock().unwrap().friends.iter().find(|x| x.id == f.id).and_then(|x| x.drive_key.clone());
+        let found = fs::symlink_metadata(&mark)
+            .ok()
+            .filter(|m| m.is_file() && m.len() <= 128)
+            .and_then(|_| fs::read_to_string(&mark).ok());
+        match (key, found) {
+            (Some(k), Some(d)) if d.trim() == k => Ok(()),
+            (Some(_), _) => bail!(
+                "{}: the disk at {} is not the one that was added; to use this one run `sdb drive {} {}`",
+                f.name,
+                dir.display(),
+                f.name,
+                f.path.as_deref().unwrap_or(dir).display()
+            ),
+            (None, _) => {
+                let key = hex::encode(rand::random::<[u8; 16]>());
+                let _ = fs::remove_file(&mark);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&mark)
+                    .and_then(|mut m| m.write_all(key.as_bytes()))
+                    .with_context(|| mark.display().to_string())?;
+                self.update(|c| {
+                    if let Some(x) = c.friends.iter_mut().find(|x| x.id == f.id) {
+                        x.drive_key = Some(key);
+                    }
+                })
+            }
+        }
     }
 
     /// Closes every open invite; used when someone keeps guessing at them.
@@ -357,11 +447,15 @@ impl Node {
     pub async fn peer(&self, f: &Friend) -> Result<Peer> {
         if let Some(path) = &f.path {
             let dir = path.join("sdb-store");
-            if !dir.is_dir() {
-                bail!("{}: drive is not connected ({} not found)", f.name, dir.display());
+            match fs::symlink_metadata(&dir) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => bail!("{}: {} is a link or a file, refusing to use it", f.name, dir.display()),
+                Err(_) => bail!("{}: drive is not connected ({} not found)", f.name, dir.display()),
             }
-            let store =
-                self.drives.lock().unwrap().entry(dir.clone()).or_insert_with(|| Arc::new(Store::new(dir, 0))).clone();
+            let mut drives = self.drives.lock().unwrap();
+            self.check_drive(f, &dir)?;
+            let store = drives.entry(dir.clone()).or_insert_with(|| Arc::new(Store::new(dir, 0))).clone();
+            drop(drives);
             return Ok(Peer { friend: f.clone(), link: Link::Drive(store, self.id()) });
         }
         if let Some(c) = self.conns.lock().unwrap().get(&f.id) {
@@ -369,7 +463,7 @@ impl Node {
                 return Ok(Peer { friend: f.clone(), link: Link::Remote(c.clone()) });
             }
         }
-        let addr = net::endpoint_addr(&f.id, &f.relay, &f.addrs)?;
+        let addr = net::endpoint_addr(&f.id, &f.relay, &dialable(&f.addrs))?;
         // An unreachable friend is not retried for a while, so one offline friend does not slow everything down.
         if self.down.lock().unwrap().get(&f.id).is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
             bail!("{}: offline", f.name);
@@ -517,6 +611,7 @@ impl Node {
         let peers = self.peers(only, out).await;
         let mut map: BTreeMap<String, Snap> = BTreeMap::new();
         let mut live = vec![];
+        let gone = self.forgotten();
         for p in peers {
             let list = match p.list_snapshots().await {
                 Ok(l) => l,
@@ -525,7 +620,13 @@ impl Node {
                     continue;
                 }
             };
+            let mut stale = vec![];
             for (id, blob) in list {
+                if gone.contains(&id) || gone.contains(&format!("{}|{id}", p.friend.id)) {
+                    // Deleted on purpose earlier: do not let it come back, and ask again.
+                    stale.push(id);
+                    continue;
+                }
                 let Ok(mut m) = self.open_manifest(&id, &blob) else {
                     out.say(format!("  {}: restore point {id} is damaged", p.friend.name));
                     continue;
@@ -537,11 +638,50 @@ impl Node {
                 }
                 s.peers.push((p.friend.clone(), m.index));
             }
+            if p.friend.path.is_some() {
+                // Our own drive answers at once and cannot stall us.
+                for id in &stale {
+                    let _ = p.delete_snapshot(id).await;
+                }
+            } else {
+                self.redelete(&p, stale);
+            }
             live.push(p);
         }
         let mut snaps: Vec<Snap> = map.into_values().collect();
         snaps.sort_by_key(|s| (s.m.time, s.m.nanos));
         Ok((snaps, live))
+    }
+
+    /// Asks a destination again, in the background, to drop restore points it still offers
+    /// after they were deleted. One that ignores this must not hold up listings (and with
+    /// them prune and verify): requests are short, one at a time per destination, and an
+    /// id is asked about once per run.
+    fn redelete(&self, p: &Peer, ids: Vec<String>) {
+        let Some(me) = self.me.upgrade() else { return };
+        if ids.is_empty() || !self.deleting.lock().unwrap().insert(p.friend.id.clone()) {
+            return;
+        }
+        let ids: Vec<String> = {
+            let mut asked = self.asked_gone.lock().unwrap();
+            ids.into_iter().filter(|id| asked.insert(format!("{}|{id}", p.friend.id))).collect()
+        };
+        let p = p.clone();
+        tokio::spawn(async move {
+            let mut left = ids.into_iter();
+            while let Some(id) = left.next() {
+                let done = tokio::time::timeout(Duration::from_secs(10), p.delete_snapshot(&id)).await;
+                if !matches!(done, Ok(Ok(()))) {
+                    // Not answering: stop here, and leave this one and the rest to a later listing.
+                    let mut asked = me.asked_gone.lock().unwrap();
+                    for id in std::iter::once(id).chain(left) {
+                        asked.remove(&format!("{}|{id}", p.friend.id));
+                    }
+                    break;
+                }
+            }
+            me.deleting.lock().unwrap().remove(&p.friend.id);
+        });
     }
 
     /// Restore points as seen through one destination, or through all of them.
@@ -599,17 +739,29 @@ impl Node {
         addrs: Vec<SocketAddr>,
     ) -> Result<String> {
         let tok = blake3::hash(hex::encode(token).as_bytes());
+        // A wrong code changes nothing and writes nothing.
+        let open = self
+            .cfg
+            .lock()
+            .unwrap()
+            .invites
+            .iter()
+            .any(|i| i.expires > now() && blake3::hash(i.token.as_bytes()) == tok);
+        if !open {
+            bail!("that invite is invalid, already used or expired");
+        }
         let mine = self.update(|c| {
             c.invites.retain(|i| i.expires > now());
             let pos = c.invites.iter().position(|i| blake3::hash(i.token.as_bytes()) == tok)?;
             c.invites.remove(pos);
             // Only keep address hints that are well formed and few.
-            let relay = relay.filter(|r| r.len() <= 200 && r.starts_with("https://"));
-            let addrs: Vec<SocketAddr> = addrs.into_iter().take(8).collect();
+            let relay = relay.filter(|r| net::valid_relay(r));
+            let addrs = dialable(&addrs);
             add_friend(c, remote, name, relay, addrs);
             Some(c.name.clone())
         })?;
         let mine = mine.ok_or_else(|| anyhow!("that invite is invalid, already used or expired"))?;
+        self.store.allow(remote);
         self.paired.notify_waiters();
         Ok(mine)
     }
@@ -653,7 +805,9 @@ impl Node {
         if id == self.id() {
             bail!("that is your own invite");
         }
-        let conn = net::connect(&self.endpoint, net::endpoint_addr(&id, &t.relay, &t.addrs)?).await?;
+        let relay_hint = t.relay.filter(|r| net::valid_relay(r));
+        let hints = dialable(&t.addrs);
+        let conn = net::connect(&self.endpoint, net::endpoint_addr(&id, &relay_hint, &hints)?).await?;
         let placeholder = Friend {
             name: "friend".into(),
             id: id.clone(),
@@ -664,6 +818,7 @@ impl Node {
             every_minutes: 0,
             max_in_kbps: 0,
             path: None,
+            drive_key: None,
         };
         let peer = Peer { friend: placeholder, link: Link::Remote(conn.clone()) };
         if !net::offline() {
@@ -671,7 +826,8 @@ impl Node {
         }
         let (relay, addrs) = net::my_addrs(&self.endpoint);
         let theirs = peer.pair(Req::Pair { token: t.token, name: self.cfg().name, relay, addrs }).await?;
-        let name = self.update(|c| add_friend(c, &id, &theirs, t.relay, t.addrs))?;
+        let name = self.update(|c| add_friend(c, &id, &theirs, relay_hint, hints))?;
+        self.store.allow(&id);
         self.conns.lock().unwrap().insert(id, conn);
         out.say(format!("Paired with {name}. You now back up to each other."));
         Ok(())
@@ -720,6 +876,7 @@ impl Node {
         let mut freed = false;
         while !mine.is_empty() {
             let victim = mine.remove(0);
+            self.forget_ids([format!("{}|{}", friend.id, victim.id)]);
             peer.delete_snapshot(&victim.id).await?;
             out.say(format!("    removed restore point {} ({}) from {}", victim.id, when(victim.m.time), friend.name));
             let rest: Vec<&Snap> = mine.iter().copied().chain(newest.iter().copied()).collect();
@@ -801,6 +958,11 @@ impl Node {
             }
         };
         let mut removed = 0;
+        // Destinations that failed part way: they are left alone, the others are still finished.
+        let mut failed: HashMap<String, String> = HashMap::new();
+        if !dry_run {
+            self.forget_ids(snaps.iter().filter(|s| !keep.contains(&s.id)).map(|s| s.id.clone()));
+        }
         for s in snaps.iter().filter(|s| !keep.contains(&s.id)) {
             out.say(format!(
                 "  {} restore point {} ({})",
@@ -811,7 +973,12 @@ impl Node {
             removed += 1;
             if !dry_run {
                 for p in peers.iter().filter(|p| s.peers.iter().any(|(f, _)| f.id == p.friend.id)) {
-                    p.delete_snapshot(&s.id).await?;
+                    if failed.contains_key(&p.friend.id) {
+                        continue;
+                    }
+                    if let Err(e) = p.delete_snapshot(&s.id).await {
+                        failed.insert(p.friend.id.clone(), format!("{e:#}"));
+                    }
                 }
             }
         }
@@ -829,8 +996,28 @@ impl Node {
                 .filter_map(|r| Some((globset::Glob::new(&r.pattern).ok()?.compile_matcher(), r.max_versions)))
                 .collect();
             let mut seen: HashMap<Vec<u8>, (u32, u64)> = HashMap::new();
+            // Sets whose history could not be read in full: their older restore points are left
+            // whole, since versions cannot be counted past the gap.
+            let mut unread: HashSet<String> = HashSet::new();
             for s in snaps.iter_mut().rev() {
-                let entries = self.load_index(s).await?;
+                if unread.contains(&s.m.set) {
+                    continue;
+                }
+                let entries = match self.load_index(s).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        out.say(format!(
+                            "  set {}: restore point {} could not be read, not thinned: {e:#}",
+                            s.m.set, s.id
+                        ));
+                        // Its holders cannot be cleaned up without this file list either.
+                        for (f, _) in &s.peers {
+                            failed.entry(f.id.clone()).or_insert_with(|| format!("{}: {e:#}", f.name));
+                        }
+                        unread.insert(s.m.set.clone());
+                        continue;
+                    }
+                };
                 if s.m.tag.is_some() {
                     cache.insert(s.id.clone(), entries);
                     continue;
@@ -866,7 +1053,7 @@ impl Node {
                 if gone > 0 {
                     thinned += gone;
                     if !dry_run {
-                        self.rewrite(s, &kept, bytes, gone, &peers).await?;
+                        self.rewrite(s, &kept, bytes, gone, &peers, &mut failed).await?;
                     }
                 }
                 cache.insert(s.id.clone(), kept);
@@ -879,17 +1066,37 @@ impl Node {
         let mut freed = 0;
         let all: Vec<&Snap> = snaps.iter().collect();
         for p in &peers {
-            freed += self.gc(p, &all, &mut cache).await?;
+            if failed.contains_key(&p.friend.id) {
+                continue;
+            }
+            match self.gc(p, &all, &mut cache).await {
+                Ok(n) => freed += n,
+                Err(e) => drop(failed.insert(p.friend.id.clone(), format!("{e:#}"))),
+            }
         }
         out.say(format!(
             "removed {removed} restore points and {thinned} old file versions, freed {freed} chunks; {} restore points kept",
             snaps.len()
         ));
+        if !failed.is_empty() {
+            for e in failed.values() {
+                out.say(format!("  not finished: {e}"));
+            }
+            bail!("pruning could not finish at {} destination(s); the others are done", failed.len());
+        }
         Ok(())
     }
 
     /// Replaces a restore point's file list with a trimmed one on every reachable friend.
-    async fn rewrite(&self, s: &mut Snap, entries: &[Entry], bytes: u64, gone: u64, peers: &[Peer]) -> Result<()> {
+    async fn rewrite(
+        &self,
+        s: &mut Snap,
+        entries: &[Entry],
+        bytes: u64,
+        gone: u64,
+        peers: &[Peer],
+        failed: &mut HashMap<String, String>,
+    ) -> Result<()> {
         let buf = snapshot::encode_index(entries)?;
         let pieces: Vec<(Id, Vec<u8>)> = backup::split_index(&buf)
             .into_iter()
@@ -907,9 +1114,17 @@ impl Node {
             let Some(slot) = s.peers.iter_mut().find(|(f, _)| f.id == p.friend.id) else {
                 continue;
             };
-            p.put_chunks(&pieces.iter().collect::<Vec<_>>()).await?;
-            p.put_snapshot(&s.id, sealed.clone()).await?;
-            slot.1 = s.m.index.clone();
+            if failed.contains_key(&p.friend.id) {
+                continue;
+            }
+            let put = async {
+                p.put_chunks(&pieces.iter().collect::<Vec<_>>()).await?;
+                p.put_snapshot(&s.id, sealed.clone()).await
+            };
+            match put.await {
+                Ok(()) => slot.1 = s.m.index.clone(),
+                Err(e) => drop(failed.insert(p.friend.id.clone(), format!("{e:#}"))),
+            }
         }
         let path = self.index_path(&s.id, &s.m.index);
         fs::create_dir_all(path.parent().unwrap())?;
@@ -921,87 +1136,116 @@ impl Node {
     pub async fn verify(&self, full: bool, set: Option<&str>, out: &Out) -> Result<()> {
         let (snaps, peers) = self.snapshots(out).await?;
         let (mut repaired, mut lost) = (0u64, 0u64);
+        let mut unchecked = vec![];
         for p in &peers {
-            let have = self.known(p, true).await?;
-            let mut refs: HashSet<Id> = HashSet::new();
-            let mut count = 0;
-            let mine = |s: &&Snap| set.is_none_or(|n| s.m.set == n) && s.peers.iter().any(|(f, _)| f.id == p.friend.id);
-            for s in snaps.iter().filter(mine) {
-                count += 1;
-                refs.extend(s.m.index.iter().copied());
-                for e in self.load_index(s).await? {
-                    if let Kind::File { chunks, .. } = e.kind {
-                        refs.extend(chunks);
-                    }
+            // One destination that misbehaves does not stop the others from being checked.
+            match self.verify_one(p, &snaps, &peers, full, set, out).await {
+                Ok((fixed, gone)) => {
+                    repaired += fixed;
+                    lost += gone;
+                }
+                Err(e) => {
+                    out.say(format!("  {} could not be checked: {e:#}", p.friend.name));
+                    unchecked.push(p.friend.name.clone());
                 }
             }
-            let mut bad: Vec<Id> = refs.iter().filter(|i| !have.contains(*i)).copied().collect();
-            let mut ids: Vec<Id> = refs.into_iter().filter(|i| have.contains(i)).collect();
-            if !full {
-                use rand::seq::SliceRandom;
-                ids.shuffle(&mut rand::rng());
-                ids.truncate(32);
-            }
-            let mut read = 0u64;
-            let (mut done, mut told) = (0usize, Instant::now());
-            for batch in ids.chunks(16) {
-                done += batch.len();
-                if told.elapsed() >= Duration::from_secs(2) {
-                    told = Instant::now();
-                    out.say(format!("  ... {}: checked {done} of {} chunks", p.friend.name, ids.len()));
-                }
-                for (id, blob) in batch.iter().zip(p.get_chunks(batch).await?) {
-                    match blob.ok_or_else(|| anyhow!("missing")).and_then(|b| self.keys.open(id, &b)) {
-                        Ok(d) => read += d.len() as u64,
-                        Err(_) => bad.push(*id),
-                    }
-                }
-            }
-            let others: Vec<&Peer> = peers.iter().filter(|o| o.friend.id != p.friend.id).collect();
-            let (mut fixed, mut gone) = (0u64, 0u64);
-            for id in &bad {
-                let mut good = None;
-                for o in &others {
-                    if let Ok(mut v) = o.get_chunks(&[*id]).await {
-                        if let Some(blob) = v.pop().flatten().filter(|b| self.keys.open(id, b).is_ok()) {
-                            good = Some(blob);
-                            break;
-                        }
-                    }
-                }
-                p.delete_chunks(&[*id]).await?;
-                match good {
-                    Some(blob) => {
-                        p.put_chunks(&[&(*id, blob)]).await?;
-                        fixed += 1;
-                    }
-                    None => gone += 1,
-                }
-            }
-            if !bad.is_empty() {
-                self.known(p, true).await?;
-            }
-            out.say(format!(
-                "{}: {count} restore points, {} chunks listed, {} chunks ({}) downloaded and checked{}",
-                p.friend.name,
-                have.len(),
-                ids.len(),
-                human(read),
-                if full { "" } else { " (sample; use --full for everything)" }
-            ));
-            if !bad.is_empty() {
-                out.say(format!("  {} damaged or missing chunks: {fixed} repaired from another friend, {gone} not available elsewhere", bad.len()));
-            }
-            repaired += fixed;
-            lost += gone;
         }
         if lost > 0 {
             bail!(
                 "{lost} chunks could not be repaired from a friend. Run `sdb backup`: anything still unchanged on this computer is uploaded again. Then run `sdb verify` once more."
             );
         }
+        if !unchecked.is_empty() {
+            bail!("could not check {}; every other destination was checked", unchecked.join(", "));
+        }
         out.say(if repaired > 0 { format!("all good after repairing {repaired} chunks") } else { "all good".into() });
         Ok(())
+    }
+
+    /// Checks one destination; returns how many chunks were repaired and how many are lost.
+    async fn verify_one(
+        &self,
+        p: &Peer,
+        snaps: &[Snap],
+        peers: &[Peer],
+        full: bool,
+        set: Option<&str>,
+        out: &Out,
+    ) -> Result<(u64, u64)> {
+        let have = self.known(p, true).await?;
+        let mut refs: HashSet<Id> = HashSet::new();
+        let mut count = 0;
+        let mine = |s: &&Snap| set.is_none_or(|n| s.m.set == n) && s.peers.iter().any(|(f, _)| f.id == p.friend.id);
+        for s in snaps.iter().filter(mine) {
+            count += 1;
+            refs.extend(s.m.index.iter().copied());
+            for e in self.load_index(s).await? {
+                if let Kind::File { chunks, .. } = e.kind {
+                    refs.extend(chunks);
+                }
+            }
+        }
+        let mut bad: Vec<Id> = refs.iter().filter(|i| !have.contains(*i)).copied().collect();
+        let mut ids: Vec<Id> = refs.into_iter().filter(|i| have.contains(i)).collect();
+        if !full {
+            use rand::seq::SliceRandom;
+            ids.shuffle(&mut rand::rng());
+            ids.truncate(32);
+        }
+        let mut read = 0u64;
+        let (mut done, mut told) = (0usize, Instant::now());
+        for batch in ids.chunks(16) {
+            done += batch.len();
+            if told.elapsed() >= Duration::from_secs(2) {
+                told = Instant::now();
+                out.say(format!("  ... {}: checked {done} of {} chunks", p.friend.name, ids.len()));
+            }
+            for (id, blob) in batch.iter().zip(p.get_chunks(batch).await?) {
+                match blob.ok_or_else(|| anyhow!("missing")).and_then(|b| self.keys.open(id, &b)) {
+                    Ok(d) => read += d.len() as u64,
+                    Err(_) => bad.push(*id),
+                }
+            }
+        }
+        let others: Vec<&Peer> = peers.iter().filter(|o| o.friend.id != p.friend.id).collect();
+        let (mut fixed, mut gone) = (0u64, 0u64);
+        for id in &bad {
+            let mut good = None;
+            for o in &others {
+                if let Ok(mut v) = o.get_chunks(&[*id]).await {
+                    if let Some(blob) = v.pop().flatten().filter(|b| self.keys.open(id, b).is_ok()) {
+                        good = Some(blob);
+                        break;
+                    }
+                }
+            }
+            p.delete_chunks(&[*id]).await?;
+            match good {
+                Some(blob) => {
+                    p.put_chunks(&[&(*id, blob)]).await?;
+                    fixed += 1;
+                }
+                None => gone += 1,
+            }
+        }
+        if !bad.is_empty() {
+            self.known(p, true).await?;
+        }
+        out.say(format!(
+            "{}: {count} restore points, {} chunks listed, {} chunks ({}) downloaded and checked{}",
+            p.friend.name,
+            have.len(),
+            ids.len(),
+            human(read),
+            if full { "" } else { " (sample; use --full for everything)" }
+        ));
+        if !bad.is_empty() {
+            out.say(format!(
+                "  {} damaged or missing chunks: {fixed} repaired from another friend, {gone} not available elsewhere",
+                bad.len()
+            ));
+        }
+        Ok((fixed, gone))
     }
 
     async fn check_local(&self, set: Option<&str>, out: &Out) -> Result<()> {
@@ -1029,7 +1273,18 @@ impl Node {
         Ok(())
     }
 
-    async fn status(&self, out: &Out) -> Result<()> {
+    /// What a friend stores here, for views. A first count walks their folder, which must not
+    /// hold up the async workers, so it runs in the background and the view shows it next time.
+    fn stored_here(self: &Arc<Self>, id: &str) -> Option<u64> {
+        let n = self.store.usage_known(id);
+        if n.is_none() {
+            let (node, id) = (self.clone(), id.to_string());
+            tokio::task::spawn_blocking(move || node.store.usage(&id));
+        }
+        n
+    }
+
+    async fn status(self: &Arc<Self>, out: &Out) -> Result<()> {
         let c = self.cfg();
         for w in self.warnings() {
             out.say(format!("WARNING:  {w}"));
@@ -1104,7 +1359,7 @@ impl Node {
         }
         out.say("friends:");
         for f in &c.friends {
-            let theirs = human(self.store.usage(&f.id).unwrap_or(0));
+            let theirs = self.stored_here(&f.id).map_or("counting...".into(), human);
             let probe = async {
                 let peer = self.peer(f).await?;
                 let (used, quota) = peer.usage().await?;
@@ -1304,7 +1559,7 @@ impl Node {
                     "max_in_kbps": f.max_in_kbps,
                     "in_use": f.backup_to,
                     "quota_gb": f.quota_gb,
-                    "used_here": if f.path.is_none() { self.store.usage(&f.id).ok() } else { None },
+                    "used_here": if f.path.is_none() { self.stored_here(&f.id) } else { None },
                     "last_in": if f.path.is_none() { self.store.last_snapshot(&f.id) } else { None },
                     "last_out": ok.get(&f.id),
                 })
@@ -1337,6 +1592,11 @@ impl Node {
     pub fn warnings(&self) -> Vec<String> {
         let c = self.cfg();
         let mut w = vec![];
+        for b in c.sets.iter().filter(|b| !b.paths.is_empty() && b.destinations.iter().all(|d| d == NOWHERE)) {
+            if !b.destinations.is_empty() {
+                w.push(format!("set {} has no destination and is not being backed up", b.name));
+            }
+        }
         if c.warn_after_days == 0 {
             return w;
         }
@@ -1514,7 +1774,7 @@ impl Node {
                         "{:<16} quota {} GB, using {}{}  {}",
                         f.name,
                         f.quota_gb,
-                        human(self.store.usage(&f.id).unwrap_or(0)),
+                        self.stored_here(&f.id).map_or("counting...".into(), human),
                         if f.backup_to { "" } else { ", not backing up to them" },
                         f.id
                     ));
@@ -1522,13 +1782,30 @@ impl Node {
                 Ok(())
             }
             Cmd::FriendRemove { name, purge } => {
+                let mut stranded = vec![];
                 let f = self.update(|c| {
                     let pos = c.friends.iter().position(|f| f.name == name)?;
-                    c.sets.iter_mut().for_each(|b| b.destinations.retain(|d| *d != name));
+                    for b in c.sets.iter_mut().filter(|b| b.destinations.contains(&name)) {
+                        b.destinations.retain(|d| *d != name);
+                        // An empty list would mean "everywhere", which nobody asked for.
+                        if b.destinations.is_empty() {
+                            b.destinations.push(NOWHERE.into());
+                            stranded.push(b.name.clone());
+                        }
+                    }
                     Some(c.friends.remove(pos))
                 })?;
                 let f = f.ok_or_else(|| anyhow!("no friend named {name}"))?;
-                self.conns.lock().unwrap().remove(&f.id);
+                if let Some(conn) = self.conns.lock().unwrap().remove(&f.id) {
+                    conn.close(1u32.into(), b"removed");
+                }
+                self.drives.lock().unwrap().retain(|p, _| f.path.as_ref().is_none_or(|d| !p.starts_with(d)));
+                self.drop_known(&f.id).await;
+                for set in stranded {
+                    out.say(format!(
+                        "set {set} went only to {name} and now has no destination: it is not backed up until you run `sdb set {set} --to NAME` (or `--to all`)"
+                    ));
+                }
                 if purge {
                     self.store.forget_owner(&f.id)?;
                 }
@@ -1564,6 +1841,9 @@ impl Node {
             Cmd::AddPaths { paths, set } => {
                 let first = self.cfg().sets.first().map(|b| b.name.clone());
                 let name = clean_name(set.as_deref().or(first.as_deref()).unwrap_or(DEFAULT_SET));
+                if self.cfg().set(&name).is_none() {
+                    refuse_reserved(&name)?;
+                }
                 self.update(|c| {
                     for b in c.sets.iter_mut() {
                         b.paths.retain(|p| !paths.contains(p));
@@ -1584,6 +1864,7 @@ impl Node {
             }
             Cmd::SetRename { name, to } => {
                 let to = clean_name(&to);
+                refuse_reserved(&to)?;
                 let c = self.cfg();
                 if c.set(&name).is_none() {
                     bail!("no set named {name}");
@@ -1659,6 +1940,19 @@ impl Node {
                         bail!("hours look like 22-7 (10pm to 7am); use 'always' to follow the general setting");
                     }
                 }
+                // An empty list is stored as "everywhere", so it is only written when asked for by name.
+                let to = match to {
+                    Some(t) if t.is_empty() => {
+                        bail!("a set needs at least one destination (use `--to all` for every destination)")
+                    }
+                    Some(t) if t.iter().any(|d| d == EVERYWHERE) => {
+                        if t.len() > 1 {
+                            bail!("a set goes either to every destination or to the ones named, not both");
+                        }
+                        Some(vec![])
+                    }
+                    t => t,
+                };
                 if let Some(bad) = to.iter().flatten().find(|d| !c.friends.iter().any(|f| &f.name == *d)) {
                     bail!("no destination named {bad}");
                 }
@@ -1720,7 +2014,7 @@ impl Node {
                         c.backup_hours = h;
                     }
                     if let Some(p) = pause_hours {
-                        c.paused_until = if p == 0 { 0 } else { now() + p * 3600 };
+                        c.paused_until = if p <= 0 { 0 } else { now() + p.min(24 * 3650) * 3600 };
                     }
                     if let Some(d) = warn_days {
                         c.warn_after_days = d;
@@ -1746,7 +2040,17 @@ impl Node {
             Cmd::DriveAdd { name, path } => {
                 let dir = path.join("sdb-store");
                 fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+                if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+                    bail!("{} is a link or a file; choose a real folder", dir.display());
+                }
                 let name = clean_name(&name);
+                refuse_reserved(&name)?;
+                if self.cfg().friends.iter().any(|f| f.name == name && f.path.is_none()) {
+                    bail!("a friend is already called {name}; give the drive another name");
+                }
+                // Adding a drive (again) is the moment its disk is trusted and marked.
+                self.drives.lock().unwrap().remove(&dir);
+                self.drop_known(&format!("drive-{name}")).await;
                 self.update(|c| {
                     c.friends.retain(|f| f.name != name);
                     c.friends.push(Friend {
@@ -1759,6 +2063,7 @@ impl Node {
                         every_minutes: 15,
                         max_in_kbps: 0,
                         path: Some(path.clone()),
+                        drive_key: None,
                     });
                 })?;
                 out.say(format!("{name} added: backups also go to {} (encrypted like everything else). When the drive is unplugged it is skipped and catches up later.", dir.display()));
@@ -1842,5 +2147,17 @@ impl Node {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_from_others_cannot_forge_lines_or_escapes() {
+        assert_eq!(clean("ok\n\u{1}OK"), "ok??OK");
+        assert_eq!(clean("\u{1b}]0;title\u{7}fine"), "?]0;title?fine");
+        assert_eq!(clean("plain text, ünïcode"), "plain text, ünïcode");
     }
 }

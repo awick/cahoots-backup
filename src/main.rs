@@ -250,10 +250,16 @@ enum ServiceCmd {
 struct KitData {
     identity: Identity,
     config: Config,
+    /// Restore points deleted on purpose, so a destination cannot bring them back after recovery.
+    #[serde(default)]
+    forgotten: std::collections::HashSet<String>,
 }
 
 fn passphrase(confirm: bool) -> Result<String> {
     if let Ok(p) = std::env::var("SDB_PASSPHRASE") {
+        if p.len() < 8 {
+            bail!("use at least 8 characters");
+        }
         return Ok(p);
     }
     let p = rpassword::prompt_password("Recovery passphrase: ")?;
@@ -395,7 +401,7 @@ async fn tui_main(home: PathBuf) -> Result<()> {
 #[tokio::main]
 async fn main() {
     if let Err(e) = real_main().await {
-        eprintln!("sdb: {e:#}");
+        eprintln!("sdb: {}", node::clean(&format!("{e:#}")));
         std::process::exit(1);
     }
 }
@@ -407,10 +413,14 @@ async fn real_main() -> Result<()> {
             if home.join("identity.key").exists() {
                 bail!("{} is already set up", home.display());
             }
+            let name = name.unwrap_or_else(hostname);
+            if config::reserved(&name) {
+                bail!("\"{name}\" has a special meaning in destination lists; choose another name");
+            }
             fs::create_dir_all(&home)?;
             fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
             Identity::generate().save(&home)?;
-            let cfg = Config::new(name.unwrap_or_else(hostname));
+            let cfg = Config::new(name);
             cfg.save(&home)?;
             println!("Set up \"{}\" in {}", cfg.name, home.display());
             println!("Next: `sdb add <folder>`, `sdb invite` (or `sdb join <invite>`), `sdb service install`.");
@@ -448,7 +458,12 @@ async fn real_main() -> Result<()> {
         C::Recovery { cmd: RecoveryCmd::Export { file } } => {
             let mut config = Config::load(&home)?;
             config.invites.clear();
-            let data = KitData { identity: Identity::load(&home)?, config };
+            let forgotten = match fs::read(home.join("forgotten.json")) {
+                Ok(b) => serde_json::from_slice(&b).context("forgotten.json")?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+                Err(e) => return Err(e).context("forgotten.json"),
+            };
+            let data = KitData { identity: Identity::load(&home)?, config, forgotten };
             let kit = crypto::kit_seal(&passphrase(true)?, &serde_json::to_vec(&data)?)?;
             config::write_private(&file, kit.as_bytes())?;
             println!(
@@ -468,6 +483,9 @@ async fn real_main() -> Result<()> {
             fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
             data.identity.save(&home)?;
             data.config.save(&home)?;
+            if !data.forgotten.is_empty() {
+                config::write_private(&home.join("forgotten.json"), &serde_json::to_vec(&data.forgotten)?)?;
+            }
             println!("Recovered \"{}\" with {} friends.", data.config.name, data.config.friends.len());
             println!("Run `sdb snapshots`, then `sdb restore latest --to <folder>` (or --in-place).");
             return Ok(());
@@ -498,13 +516,20 @@ async fn real_main() -> Result<()> {
         C::Set { name, rename: Some(to), .. } => Cmd::SetRename { name, to },
         C::Set { name, to, every, hours, days, versions, last, delete, .. } => Cmd::SetEdit {
             name,
-            to: to.map(|t| {
-                if t == "all" {
-                    vec![]
-                } else {
-                    t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
-                }
-            }),
+            to: to
+                .map(|t| -> Result<Vec<String>> {
+                    // Every destination is asked for by name; the daemon refuses an empty list.
+                    if t.trim() == "all" {
+                        return Ok(vec![config::EVERYWHERE.into()]);
+                    }
+                    let to: Vec<String> =
+                        t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+                    if to.is_empty() {
+                        bail!("--to needs destination names, or `all` for every destination");
+                    }
+                    Ok(to)
+                })
+                .transpose()?,
             every,
             hours: hours.map(|h| if h == "always" { String::new() } else { h }),
             days,

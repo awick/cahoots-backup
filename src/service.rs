@@ -23,6 +23,10 @@ pub fn installed() -> bool {
     unit_path().exists()
 }
 
+fn xml(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 pub fn install() -> Result<()> {
     let exe = std::env::current_exe()?;
     let path = unit_path();
@@ -43,8 +47,8 @@ pub fn install() -> Result<()> {
   <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
 "#,
-                exe.display(),
-                log = log.display()
+                xml(&exe.display().to_string()),
+                log = xml(&log.display().to_string())
             ),
         )?;
         let _ = Command::new("launchctl").args(["unload", "-w"]).arg(&path).output();
@@ -62,7 +66,7 @@ pub fn install() -> Result<()> {
         fs::write(
             &path,
             format!(
-                "[Unit]\nDescription=Super Duper Backup\nAfter=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=Super Duper Backup\nAfter=network-online.target\n\n[Service]\nExecStart=\"{}\" daemon\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n",
                 exe.display()
             ),
         )?;

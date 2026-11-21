@@ -3,10 +3,14 @@
 
 //! Local control socket so the CLI can drive a running daemon.
 
-use crate::node::{Cmd, Node, Out};
+use crate::node::{Cmd, Node, Out, clean};
 use anyhow::{Result, bail};
 use std::{
-    os::unix::fs::PermissionsExt,
+    ffi::OsStr,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -18,14 +22,74 @@ use tokio::{
 
 const DONE: char = '\u{1}';
 
-/// Unix socket paths are limited to about 100 bytes, so deep homes fall back to /tmp.
+/// Unix socket paths are limited to about 100 bytes, so a deep home puts the socket in a
+/// private folder elsewhere and records where in `sock-path`, which only this user can write.
 pub fn sock_path(home: &Path) -> PathBuf {
     let p = home.join("sdb.sock");
     if p.as_os_str().len() < 100 {
         return p;
     }
+    match std::fs::read(pointer(home)) {
+        Ok(b) if b.starts_with(b"/") => PathBuf::from(OsStr::from_bytes(b.trim_ascii_end())),
+        _ => PathBuf::from(format!("/tmp/sdb-{}/{}", rustix::process::getuid().as_raw(), sock_name(home))),
+    }
+}
+
+fn pointer(home: &Path) -> PathBuf {
+    home.join("sock-path")
+}
+
+fn sock_name(home: &Path) -> String {
     let h = blake3::hash(home.as_os_str().as_encoded_bytes()).to_hex();
-    PathBuf::from(format!("/tmp/sdb-{}-{}.sock", rustix::process::getuid().as_raw(), &h[..16]))
+    format!("{}.sock", &h[..16])
+}
+
+/// A folder only this user can use, made now if `fresh` (never one someone left waiting).
+fn private_dir(dir: &Path, fresh: bool) -> bool {
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(e) if fresh || e.kind() != std::io::ErrorKind::AlreadyExists => return false,
+        _ => {}
+    }
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|md| md.is_dir() && md.uid() == rustix::process::getuid().as_raw() && md.mode() & 0o077 == 0)
+}
+
+/// A temp folder others cannot rename our folder out of: their own, or a sticky one like /tmp.
+fn safe_base(base: &Path) -> bool {
+    let uid = rustix::process::getuid().as_raw();
+    base.is_absolute()
+        && std::fs::metadata(base).is_ok_and(|md| {
+            md.is_dir() && (md.mode() & 0o1000 != 0 || (md.mode() & 0o022 == 0 && (md.uid() == uid || md.uid() == 0)))
+        })
+}
+
+/// Picks the socket for a deep home: the folder used last time, then a fixed name in the
+/// per-user runtime or temp folder, then /tmp. The fixed names are predictable, so if another
+/// user already holds them an unpredictable one is used; clients find it through `sock-path`.
+fn private_sock(home: &Path) -> Result<PathBuf> {
+    let (uid, name) = (rustix::process::getuid().as_raw(), sock_name(home));
+    let mut tries = Vec::new();
+    if let Ok(b) = std::fs::read(pointer(home))
+        && let Some(d) = Path::new(OsStr::from_bytes(b.trim_ascii_end())).parent()
+        && d.is_absolute()
+    {
+        tries.push((d.to_path_buf(), false));
+    }
+    let bases: Vec<PathBuf> = [std::env::var_os("XDG_RUNTIME_DIR"), std::env::var_os("TMPDIR"), Some("/tmp".into())]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .filter(|b| safe_base(b))
+        .collect();
+    tries.extend(bases.iter().map(|b| (b.join(format!("sdb-{uid}")), false)));
+    tries.extend(bases.iter().map(|b| (b.join(format!("sdb-{uid}-{:016x}", rand::random::<u64>())), true)));
+    for (dir, fresh) in tries {
+        let p = dir.join(&name);
+        if p.as_os_str().len() < 100 && private_dir(&dir, fresh) {
+            return Ok(p);
+        }
+    }
+    bail!("found no private folder for the control socket; set SDB_HOME to a shorter path")
 }
 
 /// Identifies a build by its executable's size and modification time, so a client can
@@ -49,7 +113,6 @@ pub fn started_fingerprint() -> String {
 
 /// Connects to the local daemon, but only through a socket this user owns.
 pub async fn connect(home: &Path) -> Option<UnixStream> {
-    use std::os::unix::fs::MetadataExt;
     let path = sock_path(home);
     let md = std::fs::symlink_metadata(&path).ok()?;
     if md.uid() != rustix::process::getuid().as_raw() {
@@ -59,16 +122,25 @@ pub async fn connect(home: &Path) -> Option<UnixStream> {
 }
 
 /// The daemon's socket path, if it exists and belongs to this user.
+#[cfg(feature = "gui")]
 pub fn own_socket(home: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
     let path = sock_path(home);
     let md = std::fs::symlink_metadata(&path).ok()?;
     (md.uid() == rustix::process::getuid().as_raw()).then_some(path)
 }
 
 pub fn listen(home: &Path) -> Result<UnixListener> {
-    let path = sock_path(home);
-    let _ = std::fs::remove_file(&path);
+    let mut path = home.join("sdb.sock");
+    if path.as_os_str().len() >= 100 {
+        path = private_sock(home)?;
+        crate::config::write_private(&pointer(home), path.as_os_str().as_bytes())?;
+    }
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => bail!("cannot replace {}: {e}", path.display()),
+        _ => {}
+    }
+    // No umask change (it is process wide and other tasks are running); the folder is
+    // private and serve() checks each peer's uid, so the brief default mode is harmless.
     let l = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(l)
@@ -76,6 +148,10 @@ pub fn listen(home: &Path) -> Result<UnixListener> {
 
 pub async fn serve(node: Arc<Node>, listener: UnixListener) {
     while let Ok((stream, _)) = listener.accept().await {
+        // Only this user may drive the daemon, whatever the socket's permissions say.
+        if !stream.peer_cred().is_ok_and(|c| c.uid() == rustix::process::getuid().as_raw()) {
+            continue;
+        }
         let node = node.clone();
         tokio::spawn(async move {
             let (r, mut w) = stream.into_split();
@@ -106,8 +182,8 @@ pub async fn serve(node: Arc<Node>, listener: UnixListener) {
             }
             let end = match job.await {
                 Ok(Ok(())) => format!("{DONE}OK\n"),
-                Ok(Err(e)) => format!("{DONE}{e:#}\n"),
-                Err(e) => format!("{DONE}{e}\n"),
+                Ok(Err(e)) => format!("{DONE}{}\n", clean(&format!("{e:#}"))),
+                Err(e) => format!("{DONE}{}\n", clean(&e.to_string())),
             };
             let _ = w.write_all(end.as_bytes()).await;
         });

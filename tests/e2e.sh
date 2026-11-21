@@ -135,4 +135,48 @@ a keep --last 1 --hourly 0 --daily 0 --weekly 0 --monthly 0 >/dev/null
 a prune | grep -q "restore points kept" || fail "prune"
 a snapshots | grep -q second || fail "a tagged restore point was pruned"
 a verify --local | grep -q "all match" || fail "local check"
+step "restore does not write through planted links"
+mkdir -p victim trap1 trap2/data/sub
+ln -s "$T/victim" trap1/data
+a restore latest --to trap1 >trap.out 2>&1 && fail "restore went through a linked folder"
+[ -z "$(ls victim)" ] || fail "restore wrote into the folder a link pointed at"
+echo untouched >victimfile
+ln -s "$T/victimfile" trap2/data/sub/note.txt.sdb-tmp
+a restore latest data/sub --to trap2 >/dev/null || fail "restore beside a planted link"
+[ "$(cat victimfile)" = untouched ] || fail "restore wrote through a planted link"
+[ ! -L trap2/data/sub/note.txt ] || fail "the planted link became the restored file"
+
+step "set-id bits are not restored"
+echo three >data/sub/note.txt
+chmod 4755 data/sub/note.txt
+a backup --set default >/dev/null
+a restore latest data/sub/note.txt --to suid >/dev/null
+[ -u suid/data/sub/note.txt ] && fail "a set-uid file was restored set-uid"
+[ -x suid/data/sub/note.txt ] || fail "ordinary permissions were lost"
+chmod 644 data/sub/note.txt
+
+step "a forgotten restore point cannot be brought back"
+GONE=$(a snapshots | awk '/ pics / {id=$1} END {print id}')
+KEPT=$(find drive/sdb-store -path "*snapshots/$GONE")
+cp "$KEPT" kept-copy
+a forget "$GONE" >/dev/null
+cp kept-copy "$KEPT"
+a snapshots | grep -q "$GONE" && fail "a destination resurrected a forgotten restore point"
+[ ! -e "$KEPT" ] || fail "the resurrected restore point was not deleted again"
+
+step "a different disk at the drive's path is refused"
+mv drive drive.real
+mkdir -p drive/sdb-store
+a backup --set pics >impostor.out 2>&1 && fail "a backup went to an impostor drive"
+grep -q "not the one that was added" impostor.out || fail "impostor drive not reported"
+rm -rf drive
+mv drive.real drive
+echo pic2 >photos/p2.jpg
+a backup --set pics | grep -q "created on usb" || fail "the real drive stopped working"
+
+step "removing a set's only destination does not widen it"
+a destination rm usb | grep -q "now has no destination" || fail "no notice about the stranded set"
+a backup --set pics >stranded.out 2>&1 && fail "a set went somewhere after its only destination was removed"
+a set pics --to bob >/dev/null
+a backup --set pics | grep -q "created on bob" || fail "choosing a new destination"
 echo "end-to-end test passed"

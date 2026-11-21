@@ -252,6 +252,9 @@ impl Gui {
     /// For development: SDB_GUI_SHOT=file.ppm saves a picture of the window after it has
     /// settled and exits, so the layout can be checked without a person looking.
     fn maybe_screenshot(&mut self, ctx: &egui::Context) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
         let Ok(path) = std::env::var("SDB_GUI_SHOT") else { return };
         self.frames += 1;
         ctx.request_repaint();

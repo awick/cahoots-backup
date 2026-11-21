@@ -10,7 +10,10 @@ use crate::{
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -33,7 +36,10 @@ pub async fn run(node: Arc<Node>, out: Out) {
     let mut alerted: Vec<String> = vec![];
     loop {
         let cfg = node.cfg();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        // A burst of changes larger than this is remembered only as "something changed everywhere".
+        let (tx, mut rx) = mpsc::channel(4096);
+        let flood = Arc::new(AtomicBool::new(false));
+        let flooded = flood.clone();
         let ex = Excludes::new(&cfg, &node.home).ok();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
@@ -41,7 +47,9 @@ pub async fn run(node: Arc<Node>, out: Out) {
                 return;
             }
             for p in ev.paths.into_iter().filter(|p| ex.as_ref().is_none_or(|x| !x.is_excluded(p))) {
-                let _ = tx.send(p);
+                if tx.try_send(p).is_err() {
+                    flooded.store(true, Ordering::Relaxed);
+                }
             }
         });
         let mut watcher = match watcher {
@@ -81,6 +89,12 @@ pub async fn run(node: Arc<Node>, out: Out) {
                     }
                 }
                 _ = tick.tick() => {}
+            }
+            if flood.swap(false, Ordering::Relaxed) {
+                last_event = Instant::now();
+                dirty_since.get_or_insert(last_event);
+                refill = true;
+                touched = None;
             }
             let cfg = node.cfg();
             let settle = Duration::from_secs(cfg.settle_secs);
@@ -165,17 +179,27 @@ pub async fn run(node: Arc<Node>, out: Out) {
                 continue;
             }
             last_scan = Instant::now();
+            // Sets whose run ran out of time go on at the next tick, between other work,
+            // rather than waiting for their pace or the next change.
+            let mut unfinished = HashSet::new();
             for b in &cfg.sets {
                 let ids: HashSet<String> =
                     due.iter().filter(|(set, _)| *set == b.name).map(|(_, id)| id.clone()).collect();
                 if ids.is_empty() {
                     continue;
                 }
-                if let Err(e) = backup::run(&node, None, Some(&b.name), Some(&ids), &out).await {
-                    out.say(format!("backup failed: {e:#}"));
+                match backup::run(&node, None, Some(&b.name), Some(&ids), &out).await {
+                    Ok(()) if backup::deferred(&b.name) => {
+                        unfinished.insert(b.name.clone());
+                    }
+                    Ok(()) => {}
+                    Err(e) => out.say(format!("backup failed: {e:#}")),
                 }
             }
             for key in due {
+                if unfinished.contains(&key.0) {
+                    continue;
+                }
                 pending.remove(&key);
                 sent_at.insert(key, Instant::now());
             }
@@ -208,6 +232,6 @@ fn notify_desktop(text: &str) {
             .args(["-e", &format!("display notification \"{text}\" with title \"Super Duper Backup\"")])
             .output()
     } else {
-        std::process::Command::new("notify-send").args(["Super Duper Backup", &text]).output()
+        std::process::Command::new("notify-send").args(["--", "Super Duper Backup", &text]).output()
     };
 }

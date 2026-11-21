@@ -12,19 +12,50 @@ use anyhow::{Result, anyhow, bail};
 use fastcdc::v2020::{FastCDC, StreamCDC};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    ffi::OsStr,
     fs,
+    io::{Read, Seek},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
 // Content-defined chunk sizes: an edit only disturbs the chunks around it.
 const MIN_CHUNK: usize = 256 << 10;
 const AVG_CHUNK: usize = 1 << 20;
-const MAX_CHUNK: usize = 4 << 20;
+pub const MAX_CHUNK: usize = 4 << 20;
 const BATCH_BYTES: usize = 8 << 20;
+/// Holes are skipped in whole zero chunks rather than read, so a sparse disk image costs
+/// what it stores, not what it claims. Most empty space one file may claim: far beyond
+/// any real disk image, but an exabyte "file" would fill the index with zero chunks.
+const MAX_HOLES: u64 = 4 << 40;
+/// Most empty space read as zeros in one file: holes too small to skip, and every hole
+/// on a filesystem that cannot say where they are.
+const MAX_ZEROS_READ: u64 = 16 << 30;
+/// A run stops starting on changed files after this long, or after skipping this much
+/// empty space, and leaves the rest to the next run so other work gets its turn.
+const RUN_TIME: Duration = Duration::from_secs(30 * 60);
+const RUN_HOLES: u64 = 16 << 40;
+/// Chunks waiting for one destination. A destination that moves nothing for this long
+/// while another sits idle is dropped from the run.
+const LANE_DEPTH: usize = 16;
+const LAG: Duration = Duration::from_secs(600);
+
+/// Changed files a run left for later, per set, with the run that first left each one:
+/// the next run starts with the longest waiting, so none waits forever.
+static DEFERRED: Mutex<BTreeMap<String, HashMap<Vec<u8>, u64>>> = Mutex::new(BTreeMap::new());
+static RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the last run of this set ran out of time and left changed files for the next.
+pub fn deferred(set: &str) -> bool {
+    DEFERRED.lock().unwrap().get(set).is_some_and(|m| !m.is_empty())
+}
 
 #[derive(Clone)]
 pub struct Excludes {
@@ -53,6 +84,17 @@ struct Scan {
     bytes: u64,
     new_bytes: u64,
     skipped: u64,
+    /// Sparse files refused outright: data the user expects backed up but that is not.
+    refused: u64,
+    /// Changed files left for the next run.
+    deferred: u64,
+}
+
+/// Where a file's chunks go: the upload while backing up, a fingerprint while checking.
+trait Sink {
+    fn data(&mut self, data: &[u8]) -> Result<Id>;
+    /// A chunk of MAX_CHUNK zeros, hashed once rather than once per hole.
+    fn zeros(&mut self) -> Result<Id>;
 }
 
 struct Scanner {
@@ -61,6 +103,7 @@ struct Scanner {
     sent: HashSet<Id>,
     tx: mpsc::Sender<(Id, Vec<u8>)>,
     new_bytes: u64,
+    zero: Option<Id>,
 }
 
 impl Scanner {
@@ -80,8 +123,50 @@ impl Scanner {
     }
 }
 
-fn scan(roots: Vec<PathBuf>, ex: Excludes, prev: HashMap<Vec<u8>, Entry>, mut sc: Scanner, out: Out) -> Result<Scan> {
-    let mut res = Scan { entries: vec![], index: vec![], files: 0, bytes: 0, new_bytes: 0, skipped: 0 };
+impl Sink for Scanner {
+    fn data(&mut self, data: &[u8]) -> Result<Id> {
+        self.chunk(data)
+    }
+
+    fn zeros(&mut self) -> Result<Id> {
+        if let Some(id) = self.zero {
+            return Ok(id);
+        }
+        let id = self.chunk(&vec![0; MAX_CHUNK])?;
+        self.zero = Some(id);
+        Ok(id)
+    }
+}
+
+struct Fingerprint<'a> {
+    keys: &'a Keys,
+    zero: Option<Id>,
+}
+
+impl Sink for Fingerprint<'_> {
+    fn data(&mut self, data: &[u8]) -> Result<Id> {
+        Ok(self.keys.chunk_id(data))
+    }
+
+    fn zeros(&mut self) -> Result<Id> {
+        Ok(*self.zero.get_or_insert_with(|| self.keys.chunk_id(&vec![0; MAX_CHUNK])))
+    }
+}
+
+fn scan(
+    set: String,
+    roots: Vec<PathBuf>,
+    ex: Excludes,
+    prev: HashMap<Vec<u8>, Entry>,
+    mut sc: Scanner,
+    out: Out,
+) -> Result<Scan> {
+    let run = RUNS.fetch_add(1, Ordering::Relaxed);
+    let mut res =
+        Scan { entries: vec![], index: vec![], files: 0, bytes: 0, new_bytes: 0, skipped: 0, refused: 0, deferred: 0 };
+    let mut entries: Vec<Option<Entry>> = vec![];
+    // Changed files (entry, device, inode) are read after the walk, longest waiting first.
+    let mut todo: Vec<(usize, u64, u64)> = vec![];
     for root in &roots {
         let walk = walkdir::WalkDir::new(root)
             .follow_links(false)
@@ -116,27 +201,80 @@ fn scan(roots: Vec<PathBuf>, ex: Excludes, prev: HashMap<Vec<u8>, Entry>, mut sc
                     }
                     _ => None,
                 });
-                let (size, chunks) = match reuse {
-                    Some(c) => (md.size(), c),
-                    None => match read_file(e.path(), &mut sc) {
-                        Ok(x) => x,
-                        Err(err) if err.to_string() == "upload stopped" => return Err(err),
-                        Err(err) => {
-                            out.say(format!("  skipped {}: {err}", e.path().display()));
-                            res.skipped += 1;
-                            continue;
-                        }
-                    },
-                };
-                res.files += 1;
-                res.bytes += size;
-                Kind::File { size, chunks }
+                match reuse {
+                    Some(chunks) => {
+                        res.files += 1;
+                        res.bytes += md.size();
+                        Kind::File { size: md.size(), chunks }
+                    }
+                    None => {
+                        todo.push((entries.len(), md.dev(), md.ino()));
+                        Kind::File { size: 0, chunks: vec![] }
+                    }
+                }
             } else {
                 continue;
             };
-            res.entries.push(Entry { path, mode: md.mode(), uid: md.uid(), gid: md.gid(), mtime, ino: md.ino(), kind });
+            entries.push(Some(Entry {
+                path,
+                mode: md.mode(),
+                uid: md.uid(),
+                gid: md.gid(),
+                mtime,
+                ino: md.ino(),
+                kind,
+            }));
         }
     }
+
+    let waiting = DEFERRED.lock().unwrap().get(&set).cloned().unwrap_or_default();
+    let path_of = |i: usize, entries: &[Option<Entry>]| entries[i].as_ref().map(|e| e.path.clone()).unwrap_or_default();
+    todo.sort_by_key(|(i, ..)| waiting.get(&path_of(*i, &entries)).copied().unwrap_or(u64::MAX));
+    let began = Instant::now();
+    let (mut started, mut holes) = (false, 0u64);
+    let mut left = HashMap::new();
+    for (i, dev, ino) in todo {
+        let key = path_of(i, &entries);
+        // At least one file per run, so the longest waiting always gets its turn.
+        if started && (began.elapsed() > RUN_TIME || holes > RUN_HOLES) {
+            // Out of time: keep what the last restore point had and come back to it.
+            left.insert(key.clone(), waiting.get(&key).copied().unwrap_or(run));
+            res.deferred += 1;
+            entries[i] =
+                prev.get(&key).filter(|p| matches!(&p.kind, Kind::File { chunks, .. } if sc.have(chunks))).cloned();
+            if let Some(e) = &entries[i] {
+                res.files += 1;
+                res.bytes += e.size();
+            }
+            continue;
+        }
+        started = true;
+        let path = Path::new(OsStr::from_bytes(&key));
+        match read_file(path, dev, ino, &mut sc) {
+            Ok((size, chunks, skipped)) => {
+                holes += skipped;
+                res.files += 1;
+                res.bytes += size;
+                if let Some(e) = entries[i].as_mut() {
+                    e.kind = Kind::File { size, chunks };
+                }
+            }
+            Err(err) if err.to_string() == "upload stopped" => return Err(err),
+            Err(err) => {
+                entries[i] = None;
+                if err.to_string().starts_with("sparse file") {
+                    out.say(format!("  NOT BACKED UP {}: {err}", path.display()));
+                    res.refused += 1;
+                } else {
+                    out.say(format!("  skipped {}: {err}", path.display()));
+                    res.skipped += 1;
+                }
+            }
+        }
+    }
+    DEFERRED.lock().unwrap().insert(set, left);
+
+    res.entries = entries.into_iter().flatten().collect();
     res.entries.sort_by(|a, b| a.path.cmp(&b.path));
     res.entries.dedup_by(|a, b| a.path == b.path);
     let buf = snapshot::encode_index(&res.entries)?;
@@ -155,6 +293,7 @@ pub fn split_index(buf: &[u8]) -> Vec<&[u8]> {
 /// their fingerprints, to catch content that changed without the file being modified.
 pub fn check_local(keys: &Keys, last: Vec<Entry>, out: &Out) -> (u64, u64) {
     let (mut checked, mut bad) = (0, 0);
+    let mut fp = Fingerprint { keys, zero: None };
     for e in last {
         let Kind::File { size, chunks } = &e.kind else {
             continue;
@@ -166,42 +305,138 @@ pub fn check_local(keys: &Keys, last: Vec<Entry>, out: &Out) -> (u64, u64) {
         if md.size() != *size || md.mtime() * 1_000_000_000 + md.mtime_nsec() != e.mtime || md.ino() != e.ino {
             continue;
         }
-        let Ok(f) = fs::File::open(&path) else {
+        let Ok((f, len)) = open_scanned(&path, md.dev(), md.ino()) else {
             continue;
         };
-        let now: Option<Vec<Id>> = StreamCDC::new(f, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK)
-            .map(|c| c.ok().map(|c| keys.chunk_id(&c.data)))
-            .collect();
         checked += 1;
-        match now {
-            Some(ids) if ids == *chunks => {}
-            Some(_) => {
+        match chunk_file(&f, len, &mut fp) {
+            Ok((_, ids, _)) if ids == *chunks => {}
+            // A sparse file backed up before holes were skipped was read in full then: compare
+            // it that way, or, when that would mean reading a huge hole, leave it unchecked.
+            Ok((_, _, skipped)) if skipped > 0 && len > MAX_ZEROS_READ => checked -= 1,
+            Ok((_, _, skipped)) if skipped > 0 && plain_ids(&f, len, &mut fp).is_ok_and(|p| p == *chunks) => {}
+            Ok(_) => {
                 bad += 1;
                 out.say(format!(
                     "  CORRUPT? {} no longer matches its backup although it was not modified",
                     path.display()
                 ));
             }
-            None => {
+            Err(err) => {
                 bad += 1;
-                out.say(format!("  UNREADABLE {}", path.display()));
+                out.say(format!("  UNREADABLE {}: {err}", path.display()));
             }
         }
     }
     (checked, bad)
 }
 
-fn read_file(path: &Path, sc: &mut Scanner) -> Result<(u64, Vec<Id>)> {
-    let f = fs::File::open(path)?;
-    let mut size = 0;
-    let mut chunks = vec![];
-    for c in StreamCDC::new(f, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
-        let c = c.map_err(|e| anyhow!("{e}"))?;
-        size += c.data.len() as u64;
-        chunks.push(sc.chunk(&c.data)?);
+/// Opens the file the scan just looked at. A link, pipe or different file swapped in
+/// since then is refused rather than read, and a pipe cannot make the open wait.
+fn open_scanned(path: &Path, dev: u64, ino: u64) -> Result<(fs::File, u64)> {
+    use rustix::fs::OFlags;
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = (OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32;
+    let f = fs::OpenOptions::new().read(true).custom_flags(flags).open(path)?;
+    let md = f.metadata()?;
+    if !md.is_file() || md.dev() != dev || md.ino() != ino {
+        bail!("it was replaced while being backed up");
     }
-    Ok((size, chunks))
+    Ok((f, md.size()))
 }
+
+/// The stretches of a file to skip rather than read, as (start, length) in whole zero
+/// chunks. What is left of each hole, and holes smaller than a chunk, are read as zeros.
+fn holes(f: &fs::File, len: u64) -> Result<Vec<(u64, u64)>> {
+    use rustix::{fs::SeekFrom, io::Errno};
+    let unknown = || -> Result<Vec<(u64, u64)>> {
+        // The filesystem cannot say where its holes are, so all of them would be read.
+        let empty = len.saturating_sub(f.metadata()?.blocks().saturating_mul(512));
+        if empty > MAX_ZEROS_READ {
+            bail!("sparse file with {} of empty space on a filesystem that cannot skip it", human(empty));
+        }
+        Ok(vec![])
+    };
+    let (mut out, mut pos, mut skip, mut read) = (vec![], 0u64, 0u64, 0u64);
+    while pos < len {
+        let hole = match rustix::fs::seek(f, SeekFrom::Hole(pos)) {
+            Ok(h) => h.clamp(pos, len),
+            Err(_) => return unknown(),
+        };
+        if hole >= len {
+            break;
+        }
+        let data = match rustix::fs::seek(f, SeekFrom::Data(hole)) {
+            Ok(d) => d.clamp(hole + 1, len),
+            Err(Errno::NXIO) => len,
+            Err(_) => return unknown(),
+        };
+        let whole = (data - hole) / MAX_CHUNK as u64 * MAX_CHUNK as u64;
+        if whole > 0 {
+            out.push((hole, whole));
+        }
+        skip += whole;
+        read += data - hole - whole;
+        if skip > MAX_HOLES {
+            bail!("sparse file claiming over {} of empty space, not backed up", human(MAX_HOLES));
+        }
+        if read > MAX_ZEROS_READ {
+            bail!("sparse file with too many small holes to read, not backed up");
+        }
+        pos = data;
+    }
+    Ok(out)
+}
+
+/// Splits an open file into chunks without reading its holes. A file without holes
+/// chunks exactly as a plain read would, so its chunks match earlier backups.
+/// Returns the size covered, the chunk ids and how much empty space was skipped.
+fn chunk_file(f: &fs::File, len: u64, sink: &mut dyn Sink) -> Result<(u64, Vec<Id>, u64)> {
+    let (mut size, mut chunks, mut skipped, mut pos) = (0u64, vec![], 0u64, 0u64);
+    for (start, n) in holes(f, len)?.into_iter().chain([(len, 0)]) {
+        if start > pos {
+            let mut r = f;
+            r.seek(std::io::SeekFrom::Start(pos))?;
+            let mut got = 0;
+            // Never read past the size seen at open, however fast the file grows.
+            for c in StreamCDC::new(r.take(start - pos), MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
+                let c = c.map_err(|e| anyhow!("{e}"))?;
+                got += c.data.len() as u64;
+                chunks.push(sink.data(&c.data)?);
+            }
+            size += got;
+            if got < start - pos {
+                // It shrank while being read: keep what was there.
+                break;
+            }
+        }
+        for _ in 0..n / MAX_CHUNK as u64 {
+            chunks.push(sink.zeros()?);
+        }
+        size += n;
+        skipped += n;
+        pos = start + n;
+    }
+    Ok((size, chunks, skipped))
+}
+
+/// The chunks a plain read of the whole file gives, holes and all, as backups made before
+/// holes were skipped recorded them.
+fn plain_ids(f: &fs::File, len: u64, sink: &mut dyn Sink) -> Result<Vec<Id>> {
+    let mut r = f;
+    r.seek(std::io::SeekFrom::Start(0))?;
+    StreamCDC::new(r.take(len), MIN_CHUNK, AVG_CHUNK, MAX_CHUNK)
+        .map(|c| sink.data(&c.map_err(|e| anyhow!("{e}"))?.data))
+        .collect()
+}
+
+fn read_file(path: &Path, dev: u64, ino: u64, sc: &mut Scanner) -> Result<(u64, Vec<Id>, u64)> {
+    let (f, len) = open_scanned(path, dev, ino)?;
+    chunk_file(&f, len, sc)
+}
+
+/// A sealed chunk on its way to several destinations, held once.
+type Shared = Arc<(Id, Vec<u8>)>;
 
 struct Target {
     peer: Peer,
@@ -212,35 +447,61 @@ struct Target {
     full: bool,
 }
 
-async fn flush(targets: &mut [Target], batch: &mut Vec<(Id, Vec<u8>)>, out: &Out) -> Result<()> {
-    let results = futures::future::join_all(targets.iter().map(|t| {
-        let items: Vec<&(Id, Vec<u8>)> = batch.iter().filter(|(id, _)| !t.known.contains(id)).collect();
-        async move {
-            if t.failed.is_some() || items.is_empty() {
-                return Ok(vec![]);
-            }
-            t.peer.put_chunks(&items).await?;
-            Ok::<_, anyhow::Error>(items.iter().map(|(id, _)| *id).collect())
-        }
-    }))
-    .await;
-    for (t, r) in targets.iter_mut().zip(results) {
-        match r {
-            Ok(ids) => t.added.extend(ids),
-            Err(e) => {
-                t.full = format!("{e:#}").contains("quota exceeded");
-                if !t.full {
-                    out.say(format!("  {} dropped out: {e:#}", t.peer.friend.name));
+/// One destination's share of the upload, taken at its own pace so that a slow
+/// destination does not hold every batch of the others.
+async fn lane(
+    peer: Peer,
+    mut rx: mpsc::Receiver<Shared>,
+    limit: usize,
+    kbps: u64,
+    remote: u64,
+    done: Arc<AtomicU64>,
+) -> Result<Vec<Id>> {
+    let mut added = vec![];
+    let mut open = true;
+    while open {
+        let (mut batch, mut size) = (vec![], 0);
+        while size < limit && batch.len() < 512 {
+            match rx.recv().await {
+                Some(item) => {
+                    size += item.1.len();
+                    batch.push(item);
                 }
-                t.failed = Some(format!("{e:#}"));
+                None => {
+                    open = false;
+                    break;
+                }
             }
         }
+        if batch.is_empty() {
+            break;
+        }
+        let began = Instant::now();
+        let items: Vec<&(Id, Vec<u8>)> = batch.iter().map(|i| &**i).collect();
+        // Each piece the friend reads counts as progress, so a slow but steady friend is never
+        // taken for a stuck one, however long one batch takes it.
+        peer.put_chunks_ticking(&items, Some(done.clone())).await?;
+        added.extend(batch.iter().map(|i| i.0));
+        done.fetch_add(1, Ordering::Relaxed);
+        if kbps > 0 && peer.is_remote() {
+            // Hold the average upload rate, shared by the remote destinations, to the limit;
+            // local drives do not count.
+            let owed = Duration::from_millis(size as u64 * remote * 1000 / (kbps * 1024));
+            tokio::time::sleep(owed.saturating_sub(began.elapsed())).await;
+        }
     }
-    batch.clear();
-    if targets.iter().all(|t| t.failed.is_some()) {
-        bail!("no friend could accept the backup");
-    }
-    Ok(())
+    Ok(added)
+}
+
+struct Lane {
+    tx: Option<mpsc::Sender<Shared>>,
+    task: tokio::task::JoinHandle<Result<Vec<Id>>>,
+    done: Arc<AtomicU64>,
+}
+
+fn too_slow(t: &mut Target, out: &Out) {
+    out.say(format!("  {} is too slow and was left out of this backup; it catches up next time", t.peer.friend.name));
+    t.failed = Some("too slow".into());
 }
 
 /// Backs up one set (or all of them). When a friend's quota is hit, trims the oldest
@@ -304,6 +565,12 @@ async fn run_set(
     bail!("could not make enough room within your friends' quotas")
 }
 
+/// Restore points deleted on purpose, as kept by the node: an id everywhere, or
+/// "destination|id" at one place.
+fn forgotten(home: &Path) -> HashSet<String> {
+    fs::read(home.join("forgotten.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
 async fn run_once(
     node: &Arc<Node>,
     tag: Option<String>,
@@ -323,28 +590,33 @@ async fn run_once(
     if friends.is_empty() {
         bail!("no friends to back up to yet: use `sdb invite` or `sdb join`");
     }
+    // A forgotten restore point is never reused for a new backup: the next listing deletes
+    // it again, which would silently take the newest backup with it.
+    let gone = &forgotten(&node.home);
     let mut targets = vec![];
     let mut full = vec![];
-    for f in &friends {
-        let t = async {
-            let peer = node.peer_patient(f).await?;
-            let (used, quota) = peer.usage().await?;
-            if used > quota {
-                full.push(f.clone());
-                bail!("over quota");
-            }
-            let known = node.known(&peer, false).await?;
-            let snaps = peer
-                .list_snapshots()
-                .await?
-                .into_iter()
-                .filter_map(|(id, blob)| Some((node.open_manifest(&id, &blob).ok()?.index, id, blob)))
-                .collect();
-            Ok::<_, anyhow::Error>(Target { peer, known, added: vec![], snaps, failed: None, full: false })
-        };
-        match t.await {
-            Ok(t) => targets.push(t),
-            Err(e) if e.to_string() == "over quota" => {}
+    // All destinations are contacted at once, so a slow or silent one does not hold up the rest.
+    let probes = futures::future::join_all(friends.iter().map(|f| async move {
+        let peer = node.peer_patient(f).await?;
+        let (used, quota) = peer.usage().await?;
+        if used > quota {
+            return Ok(None);
+        }
+        let known = node.known(&peer, false).await?;
+        let snaps = peer
+            .list_snapshots()
+            .await?
+            .into_iter()
+            .filter(|(id, _)| !gone.contains(id) && !gone.contains(&format!("{}|{id}", f.id)))
+            .filter_map(|(id, blob)| Some((node.open_manifest(&id, &blob).ok()?.index, id, blob)))
+            .collect();
+        Ok::<_, anyhow::Error>(Some(Target { peer, known, added: vec![], snaps, failed: None, full: false }))
+    }))
+    .await;
+    for (f, probe) in friends.iter().zip(probes) {
+        match probe {
+            Ok(Some(t)) => targets.push(t),
+            Ok(None) => full.push(f.clone()),
             Err(e) => out.say(format!("  {} is unreachable: {e:#}", f.name)),
         }
     }
@@ -362,48 +634,128 @@ async fn run_once(
         sent: HashSet::new(),
         tx,
         new_bytes: 0,
+        zero: None,
     };
     let prev: HashMap<Vec<u8>, Entry> =
         node.load_last_index(&set.name).into_iter().map(|e| (e.path.clone(), e)).collect();
     let ex = Excludes::new(&cfg, &node.home)?;
-    let (roots, out2) = (set.paths.clone(), out.clone());
-    let job = tokio::task::spawn_blocking(move || scan(roots, ex, prev, scanner, out2));
+    let (name, roots, out2) = (set.name.clone(), set.paths.clone(), out.clone());
+    let job = tokio::task::spawn_blocking(move || scan(name, roots, ex, prev, scanner, out2));
 
     let batch_limit =
         if cfg.upload_kbps > 0 { (cfg.upload_kbps as usize * 1024).clamp(64 << 10, BATCH_BYTES) } else { BATCH_BYTES };
-    let (mut batch, mut size) = (vec![], 0);
-    let (mut total, mut told) = (0u64, std::time::Instant::now());
+    let remote = targets.iter().filter(|t| t.peer.is_remote()).count() as u64;
+    let mut lanes: Vec<Lane> = targets
+        .iter()
+        .map(|t| {
+            let (ltx, lrx) = mpsc::channel(LANE_DEPTH);
+            let done = Arc::new(AtomicU64::new(0));
+            let (peer, out, kbps, d) = (t.peer.clone(), out.clone(), cfg.upload_kbps, done.clone());
+            let task = tokio::spawn(async move {
+                let name = peer.friend.name.clone();
+                let r = lane(peer, lrx, batch_limit, kbps, remote, d).await;
+                if let Err(e) = &r {
+                    if !format!("{e:#}").contains("quota exceeded") {
+                        out.say(format!("  {name} dropped out: {e:#}"));
+                    }
+                }
+                r
+            });
+            Lane { tx: Some(ltx), task, done }
+        })
+        .collect();
+    let (mut total, mut told) = (0u64, Instant::now());
     while let Some((id, blob)) = rx.recv().await {
-        size += blob.len();
         total += blob.len() as u64;
-        batch.push((id, blob));
         if told.elapsed().as_secs() >= 2 {
-            told = std::time::Instant::now();
+            told = Instant::now();
             out.say(format!("  ... {} uploaded so far", human(total)));
             node.set_running(&set.name, Some(format!("{} uploaded so far", human(total))));
         }
-        if size >= batch_limit || batch.len() >= 512 {
-            let began = std::time::Instant::now();
-            if flush(&mut targets, &mut batch, out).await.is_err() {
-                break;
+        let item = Arc::new((id, blob));
+        for i in 0..lanes.len() {
+            if targets[i].known.contains(&item.0) {
+                continue;
             }
-            if cfg.upload_kbps > 0 {
-                // Hold the average upload rate to the limit; local drives do not count.
-                let remote = targets.iter().filter(|t| t.failed.is_none() && t.peer.is_remote()).count() as u64;
-                let owed = std::time::Duration::from_millis(size as u64 * remote * 1000 / (cfg.upload_kbps * 1024));
-                tokio::time::sleep(owed.saturating_sub(began.elapsed())).await;
+            while let Some(ltx) = lanes[i].tx.clone() {
+                let mark = lanes[i].done.load(Ordering::Relaxed);
+                match tokio::time::timeout(LAG, ltx.send(item.clone())).await {
+                    Ok(Ok(())) => break,
+                    // It stopped with an error; its result says which.
+                    Ok(Err(_)) => lanes[i].tx = None,
+                    Err(_) => {
+                        // Waiting on one destination that moved nothing all that time, while
+                        // another has nothing to do.
+                        let stuck = lanes[i].done.load(Ordering::Relaxed) == mark;
+                        let idle = stuck
+                            && lanes.iter().enumerate().any(|(j, l)| {
+                                j != i && l.tx.as_ref().is_some_and(|t| t.capacity() == t.max_capacity())
+                            });
+                        if idle {
+                            lanes[i].tx = None;
+                            lanes[i].task.abort();
+                            too_slow(&mut targets[i], out);
+                        }
+                    }
+                }
             }
-            size = 0;
+        }
+        if lanes.iter().all(|l| l.tx.is_none()) {
+            break;
         }
     }
-    let flushed = flush(&mut targets, &mut batch, out).await;
-    let full: Vec<Friend> = targets.iter().filter(|t| t.full).map(|t| t.peer.friend.clone()).collect();
-    if flushed.is_err() && !full.is_empty() {
-        drop(rx);
-        let _ = job.await;
-        return Ok(full);
+    // The rest finish what they were given. One that makes no progress for a long time
+    // while another has finished is dropped, rather than holding up the restore point.
+    let mut live = vec![];
+    for (i, l) in lanes.into_iter().enumerate() {
+        drop(l.tx);
+        live.push((i, l.task, l.done));
     }
-    flushed?;
+    let mut results: Vec<Option<Result<Vec<Id>>>> = targets.iter().map(|_| None).collect();
+    while !live.is_empty() {
+        let marks: Vec<u64> = live.iter().map(|(_, _, d)| d.load(Ordering::Relaxed)).collect();
+        let next = tokio::time::timeout(LAG, futures::future::select_all(live.iter_mut().map(|(_, h, _)| h))).await;
+        match next {
+            Ok((r, k, rest)) => {
+                drop(rest);
+                let (i, _, _) = live.swap_remove(k);
+                results[i] = Some(r.unwrap_or_else(|e| Err(anyhow!("{e}"))));
+            }
+            Err(_) => {
+                let finished = results.iter().any(|r| matches!(r, Some(Ok(_))));
+                let mut k = 0;
+                live.retain(|(i, h, d)| {
+                    let stuck = finished && d.load(Ordering::Relaxed) == marks[k];
+                    k += 1;
+                    if stuck {
+                        h.abort();
+                        too_slow(&mut targets[*i], out);
+                    }
+                    !stuck
+                });
+            }
+        }
+    }
+    for (t, r) in targets.iter_mut().zip(results) {
+        match r {
+            _ if t.failed.is_some() => {}
+            Some(Ok(ids)) => t.added = ids,
+            Some(Err(e)) => {
+                t.full = format!("{e:#}").contains("quota exceeded");
+                t.failed = Some(format!("{e:#}"));
+            }
+            None => t.failed = Some("did not finish".into()),
+        }
+    }
+    let full: Vec<Friend> = targets.iter().filter(|t| t.full).map(|t| t.peer.friend.clone()).collect();
+    if targets.iter().all(|t| t.failed.is_some()) {
+        drop(rx);
+        if !full.is_empty() {
+            let _ = job.await;
+            return Ok(full);
+        }
+        bail!("no friend could accept the backup");
+    }
     let scan = job.await??;
 
     let clock = chrono::Utc::now();
@@ -468,10 +820,19 @@ async fn run_once(
         }
     }
     node.save_index(&set.name, &scan.entries)?;
-    let skipped = if scan.skipped > 0 { format!(", {} unreadable skipped", scan.skipped) } else { String::new() };
+    let mut skipped = String::new();
+    if scan.skipped > 0 {
+        skipped += &format!(", {} unreadable skipped", scan.skipped);
+    }
+    if scan.refused > 0 {
+        skipped += &format!(", {} sparse files NOT backed up", scan.refused);
+    }
+    if scan.deferred > 0 {
+        skipped += &format!(", {} changed files left for the next run", scan.deferred);
+    }
     if stored.is_empty() && scan.new_bytes > 0 {
         out.say(format!(
-            "{prefix}no changes since the last restore point; re-sent {} that friends were missing",
+            "{prefix}no changes since the last restore point; re-sent {} that friends were missing{skipped}",
             human(scan.new_bytes)
         ));
     } else if stored.is_empty() {
@@ -492,12 +853,92 @@ async fn run_once(
         out.say(line);
         *node.last_backup.lock().unwrap() = Some(snapshot::when(manifest.time));
     }
+    if scan.refused > 0 {
+        // Data the user expects to be safe is not: say so where it will be seen, not just in passing.
+        let line = format!(
+            "{prefix}WARNING: {} sparse files are NOT in this restore point (marked NOT BACKED UP above)",
+            scan.refused
+        );
+        node.note(line.clone());
+        out.say(line);
+    }
     Ok(full)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_swapped_or_sparse_file_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("sdb-test-scan-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("secret"), "owner only").unwrap();
+        fs::write(dir.join("plain"), "hello").unwrap();
+        let seen = fs::symlink_metadata(dir.join("plain")).unwrap();
+        assert_eq!(open_scanned(&dir.join("plain"), seen.dev(), seen.ino()).unwrap().1, 5);
+        // The file is replaced by a link to something else after the scan looked at it.
+        fs::remove_file(dir.join("plain")).unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("plain")).unwrap();
+        assert!(open_scanned(&dir.join("plain"), seen.dev(), seen.ino()).is_err());
+        // Or by a different regular file.
+        fs::remove_file(dir.join("plain")).unwrap();
+        fs::rename(dir.join("secret"), dir.join("plain")).unwrap();
+        fs::write(dir.join("other"), "x").unwrap();
+        let other = fs::symlink_metadata(dir.join("other")).unwrap();
+        assert!(open_scanned(&dir.join("plain"), other.dev(), other.ino()).is_err());
+        // A hole beyond any real disk image is refused before anything is read.
+        let sparse = fs::File::create(dir.join("sparse")).unwrap();
+        if sparse.set_len(MAX_HOLES + (1 << 30)).is_ok() {
+            let err = holes(&sparse, MAX_HOLES + (1 << 30)).unwrap_err();
+            assert!(err.to_string().starts_with("sparse file"), "{err}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Collects what a file chunks into, zeros included.
+    struct Collect(Vec<u8>);
+
+    impl Sink for Collect {
+        fn data(&mut self, data: &[u8]) -> Result<Id> {
+            self.0.extend_from_slice(data);
+            Ok([1; 32])
+        }
+
+        fn zeros(&mut self) -> Result<Id> {
+            self.0.resize(self.0.len() + MAX_CHUNK, 0);
+            Ok([0; 32])
+        }
+    }
+
+    #[test]
+    fn holes_become_zero_chunks_without_changing_the_content() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("sdb-test-holes-{}", rand::random::<u64>()));
+        let mut f = fs::File::create(&path).unwrap();
+        let (head, tail) = (noise(3 << 20), noise(1 << 20));
+        f.write_all(&head).unwrap();
+        f.seek(std::io::SeekFrom::Start((3 << 20) + (64 << 20) + 12345)).unwrap();
+        f.write_all(&tail).unwrap();
+        // A trailing hole too.
+        f.set_len((3 << 20) + (64 << 20) + 12345 + (1 << 20) + (9 << 20)).unwrap();
+        drop(f);
+        let f = fs::File::open(&path).unwrap();
+        let len = f.metadata().unwrap().len();
+        let mut sink = Collect(vec![]);
+        let (size, _, skipped) = chunk_file(&f, len, &mut sink).unwrap();
+        assert_eq!(size, len);
+        assert_eq!(sink.0, fs::read(&path).unwrap());
+        assert_eq!(skipped % MAX_CHUNK as u64, 0);
+        // A file without holes chunks exactly as a plain read does.
+        fs::write(&path, noise(6 << 20)).unwrap();
+        let f = fs::File::open(&path).unwrap();
+        let (_, ids, skipped) = chunk_file(&f, 6 << 20, &mut Collect(vec![])).unwrap();
+        assert_eq!(skipped, 0);
+        let plain = StreamCDC::new(fs::File::open(&path).unwrap(), MIN_CHUNK, AVG_CHUNK, MAX_CHUNK).count();
+        assert_eq!(ids.len(), plain);
+        fs::remove_file(path).unwrap();
+    }
 
     /// Deterministic noise, so chunk boundaries are realistic and the test is repeatable.
     fn noise(len: usize) -> Vec<u8> {

@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     net::SocketAddr,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -76,6 +75,10 @@ pub struct Friend {
     /// Set for a local destination (an external drive or folder) instead of a friend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// For a drive: the mark written on it when it was added, so another disk mounted
+    /// at the same place is not mistaken for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -110,6 +113,8 @@ pub struct BackupSet {
     #[serde(default)]
     pub paths: Vec<PathBuf>,
     /// Names of the friends or drives this set goes to; empty means every one that is switched on.
+    /// That is how "everywhere" has always been stored (the default set starts that way), so an
+    /// empty list must only ever be written on purpose: see `EVERYWHERE` and `NOWHERE`.
     #[serde(default)]
     pub destinations: Vec<String>,
     /// Minutes between automatic backups of this set (0 = each destination's own pace).
@@ -138,6 +143,23 @@ impl BackupSet {
 }
 
 pub const DEFAULT_SET: &str = "default";
+
+/// Stands in a set's destination list when its last destination was removed, so the set
+/// goes nowhere instead of everywhere. No friend or drive can carry this name.
+pub const NOWHERE: &str = "(none)";
+
+/// What a request to change a set's destinations sends to mean every destination; it is
+/// stored as the empty list. An empty request is refused, so a list emptied by mistake never
+/// widens a set. No friend or drive can carry this name.
+pub const EVERYWHERE: &str = "(all)";
+
+/// Words that mean something where destinations are named (`--to all`), so no friend, drive,
+/// set or node may be called by one of them, in any case.
+const RESERVED: &[&str] = &["all", "none", "everywhere", "nowhere", EVERYWHERE, NOWHERE];
+
+pub fn reserved(name: &str) -> bool {
+    RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name.trim()))
+}
 
 pub const CONFIG_FORMAT: u32 = 1;
 
@@ -259,12 +281,17 @@ impl Config {
     }
 }
 
+/// Writes a file only its owner can read. The temporary file is new, private from the
+/// start and never opened through a link someone else left in the folder.
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let tmp = path.with_extension(format!("tmp{:016x}", rand::random::<u64>()));
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    let done = f.write_all(data).and_then(|_| fs::rename(&tmp, path));
+    if done.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    Ok(done?)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -368,6 +395,7 @@ impl Friend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn friend(name: &str, drive: bool) -> Friend {
         Friend {
@@ -379,6 +407,7 @@ mod tests {
             addrs: vec![],
             every_minutes: 0,
             max_in_kbps: 0,
+            drive_key: None,
             path: drive.then(|| PathBuf::from("/tmp")),
         }
     }
@@ -443,6 +472,12 @@ mod tests {
         let again = Config::load(&dir).unwrap();
         assert_eq!(again.all_paths(), c.all_paths());
         assert_eq!(fs::metadata(dir.join("config.toml")).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // A link planted where the old fixed temporary name was is not written through.
+        fs::write(dir.join("victim"), "untouched").unwrap();
+        std::os::unix::fs::symlink(dir.join("victim"), dir.join("config.tmp")).unwrap();
+        c.save(&dir).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("victim")).unwrap(), "untouched");
 
         fs::write(dir.join("config.toml"), "name = \"new\"\nformat = 99\n").unwrap();
         assert!(Config::load(&dir).is_err(), "a newer config format must be refused");
