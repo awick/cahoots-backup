@@ -10,6 +10,7 @@ Friends only ever hold ciphertext.
 ```bash
 cargo build --release              # binary is target/release/sdb
 sdb tui                            # interactive: backup sets, restore, destinations, settings
+sdb gui                            # the same in a window
 ```
 
 Or from the command line:
@@ -53,6 +54,7 @@ restore point shortly after files stop changing.
 | `sdb destination limit NAME KBPS` | fastest a friend may send backups to your computer (0 = unlimited) |
 | `sdb set NAME --rename NEW` | rename a backup set; its restore points stay with it |
 | `sdb destination backup-to NAME false` | stop using a destination |
+| `sdb verify --set NAME` | the same checks for one backup set (also on each set in the TUI and GUI) |
 | `sdb verify [--full]` | check friends still hold your data and it decrypts; repairs damage from another friend |
 | `sdb verify --local` | fingerprint your unmodified files against the last backup to catch silent disk corruption |
 | `sdb scrub` | check the data friends store on your computer for disk damage |
@@ -77,6 +79,14 @@ when each last got a backup), its schedule, and what it is doing right now.
 | Settings | hours, pause, pace, upload limit, warnings and history rules that apply to every set |
 | History | what the daemon has done since it started |
 | Status | the full `sdb status` report |
+
+## The GUI
+
+`sdb gui` opens the same thing in a window: the backup sets with their status,
+restore with a timeline, destinations, defaults, history and status. It is
+another client of the daemon, built with egui into the same binary. It needs a
+desktop session only when you run it; everything else works without one. Build
+with `cargo build --release --no-default-features` to leave it out.
 
 ## The daemon
 

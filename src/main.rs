@@ -9,6 +9,8 @@ mod backup;
 mod config;
 mod control;
 mod crypto;
+#[cfg(feature = "gui")]
+mod gui;
 mod net;
 mod node;
 mod proto;
@@ -184,6 +186,9 @@ enum C {
         /// Instead, fingerprint this computer's unmodified files against the last backup
         #[arg(long)]
         local: bool,
+        /// Only this backup set
+        #[arg(long)]
+        set: Option<String>,
     },
     /// Check the data friends store on this computer for disk damage
     Scrub,
@@ -191,9 +196,11 @@ enum C {
     Status,
     /// Stop the background daemon (the next command starts it again)
     Stop,
-    /// Interactive setup: pick folders and friends, browse and restore files
+    /// The interface in the terminal: backup sets, restore, destinations, settings
     #[command(alias = "setup")]
     Tui,
+    /// The same in a window
+    Gui,
     /// Export or import the recovery kit you need after losing this computer
     Recovery {
         #[command(subcommand)]
@@ -412,6 +419,19 @@ async fn real_main() -> Result<()> {
         }
         C::Daemon => return daemon(home).await,
         C::Tui => return tui_main(home).await,
+        #[cfg(feature = "gui")]
+        C::Gui => {
+            if !home.join("identity.key").exists() {
+                fs::create_dir_all(&home)?;
+                fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+                Identity::generate().save(&home)?;
+                Config::new(hostname()).save(&home)?;
+            }
+            drop(daemon_stream(&home).await?);
+            return gui::run(home);
+        }
+        #[cfg(not(feature = "gui"))]
+        C::Gui => bail!("this sdb was built without the graphical interface; use `sdb tui`"),
         C::Service { cmd } => {
             return match cmd {
                 ServiceCmd::Install => {
@@ -536,7 +556,7 @@ async fn real_main() -> Result<()> {
         }
         C::Prune { dry_run } => Cmd::Prune { dry_run },
         C::Forget { snap } => Cmd::Forget { snap },
-        C::Verify { full, local } => Cmd::Verify { full, local },
+        C::Verify { full, local, set } => Cmd::Verify { full, local, set },
         C::Scrub => Cmd::Scrub,
         C::Status => Cmd::Status,
         C::Stop => Cmd::Stop,

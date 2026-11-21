@@ -66,6 +66,8 @@ pub enum Cmd {
     Verify {
         full: bool,
         local: bool,
+        /// Only this backup set (None = all of them).
+        set: Option<String>,
     },
     Scrub,
     Status,
@@ -916,14 +918,15 @@ impl Node {
     }
 
     /// Checks what friends hold for us and repairs damaged or missing chunks from another friend.
-    pub async fn verify(&self, full: bool, out: &Out) -> Result<()> {
+    pub async fn verify(&self, full: bool, set: Option<&str>, out: &Out) -> Result<()> {
         let (snaps, peers) = self.snapshots(out).await?;
         let (mut repaired, mut lost) = (0u64, 0u64);
         for p in &peers {
             let have = self.known(p, true).await?;
             let mut refs: HashSet<Id> = HashSet::new();
             let mut count = 0;
-            for s in snaps.iter().filter(|s| s.peers.iter().any(|(f, _)| f.id == p.friend.id)) {
+            let mine = |s: &&Snap| set.is_none_or(|n| s.m.set == n) && s.peers.iter().any(|(f, _)| f.id == p.friend.id);
+            for s in snaps.iter().filter(mine) {
                 count += 1;
                 refs.extend(s.m.index.iter().copied());
                 for e in self.load_index(s).await? {
@@ -940,7 +943,13 @@ impl Node {
                 ids.truncate(32);
             }
             let mut read = 0u64;
+            let (mut done, mut told) = (0usize, Instant::now());
             for batch in ids.chunks(16) {
+                done += batch.len();
+                if told.elapsed() >= Duration::from_secs(2) {
+                    told = Instant::now();
+                    out.say(format!("  ... {}: checked {done} of {} chunks", p.friend.name, ids.len()));
+                }
                 for (id, blob) in batch.iter().zip(p.get_chunks(batch).await?) {
                     match blob.ok_or_else(|| anyhow!("missing")).and_then(|b| self.keys.open(id, &b)) {
                         Ok(d) => read += d.len() as u64,
@@ -995,8 +1004,13 @@ impl Node {
         Ok(())
     }
 
-    async fn check_local(&self, out: &Out) -> Result<()> {
-        let last: Vec<Entry> = self.cfg().sets.iter().flat_map(|s| self.load_last_index(&s.name)).collect();
+    async fn check_local(&self, set: Option<&str>, out: &Out) -> Result<()> {
+        let sets = self.cfg().sets;
+        let last: Vec<Entry> = sets
+            .iter()
+            .filter(|s| set.is_none_or(|n| s.name == n))
+            .flat_map(|s| self.load_last_index(&s.name))
+            .collect();
         let (keys, out2) = (self.keys.clone(), out.clone());
         let (checked, bad) = tokio::task::spawn_blocking(move || backup::check_local(&keys, last, &out2)).await?;
         if bad > 0 {
@@ -1478,8 +1492,9 @@ impl Node {
                 let _op = self.op.lock().await;
                 self.prune(false, Some(snap), out).await
             }
-            Cmd::Verify { local: true, .. } => self.check_local(out).await,
-            Cmd::Verify { full, .. } => self.verify(full, out).await,
+            Cmd::Verify { set: Some(name), .. } if self.cfg().set(&name).is_none() => bail!("no set named {name}"),
+            Cmd::Verify { local: true, set, .. } => self.check_local(set.as_deref(), out).await,
+            Cmd::Verify { full, set, .. } => self.verify(full, set.as_deref(), out).await,
             Cmd::Scrub => self.scrub(out).await,
             Cmd::Status => self.status(out).await,
             Cmd::Invite => self.invite(out).await,

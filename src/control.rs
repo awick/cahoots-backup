@@ -58,6 +58,14 @@ pub async fn connect(home: &Path) -> Option<UnixStream> {
     UnixStream::connect(&path).await.ok()
 }
 
+/// The daemon's socket path, if it exists and belongs to this user.
+pub fn own_socket(home: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let path = sock_path(home);
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    (md.uid() == rustix::process::getuid().as_raw()).then_some(path)
+}
+
 pub fn listen(home: &Path) -> Result<UnixListener> {
     let path = sock_path(home);
     let _ = std::fs::remove_file(&path);

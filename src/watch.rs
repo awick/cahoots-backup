@@ -185,7 +185,7 @@ pub async fn run(node: Arc<Node>, out: Out) {
             if last_check.elapsed() > Duration::from_secs(7 * 86400) {
                 last_check = Instant::now();
                 let _ = node.scrub(&out).await;
-                if let Err(e) = node.verify(false, &out).await {
+                if let Err(e) = node.verify(false, None, &out).await {
                     out.say(format!("verify: {e:#}"));
                 }
             }

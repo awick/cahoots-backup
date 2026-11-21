@@ -73,10 +73,10 @@ fn lines_or_error(r: Result<Vec<String>>) -> Vec<String> {
     })
 }
 
-type Item = (String, bool, u64);
-type Listing = Vec<(String, bool, u64, String)>;
+pub(crate) type Item = (String, bool, u64);
+pub(crate) type Listing = Vec<(String, bool, u64, String)>;
 
-fn parse_listing(lines: Vec<String>) -> Listing {
+pub(crate) fn parse_listing(lines: Vec<String>) -> Listing {
     lines
         .iter()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -147,7 +147,7 @@ impl Tree {
     }
 }
 
-fn list_dir(dir: &str, hidden: bool) -> Vec<Item> {
+pub(crate) fn list_dir(dir: &str, hidden: bool) -> Vec<Item> {
     let mut v: Vec<Item> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -162,12 +162,12 @@ fn list_dir(dir: &str, hidden: bool) -> Vec<Item> {
     v
 }
 
-fn name(path: &str) -> String {
+pub(crate) fn name(path: &str) -> String {
     Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
 }
 
 /// "5 min ago", "3 h ago", "2 days ago" or "never".
-fn ago(ts: Option<i64>) -> String {
+pub(crate) fn ago(ts: Option<i64>) -> String {
     let Some(t) = ts else { return "never".into() };
     let s = (chrono::Utc::now().timestamp() - t).max(0);
     match s {
@@ -179,7 +179,7 @@ fn ago(ts: Option<i64>) -> String {
 }
 
 /// "now", "in 5 min" or "in 3 h".
-fn until(ts: i64) -> String {
+pub(crate) fn until(ts: i64) -> String {
     let s = ts - chrono::Utc::now().timestamp();
     match s {
         i64::MIN..=20 => "any moment".into(),
@@ -190,7 +190,7 @@ fn until(ts: i64) -> String {
 }
 
 /// Shortens a path by replacing the home folder with `~`.
-fn tilde(path: &str) -> String {
+pub(crate) fn tilde(path: &str) -> String {
     match std::env::var("HOME") {
         Ok(h) if !h.is_empty() && path.starts_with(&h) => format!("~{}", &path[h.len()..]),
         _ => path.to_string(),
@@ -277,6 +277,9 @@ enum Prompt {
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
     BackupSet,
+    VerifySet,
+    VerifySetFull,
+    VerifySetLocal,
     BackupAll,
     NewSet,
     DeleteSet,
@@ -305,6 +308,10 @@ enum Act {
     Newer,
     Refresh,
 }
+
+/// Where "Files and folders" and "Destinations" sit in a set's menu.
+const SET_FILES: usize = 4;
+const SET_DESTS: usize = 5;
 
 /// The pages, in the order of the top-level menu.
 const BACKUP: usize = 0;
@@ -905,6 +912,9 @@ impl App {
             }
             Kind::Set(n) => vec![
                 act("Back up now".into(), Act::BackupSet),
+                act("Verify (quick check)".into(), Act::VerifySet),
+                act("Verify everything (slow)".into(), Act::VerifySetFull),
+                act("Verify the files on this computer".into(), Act::VerifySetLocal),
                 ("Files and folders".into(), Choice::Focus),
                 ("Destinations".into(), Choice::Focus),
                 go("Schedule and history", Kind::Rules(n.clone())),
@@ -1026,9 +1036,9 @@ impl App {
                 if matches!(kind, Kind::Rules(_)) {
                     self.sub = Sub::Rules;
                     self.rules.select(Some(sel));
-                } else if sel == 1 {
+                } else if sel == SET_FILES {
                     self.sub = Sub::Files;
-                } else if sel == 2 {
+                } else if sel == SET_DESTS {
                     self.sub = Sub::Dests;
                 }
             }
@@ -1064,6 +1074,12 @@ impl App {
                 self.start("backing up", |ex, pr| async move {
                     Done::BackedUp(lines_or_error(ex.live(Cmd::Backup { tag: None, set }, &pr).await))
                 });
+            }
+            Act::VerifySet | Act::VerifySetFull | Act::VerifySetLocal => {
+                let Some(set) = self.picked_set() else { return };
+                let cmd =
+                    Cmd::Verify { full: a == Act::VerifySetFull, local: a == Act::VerifySetLocal, set: Some(set) };
+                self.start("verifying", |ex, pr| async move { Done::Popup(lines_or_error(ex.live(cmd, &pr).await)) });
             }
             Act::NewSet => self.input = Some((Prompt::NewSet, String::new())),
             Act::RenameSet => {
@@ -1386,7 +1402,7 @@ impl App {
                     self.set = name.clone();
                     self.apply(self.set_edit(None)).await;
                     let idx = self.cfg.sets.iter().position(|b| b.name == name).unwrap_or(0);
-                    self.stack = vec![(Kind::Root, BACKUP), (Kind::Backup, idx), (Kind::Set(name), 1)];
+                    self.stack = vec![(Kind::Root, BACKUP), (Kind::Backup, idx), (Kind::Set(name), SET_FILES)];
                     self.in_menu = false;
                     self.status = format!("set \"{}\" created: mark what it backs up with space, then esc", self.set);
                 }

@@ -125,6 +125,11 @@ TOOK=$(($(date +%s) - START))
 [ "$TOOK" -ge 3 ] || fail "4 MB arrived in ${TOOK}s despite a 1000 KB/s limit"
 b destination limit alice 0 >/dev/null
 
+step "verify one set"
+a verify --set pics | grep -q "usb: " || fail "verify of one set"
+a verify --set pics | grep -q "bob: 0 restore points" || fail "a set that is not sent to bob was counted there"
+a verify --set nosuchset >/dev/null 2>&1 && fail "verify accepted a set that does not exist"
+
 step "prune and local fingerprint check"
 a keep --last 1 --hourly 0 --daily 0 --weekly 0 --monthly 0 >/dev/null
 a prune | grep -q "restore points kept" || fail "prune"
