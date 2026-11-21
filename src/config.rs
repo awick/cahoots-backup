@@ -40,7 +40,15 @@ pub struct VersionRule {
 
 impl Default for Retention {
     fn default() -> Self {
-        Retention { keep_last: 24, keep_hourly: 48, keep_daily: 30, keep_weekly: 12, keep_monthly: 24, keep_days: 0, max_versions: 0 }
+        Retention {
+            keep_last: 24,
+            keep_hourly: 48,
+            keep_daily: 30,
+            keep_weekly: 12,
+            keep_monthly: 24,
+            keep_days: 0,
+            max_versions: 0,
+        }
     }
 }
 
@@ -119,7 +127,11 @@ impl BackupSet {
 
     /// Seconds between automatic backups of this set to one destination.
     pub fn interval_secs(&self, f: &Friend, cfg: &Config) -> u64 {
-        if self.every_minutes > 0 { self.every_minutes as u64 * 60 } else { f.interval_secs(cfg) }
+        if self.every_minutes > 0 {
+            self.every_minutes as u64 * 60
+        } else {
+            f.interval_secs(cfg)
+        }
     }
 }
 
@@ -205,10 +217,17 @@ impl Config {
             upnp: true,
             store_dir: None,
             paths: vec![],
-            exclude: vec!["**/.DS_Store".into(), "**/.Trash".into(), "**/*.sdb-tmp".into()],
+            exclude: vec![
+                "**/.DS_Store".into(),
+                "**/.Trash".into(),
+                "**/*.sdb-tmp".into(),
+            ],
             retention: Retention::default(),
             version_rules: vec![],
-            sets: vec![BackupSet { name: DEFAULT_SET.into(), ..Default::default() }],
+            sets: vec![BackupSet {
+                name: DEFAULT_SET.into(),
+                ..Default::default()
+            }],
             friends: vec![],
             invites: vec![],
         }
@@ -218,22 +237,33 @@ impl Config {
         let p = home.join("config.toml");
         let s = fs::read_to_string(&p)
             .with_context(|| format!("cannot read {} (run `sdb init` first)", p.display()))?;
-        let mut c: Config = toml::from_str(&s).with_context(|| format!("bad config {}", p.display()))?;
+        let mut c: Config =
+            toml::from_str(&s).with_context(|| format!("bad config {}", p.display()))?;
         if c.sets.is_empty() {
-            c.sets.push(BackupSet { name: DEFAULT_SET.into(), ..Default::default() });
+            c.sets.push(BackupSet {
+                name: DEFAULT_SET.into(),
+                ..Default::default()
+            });
         }
         if !c.paths.is_empty() {
             let old = std::mem::take(&mut c.paths);
             c.sets[0].paths.extend(old);
         }
         if c.format > CONFIG_FORMAT {
-            anyhow::bail!("{} is in format {} but this sdb only reads up to {CONFIG_FORMAT}; upgrade sdb", p.display(), c.format);
+            anyhow::bail!(
+                "{} is in format {} but this sdb only reads up to {CONFIG_FORMAT}; upgrade sdb",
+                p.display(),
+                c.format
+            );
         }
         Ok(c)
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {
-        write_private(&home.join("config.toml"), toml::to_string_pretty(self)?.as_bytes())
+        write_private(
+            &home.join("config.toml"),
+            toml::to_string_pretty(self)?.as_bytes(),
+        )
     }
 
     pub fn store_dir(&self, home: &Path) -> PathBuf {
@@ -276,7 +306,10 @@ impl Identity {
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {
-        write_private(&home.join("identity.key"), serde_json::to_string(self)?.as_bytes())
+        write_private(
+            &home.join("identity.key"),
+            serde_json::to_string(self)?.as_bytes(),
+        )
     }
 
     pub fn bytes(s: &str) -> Result<[u8; 32]> {
@@ -300,7 +333,11 @@ impl Config {
 
     /// The same for one set, whose own hours take the place of the general ones.
     pub fn held_for(&self, set: &BackupSet) -> Option<String> {
-        self.held_with(if set.hours.is_empty() { &self.backup_hours } else { &set.hours })
+        self.held_with(if set.hours.is_empty() {
+            &self.backup_hours
+        } else {
+            &set.hours
+        })
     }
 
     fn held_with(&self, hours: &str) -> Option<String> {
@@ -311,12 +348,19 @@ impl Config {
         }
         let (a, b) = parse_hours(hours)?;
         let h = now.hour();
-        let inside = if a < b { h >= a && h < b } else { h >= a || h < b };
+        let inside = if a < b {
+            h >= a && h < b
+        } else {
+            h >= a || h < b
+        };
         (!inside).then(|| format!("outside the backup hours {hours}"))
     }
 
     pub fn all_paths(&self) -> Vec<PathBuf> {
-        self.sets.iter().flat_map(|s| s.paths.iter().cloned()).collect()
+        self.sets
+            .iter()
+            .flat_map(|s| s.paths.iter().cloned())
+            .collect()
     }
 
     pub fn set(&self, name: &str) -> Option<&BackupSet> {
@@ -332,5 +376,102 @@ impl Friend {
             (0, Some(_)) => cfg.min_interval_secs,
             (n, _) => n as u64 * 60,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn friend(name: &str, drive: bool) -> Friend {
+        Friend {
+            name: name.into(),
+            id: name.into(),
+            quota_gb: 1,
+            backup_to: true,
+            relay: None,
+            addrs: vec![],
+            every_minutes: 0,
+            path: drive.then(|| PathBuf::from("/tmp")),
+        }
+    }
+
+    #[test]
+    fn hours() {
+        assert_eq!(parse_hours("22-7"), Some((22, 7)));
+        assert_eq!(parse_hours(" 9 - 17 "), Some((9, 17)));
+        assert_eq!(parse_hours("7-7"), None);
+        assert_eq!(parse_hours("25-3"), None);
+        assert_eq!(parse_hours("always"), None);
+    }
+
+    #[test]
+    fn pacing_defaults() {
+        let cfg = Config::new("n".into());
+        assert_eq!(friend("bob", false).interval_secs(&cfg), 3600);
+        assert_eq!(
+            friend("usb", true).interval_secs(&cfg),
+            cfg.min_interval_secs
+        );
+        let mut f = friend("bob", false);
+        f.every_minutes = 10;
+        assert_eq!(f.interval_secs(&cfg), 600);
+        let set = BackupSet {
+            name: "s".into(),
+            every_minutes: 5,
+            ..Default::default()
+        };
+        assert_eq!(set.interval_secs(&f, &cfg), 300);
+    }
+
+    #[test]
+    fn set_destinations() {
+        let all = BackupSet {
+            name: "a".into(),
+            ..Default::default()
+        };
+        let one = BackupSet {
+            name: "b".into(),
+            destinations: vec!["usb".into()],
+            ..Default::default()
+        };
+        let mut off = friend("bob", false);
+        assert!(all.sends_to(&off) && !one.sends_to(&off) && one.sends_to(&friend("usb", true)));
+        off.backup_to = false;
+        assert!(!all.sends_to(&off));
+    }
+
+    #[test]
+    fn old_config_moves_folders_into_the_default_set() {
+        let dir = std::env::temp_dir().join(format!("sdb-test-cfg-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.toml"),
+            "name = \"old\"\npaths = [\"/home/me/Documents\"]\n",
+        )
+        .unwrap();
+        let c = Config::load(&dir).unwrap();
+        assert!(c.paths.is_empty());
+        assert_eq!(c.sets.len(), 1);
+        assert_eq!(c.sets[0].name, DEFAULT_SET);
+        assert_eq!(c.all_paths(), vec![PathBuf::from("/home/me/Documents")]);
+        c.save(&dir).unwrap();
+        let again = Config::load(&dir).unwrap();
+        assert_eq!(again.all_paths(), c.all_paths());
+        assert_eq!(
+            fs::metadata(dir.join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        fs::write(dir.join("config.toml"), "name = \"new\"\nformat = 99\n").unwrap();
+        assert!(
+            Config::load(&dir).is_err(),
+            "a newer config format must be refused"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

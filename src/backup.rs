@@ -6,9 +6,9 @@ use crate::{
     crypto::{Id, Keys},
     net::Peer,
     node::{Node, Out},
-    snapshot::{self, human, Entry, Kind, Manifest},
+    snapshot::{self, Entry, Kind, Manifest, human},
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use fastcdc::v2020::{FastCDC, StreamCDC};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::{
@@ -38,7 +38,10 @@ impl Excludes {
         for p in &cfg.exclude {
             b.add(Glob::new(p).map_err(|e| anyhow!("bad exclude pattern {p}: {e}"))?);
         }
-        Ok(Excludes { globs: b.build()?, dirs: vec![home.to_path_buf(), cfg.store_dir(home)] })
+        Ok(Excludes {
+            globs: b.build()?,
+            dirs: vec![home.to_path_buf(), cfg.store_dir(home)],
+        })
     }
 
     pub fn is_excluded(&self, p: &Path) -> bool {
@@ -69,14 +72,17 @@ impl Scanner {
         if !self.sent.contains(&id) && !self.known.iter().all(|k| k.contains(&id)) {
             let blob = self.keys.seal(&id, data)?;
             self.new_bytes += blob.len() as u64;
-            self.tx.blocking_send((id, blob)).map_err(|_| anyhow!("upload stopped"))?;
+            self.tx
+                .blocking_send((id, blob))
+                .map_err(|_| anyhow!("upload stopped"))?;
             self.sent.insert(id);
         }
         Ok(id)
     }
 
     fn have(&self, ids: &[Id]) -> bool {
-        ids.iter().all(|id| self.sent.contains(id) || self.known.iter().all(|k| k.contains(id)))
+        ids.iter()
+            .all(|id| self.sent.contains(id) || self.known.iter().all(|k| k.contains(id)))
     }
 }
 
@@ -87,7 +93,14 @@ fn scan(
     mut sc: Scanner,
     out: Out,
 ) -> Result<Scan> {
-    let mut res = Scan { entries: vec![], index: vec![], files: 0, bytes: 0, new_bytes: 0, skipped: 0 };
+    let mut res = Scan {
+        entries: vec![],
+        index: vec![],
+        files: 0,
+        bytes: 0,
+        new_bytes: 0,
+        skipped: 0,
+    };
     for root in &roots {
         let walk = walkdir::WalkDir::new(root)
             .follow_links(false)
@@ -116,7 +129,10 @@ fn scan(
             } else if ft.is_file() {
                 let reuse = prev.get(&path).and_then(|p| match &p.kind {
                     Kind::File { size, chunks }
-                        if *size == md.size() && p.mtime == mtime && p.ino == md.ino() && sc.have(chunks) =>
+                        if *size == md.size()
+                            && p.mtime == mtime
+                            && p.ino == md.ino()
+                            && sc.have(chunks) =>
                     {
                         Some(chunks.clone())
                     }
@@ -140,7 +156,15 @@ fn scan(
             } else {
                 continue;
             };
-            res.entries.push(Entry { path, mode: md.mode(), uid: md.uid(), gid: md.gid(), mtime, ino: md.ino(), kind });
+            res.entries.push(Entry {
+                path,
+                mode: md.mode(),
+                uid: md.uid(),
+                gid: md.gid(),
+                mtime,
+                ino: md.ino(),
+                kind,
+            });
         }
     }
     res.entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -154,7 +178,9 @@ fn scan(
 }
 
 pub fn split_index(buf: &[u8]) -> Vec<&[u8]> {
-    FastCDC::new(buf, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK).map(|c| &buf[c.offset..c.offset + c.length]).collect()
+    FastCDC::new(buf, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK)
+        .map(|c| &buf[c.offset..c.offset + c.length])
+        .collect()
 }
 
 /// Re-reads local files that look unchanged since the last backup and compares
@@ -162,20 +188,34 @@ pub fn split_index(buf: &[u8]) -> Vec<&[u8]> {
 pub fn check_local(keys: &Keys, last: Vec<Entry>, out: &Out) -> (u64, u64) {
     let (mut checked, mut bad) = (0, 0);
     for e in last {
-        let Kind::File { size, chunks } = &e.kind else { continue };
+        let Kind::File { size, chunks } = &e.kind else {
+            continue;
+        };
         let path = e.path();
-        let Ok(md) = fs::symlink_metadata(&path) else { continue };
-        if md.size() != *size || md.mtime() * 1_000_000_000 + md.mtime_nsec() != e.mtime || md.ino() != e.ino {
+        let Ok(md) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if md.size() != *size
+            || md.mtime() * 1_000_000_000 + md.mtime_nsec() != e.mtime
+            || md.ino() != e.ino
+        {
             continue;
         }
-        let Ok(f) = fs::File::open(&path) else { continue };
-        let now: Option<Vec<Id>> = StreamCDC::new(f, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK).map(|c| c.ok().map(|c| keys.chunk_id(&c.data))).collect();
+        let Ok(f) = fs::File::open(&path) else {
+            continue;
+        };
+        let now: Option<Vec<Id>> = StreamCDC::new(f, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK)
+            .map(|c| c.ok().map(|c| keys.chunk_id(&c.data)))
+            .collect();
         checked += 1;
         match now {
             Some(ids) if ids == *chunks => {}
             Some(_) => {
                 bad += 1;
-                out.say(format!("  CORRUPT? {} no longer matches its backup although it was not modified", path.display()));
+                out.say(format!(
+                    "  CORRUPT? {} no longer matches its backup although it was not modified",
+                    path.display()
+                ));
             }
             None => {
                 bad += 1;
@@ -209,7 +249,10 @@ struct Target {
 
 async fn flush(targets: &mut [Target], batch: &mut Vec<(Id, Vec<u8>)>, out: &Out) -> Result<()> {
     let results = futures::future::join_all(targets.iter().map(|t| {
-        let items: Vec<&(Id, Vec<u8>)> = batch.iter().filter(|(id, _)| !t.known.contains(id)).collect();
+        let items: Vec<&(Id, Vec<u8>)> = batch
+            .iter()
+            .filter(|(id, _)| !t.known.contains(id))
+            .collect();
         async move {
             if t.failed.is_some() || items.is_empty() {
                 return Ok(vec![]);
@@ -240,17 +283,32 @@ async fn flush(targets: &mut [Target], batch: &mut Vec<(Id, Vec<u8>)>, out: &Out
 
 /// Backs up one set (or all of them). When a friend's quota is hit, trims the oldest
 /// restore points stored with that friend and tries again.
-pub async fn run(node: &Arc<Node>, tag: Option<String>, set: Option<&str>, only: Option<&HashSet<String>>, out: &Out) -> Result<()> {
+pub async fn run(
+    node: &Arc<Node>,
+    tag: Option<String>,
+    set: Option<&str>,
+    only: Option<&HashSet<String>>,
+    out: &Out,
+) -> Result<()> {
     let _op = node.op.lock().await;
     let cfg = node.cfg();
-    let sets: Vec<BackupSet> = cfg.sets.iter().filter(|s| set.is_none_or(|n| n == s.name) && !s.paths.is_empty()).cloned().collect();
+    let sets: Vec<BackupSet> = cfg
+        .sets
+        .iter()
+        .filter(|s| set.is_none_or(|n| n == s.name) && !s.paths.is_empty())
+        .cloned()
+        .collect();
     if sets.is_empty() {
         bail!("nothing to back up yet: use `sdb add <path>`");
     }
     let label = sets.len() > 1 || cfg.sets.len() > 1;
     let mut failed = None;
     for s in &sets {
-        let prefix = if label { format!("[{}] ", s.name) } else { String::new() };
+        let prefix = if label {
+            format!("[{}] ", s.name)
+        } else {
+            String::new()
+        };
         if let Err(e) = run_set(node, tag.clone(), s, only, &prefix, out).await {
             out.say(format!("{prefix}{e:#}"));
             failed = Some(e);
@@ -263,7 +321,14 @@ pub async fn run(node: &Arc<Node>, tag: Option<String>, set: Option<&str>, only:
     }
 }
 
-async fn run_set(node: &Arc<Node>, tag: Option<String>, set: &BackupSet, only: Option<&HashSet<String>>, prefix: &str, out: &Out) -> Result<()> {
+async fn run_set(
+    node: &Arc<Node>,
+    tag: Option<String>,
+    set: &BackupSet,
+    only: Option<&HashSet<String>>,
+    prefix: &str,
+    out: &Out,
+) -> Result<()> {
     let mut skip = HashSet::new();
     for _ in 0..20 {
         let full = run_once(node, tag.clone(), set, &skip, only, prefix, out).await?;
@@ -271,9 +336,15 @@ async fn run_set(node: &Arc<Node>, tag: Option<String>, set: &BackupSet, only: O
             return Ok(());
         }
         for f in full {
-            out.say(format!("  {} is at the quota they gave you, removing your oldest restore points there", f.name));
+            out.say(format!(
+                "  {} is at the quota they gave you, removing your oldest restore points there",
+                f.name
+            ));
             if !node.evict(&f, out).await.unwrap_or(false) {
-                out.say(format!("  {}: quota is too small for even one restore point, skipping them", f.name));
+                out.say(format!(
+                    "  {}: quota is too small for even one restore point, skipping them",
+                    f.name
+                ));
                 skip.insert(f.id);
             }
         }
@@ -291,7 +362,14 @@ async fn run_once(
     out: &Out,
 ) -> Result<Vec<Friend>> {
     let cfg = node.cfg();
-    let friends: Vec<_> = cfg.friends.iter().filter(|f| set.sends_to(f) && !skip.contains(&f.id) && only.is_none_or(|o| o.contains(&f.id))).cloned().collect();
+    let friends: Vec<_> = cfg
+        .friends
+        .iter()
+        .filter(|f| {
+            set.sends_to(f) && !skip.contains(&f.id) && only.is_none_or(|o| o.contains(&f.id))
+        })
+        .cloned()
+        .collect();
     if friends.is_empty() {
         bail!("no friends to back up to yet: use `sdb invite` or `sdb join`");
     }
@@ -310,9 +388,18 @@ async fn run_once(
                 .list_snapshots()
                 .await?
                 .into_iter()
-                .filter_map(|(id, blob)| Some((node.open_manifest(&id, &blob).ok()?.index, id, blob)))
+                .filter_map(|(id, blob)| {
+                    Some((node.open_manifest(&id, &blob).ok()?.index, id, blob))
+                })
                 .collect();
-            Ok::<_, anyhow::Error>(Target { peer, known, added: vec![], snaps, failed: None, full: false })
+            Ok::<_, anyhow::Error>(Target {
+                peer,
+                known,
+                added: vec![],
+                snaps,
+                failed: None,
+                full: false,
+            })
         };
         match t.await {
             Ok(t) => targets.push(t),
@@ -335,13 +422,20 @@ async fn run_once(
         tx,
         new_bytes: 0,
     };
-    let prev: HashMap<Vec<u8>, Entry> =
-        node.load_last_index(&set.name).into_iter().map(|e| (e.path.clone(), e)).collect();
+    let prev: HashMap<Vec<u8>, Entry> = node
+        .load_last_index(&set.name)
+        .into_iter()
+        .map(|e| (e.path.clone(), e))
+        .collect();
     let ex = Excludes::new(&cfg, &node.home)?;
     let (roots, out2) = (set.paths.clone(), out.clone());
     let job = tokio::task::spawn_blocking(move || scan(roots, ex, prev, scanner, out2));
 
-    let batch_limit = if cfg.upload_kbps > 0 { (cfg.upload_kbps as usize * 1024).clamp(64 << 10, BATCH_BYTES) } else { BATCH_BYTES };
+    let batch_limit = if cfg.upload_kbps > 0 {
+        (cfg.upload_kbps as usize * 1024).clamp(64 << 10, BATCH_BYTES)
+    } else {
+        BATCH_BYTES
+    };
     let (mut batch, mut size) = (vec![], 0);
     let (mut total, mut told) = (0u64, std::time::Instant::now());
     while let Some((id, blob)) = rx.recv().await {
@@ -359,15 +453,24 @@ async fn run_once(
             }
             if cfg.upload_kbps > 0 {
                 // Hold the average upload rate to the limit; local drives do not count.
-                let remote = targets.iter().filter(|t| t.failed.is_none() && t.peer.is_remote()).count() as u64;
-                let owed = std::time::Duration::from_millis(size as u64 * remote * 1000 / (cfg.upload_kbps * 1024));
+                let remote = targets
+                    .iter()
+                    .filter(|t| t.failed.is_none() && t.peer.is_remote())
+                    .count() as u64;
+                let owed = std::time::Duration::from_millis(
+                    size as u64 * remote * 1000 / (cfg.upload_kbps * 1024),
+                );
                 tokio::time::sleep(owed.saturating_sub(began.elapsed())).await;
             }
             size = 0;
         }
     }
     let flushed = flush(&mut targets, &mut batch, out).await;
-    let full: Vec<Friend> = targets.iter().filter(|t| t.full).map(|t| t.peer.friend.clone()).collect();
+    let full: Vec<Friend> = targets
+        .iter()
+        .filter(|t| t.full)
+        .map(|t| t.peer.friend.clone())
+        .collect();
     if flushed.is_err() && !full.is_empty() {
         drop(rx);
         let _ = job.await;
@@ -394,14 +497,20 @@ async fn run_once(
     };
     // A friend that missed an identical restore point gets that one rather than a new id.
     let existing = match &tag {
-        None => targets.iter().flat_map(|t| &t.snaps).find(|(idx, _, _)| *idx == scan.index).map(|(_, id, blob)| (id.clone(), blob.clone())),
+        None => targets
+            .iter()
+            .flat_map(|t| &t.snaps)
+            .find(|(idx, _, _)| *idx == scan.index)
+            .map(|(_, id, blob)| (id.clone(), blob.clone())),
         Some(_) => None,
     };
     let (snap_id, sealed) = match existing {
         Some(x) => x,
         None => {
             let id = hex::encode(rand::random::<[u8; 8]>());
-            let sealed = node.keys.seal_raw(id.as_bytes(), &snapshot::encode_manifest(&manifest)?)?;
+            let sealed = node
+                .keys
+                .seal_raw(id.as_bytes(), &snapshot::encode_manifest(&manifest)?)?;
             (id, sealed)
         }
     };
@@ -417,8 +526,18 @@ async fn run_once(
             }
         }
     }
-    let full: Vec<Friend> = targets.iter().filter(|t| t.full).map(|t| t.peer.friend.clone()).collect();
-    node.mark_ok(&targets.iter().filter(|t| t.failed.is_none()).map(|t| t.peer.friend.id.clone()).collect::<Vec<_>>());
+    let full: Vec<Friend> = targets
+        .iter()
+        .filter(|t| t.full)
+        .map(|t| t.peer.friend.clone())
+        .collect();
+    node.mark_ok(
+        &targets
+            .iter()
+            .filter(|t| t.failed.is_none())
+            .map(|t| t.peer.friend.id.clone())
+            .collect::<Vec<_>>(),
+    );
     for t in targets {
         if t.failed.is_none() {
             let mut known = t.known;
@@ -429,11 +548,22 @@ async fn run_once(
         }
     }
     node.save_index(&set.name, &scan.entries)?;
-    let skipped = if scan.skipped > 0 { format!(", {} unreadable skipped", scan.skipped) } else { String::new() };
+    let skipped = if scan.skipped > 0 {
+        format!(", {} unreadable skipped", scan.skipped)
+    } else {
+        String::new()
+    };
     if stored.is_empty() && scan.new_bytes > 0 {
-        out.say(format!("{prefix}no changes since the last restore point; re-sent {} that friends were missing", human(scan.new_bytes)));
+        out.say(format!(
+            "{prefix}no changes since the last restore point; re-sent {} that friends were missing",
+            human(scan.new_bytes)
+        ));
     } else if stored.is_empty() {
-        out.say(format!("{prefix}no changes since the last restore point ({} files, {}{skipped})", scan.files, human(scan.bytes)));
+        out.say(format!(
+            "{prefix}no changes since the last restore point ({} files, {}{skipped})",
+            scan.files,
+            human(scan.bytes)
+        ));
     } else {
         out.say(format!(
             "{prefix}restore point {snap_id} created on {}: {} files, {}, {} uploaded{skipped}",
@@ -445,4 +575,67 @@ async fn run_once(
         *node.last_backup.lock().unwrap() = Some(snapshot::when(manifest.time));
     }
     Ok(full)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic noise, so chunk boundaries are realistic and the test is repeatable.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x = 0x9E3779B97F4A7C15u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn index_pieces_rejoin() {
+        let buf = noise(6_000_000);
+        let pieces = split_index(&buf);
+        assert!(pieces.len() > 1);
+        assert!(
+            pieces
+                .iter()
+                .all(|p| p.len() >= MIN_CHUNK || std::ptr::eq(*p, *pieces.last().unwrap()))
+        );
+        assert!(pieces.iter().all(|p| p.len() <= MAX_CHUNK));
+        assert_eq!(pieces.concat(), buf);
+    }
+
+    #[test]
+    fn an_edit_only_changes_nearby_chunks() {
+        let a = noise(24_000_000);
+        let mut b = a.clone();
+        b.splice(12_000_000..12_000_000, *b"inserted bytes");
+        let ids = |buf: &[u8]| -> HashSet<blake3::Hash> {
+            split_index(buf).iter().map(|p| blake3::hash(p)).collect()
+        };
+        let (x, y) = (ids(&a), ids(&b));
+        let changed = y.difference(&x).count();
+        assert!(y.len() >= 8, "expected many chunks, got {}", y.len());
+        assert!(
+            changed <= 2,
+            "{changed} of {} chunks changed after a small insert",
+            y.len()
+        );
+    }
+
+    #[test]
+    fn excludes() {
+        let mut cfg = Config::new("n".into());
+        cfg.exclude.push("**/node_modules".into());
+        let ex = Excludes::new(&cfg, Path::new("/home/me/.super-duper-backup")).unwrap();
+        assert!(ex.is_excluded(Path::new("/home/me/proj/node_modules")));
+        assert!(ex.is_excluded(Path::new("/home/me/.DS_Store")));
+        assert!(ex.is_excluded(Path::new("/home/me/.super-duper-backup/store/x")));
+        assert!(!ex.is_excluded(Path::new("/home/me/proj/src/main.rs")));
+        cfg.exclude.push("[".into());
+        assert!(Excludes::new(&cfg, Path::new("/x")).is_err());
+    }
 }

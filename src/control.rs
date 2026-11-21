@@ -4,8 +4,12 @@
 //! Local control socket so the CLI can drive a running daemon.
 
 use crate::node::{Cmd, Node, Out};
-use anyhow::{bail, Result};
-use std::{os::unix::fs::PermissionsExt, path::{Path, PathBuf}, sync::Arc};
+use anyhow::{Result, bail};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -21,7 +25,11 @@ pub fn sock_path(home: &Path) -> PathBuf {
         return p;
     }
     let h = blake3::hash(home.as_os_str().as_encoded_bytes()).to_hex();
-    PathBuf::from(format!("/tmp/sdb-{}-{}.sock", unsafe { libc::getuid() }, &h[..16]))
+    PathBuf::from(format!(
+        "/tmp/sdb-{}-{}.sock",
+        rustix::process::getuid().as_raw(),
+        &h[..16]
+    ))
 }
 
 /// Connects to the local daemon, but only through a socket this user owns.
@@ -29,7 +37,7 @@ pub async fn connect(home: &Path) -> Option<UnixStream> {
     use std::os::unix::fs::MetadataExt;
     let path = sock_path(home);
     let md = std::fs::symlink_metadata(&path).ok()?;
-    if md.uid() != unsafe { libc::getuid() } {
+    if md.uid() != rustix::process::getuid().as_raw() {
         return None;
     }
     UnixStream::connect(&path).await.ok()
@@ -79,9 +87,14 @@ pub async fn client(stream: UnixStream, cmd: &Cmd) -> Result<()> {
     request(stream, cmd, &mut |l| println!("{l}")).await
 }
 
-pub async fn request(stream: UnixStream, cmd: &Cmd, line: &mut (dyn FnMut(String) + Send)) -> Result<()> {
+pub async fn request(
+    stream: UnixStream,
+    cmd: &Cmd,
+    line: &mut (dyn FnMut(String) + Send),
+) -> Result<()> {
     let (r, mut w) = stream.into_split();
-    w.write_all(format!("{}\n", serde_json::to_string(cmd)?).as_bytes()).await?;
+    w.write_all(format!("{}\n", serde_json::to_string(cmd)?).as_bytes())
+        .await?;
     let mut lines = BufReader::new(r).lines();
     while let Some(l) = lines.next_line().await? {
         match l.strip_prefix(DONE) {

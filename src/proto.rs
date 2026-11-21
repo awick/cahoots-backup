@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::crypto::Id;
-use anyhow::{bail, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -14,14 +14,30 @@ pub const MISSING: u32 = u32::MAX;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Req {
-    Pair { token: [u8; 16], name: String, relay: Option<String>, addrs: Vec<SocketAddr> },
+    Pair {
+        token: [u8; 16],
+        name: String,
+        relay: Option<String>,
+        addrs: Vec<SocketAddr>,
+    },
     ListChunks,
-    PutChunks { count: u32 },
-    GetChunks { ids: Vec<Id> },
-    DeleteChunks { ids: Vec<Id> },
-    PutSnapshot { id: String, data: Vec<u8> },
+    PutChunks {
+        count: u32,
+    },
+    GetChunks {
+        ids: Vec<Id>,
+    },
+    DeleteChunks {
+        ids: Vec<Id>,
+    },
+    PutSnapshot {
+        id: String,
+        data: Vec<u8>,
+    },
     ListSnapshots,
-    DeleteSnapshot { id: String },
+    DeleteSnapshot {
+        id: String,
+    },
     Usage,
 }
 
@@ -43,8 +59,13 @@ pub async fn recv<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Resul
     recv_max(r, MAX_MSG).await
 }
 
-pub async fn recv_max<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R, max: usize) -> Result<T> {
-    Ok(postcard::from_bytes(&read_blob(r, max).await?.unwrap_or_default())?)
+pub async fn recv_max<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    r: &mut R,
+    max: usize,
+) -> Result<T> {
+    Ok(postcard::from_bytes(
+        &read_blob(r, max).await?.unwrap_or_default(),
+    )?)
 }
 
 pub async fn write_blob<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Result<()> {
