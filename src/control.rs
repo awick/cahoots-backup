@@ -25,11 +25,26 @@ pub fn sock_path(home: &Path) -> PathBuf {
         return p;
     }
     let h = blake3::hash(home.as_os_str().as_encoded_bytes()).to_hex();
-    PathBuf::from(format!(
-        "/tmp/sdb-{}-{}.sock",
-        rustix::process::getuid().as_raw(),
-        &h[..16]
-    ))
+    PathBuf::from(format!("/tmp/sdb-{}-{}.sock", rustix::process::getuid().as_raw(), &h[..16]))
+}
+
+/// Identifies a build by its executable's size and modification time, so a client can
+/// tell when the running daemon is older than itself.
+pub fn fingerprint() -> String {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .map(|m| {
+            let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+            format!("{}-{}", m.len(), t.map(|d| d.as_nanos()).unwrap_or(0))
+        })
+        .unwrap_or_default()
+}
+
+static STARTED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The fingerprint of the executable as it was when this process started.
+pub fn started_fingerprint() -> String {
+    STARTED.get_or_init(fingerprint).clone()
 }
 
 /// Connects to the local daemon, but only through a socket this user owns.
@@ -61,16 +76,24 @@ pub async fn serve(node: Arc<Node>, listener: UnixListener) {
                 return;
             }
             let (tx, mut rx) = mpsc::unbounded_channel();
+            let cmd = serde_json::from_str::<Cmd>(&line);
+            // Backups and pruning belong to the daemon: they carry on when the client that
+            // asked for them goes away. Anything else stops with its client.
+            let detached = matches!(cmd, Ok(Cmd::Backup { .. } | Cmd::Prune { .. } | Cmd::Forget { .. }));
             let job = tokio::spawn(async move {
-                match serde_json::from_str::<Cmd>(&line) {
+                match cmd {
                     Ok(cmd) => node.run(cmd, &Out(tx)).await,
                     Err(e) => Err(e.into()),
                 }
             });
+            let mut gone = false;
             while let Some(l) = rx.recv().await {
-                if w.write_all(format!("{l}\n").as_bytes()).await.is_err() {
-                    job.abort();
-                    return;
+                if !gone && w.write_all(format!("{l}\n").as_bytes()).await.is_err() {
+                    if !detached {
+                        job.abort();
+                        return;
+                    }
+                    gone = true;
                 }
             }
             let end = match job.await {
@@ -87,14 +110,9 @@ pub async fn client(stream: UnixStream, cmd: &Cmd) -> Result<()> {
     request(stream, cmd, &mut |l| println!("{l}")).await
 }
 
-pub async fn request(
-    stream: UnixStream,
-    cmd: &Cmd,
-    line: &mut (dyn FnMut(String) + Send),
-) -> Result<()> {
+pub async fn request(stream: UnixStream, cmd: &Cmd, line: &mut (dyn FnMut(String) + Send)) -> Result<()> {
     let (r, mut w) = stream.into_split();
-    w.write_all(format!("{}\n", serde_json::to_string(cmd)?).as_bytes())
-        .await?;
+    w.write_all(format!("{}\n", serde_json::to_string(cmd)?).as_bytes()).await?;
     let mut lines = BufReader::new(r).lines();
     while let Some(l) = lines.next_line().await? {
         match l.strip_prefix(DONE) {

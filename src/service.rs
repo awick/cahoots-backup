@@ -12,12 +12,15 @@ fn home_dir() -> PathBuf {
 
 fn unit_path() -> PathBuf {
     if cfg!(target_os = "macos") {
-        home_dir()
-            .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist"))
+        home_dir().join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
     } else {
         home_dir().join(".config/systemd/user/sdb.service")
     }
+}
+
+/// Whether the start-at-login service file is in place.
+pub fn installed() -> bool {
+    unit_path().exists()
 }
 
 pub fn install() -> Result<()> {
@@ -44,23 +47,12 @@ pub fn install() -> Result<()> {
                 log = log.display()
             ),
         )?;
-        let _ = Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&path)
-            .output();
-        let ok = Command::new("launchctl")
-            .args(["load", "-w"])
-            .arg(&path)
-            .status()?
-            .success();
+        let _ = Command::new("launchctl").args(["unload", "-w"]).arg(&path).output();
+        let ok = Command::new("launchctl").args(["load", "-w"]).arg(&path).status()?.success();
         println!(
             "installed {}{}",
             path.display(),
-            if ok {
-                " and started the daemon"
-            } else {
-                "; start it with `launchctl load -w` on that file"
-            }
+            if ok { " and started the daemon" } else { "; start it with `launchctl load -w` on that file" }
         );
         println!(
             "On macOS, grant {} Full Disk Access in System Settings if you back up Documents, Desktop or Downloads.",
@@ -74,9 +66,7 @@ pub fn install() -> Result<()> {
                 exe.display()
             ),
         )?;
-        let _ = Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status();
+        let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
         let ok = Command::new("systemctl")
             .args(["--user", "enable", "--now", "sdb.service"])
             .status()
@@ -85,11 +75,7 @@ pub fn install() -> Result<()> {
         println!(
             "installed {}{}",
             path.display(),
-            if ok {
-                " and started the daemon"
-            } else {
-                "; start it with `systemctl --user enable --now sdb.service`"
-            }
+            if ok { " and started the daemon" } else { "; start it with `systemctl --user enable --now sdb.service`" }
         );
         println!("Run `loginctl enable-linger $USER` to keep it running while you are logged out.");
     }
@@ -99,14 +85,9 @@ pub fn install() -> Result<()> {
 pub fn uninstall() -> Result<()> {
     let path = unit_path();
     if cfg!(target_os = "macos") {
-        let _ = Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&path)
-            .output();
+        let _ = Command::new("launchctl").args(["unload", "-w"]).arg(&path).output();
     } else {
-        let _ = Command::new("systemctl")
-            .args(["--user", "disable", "--now", "sdb.service"])
-            .status();
+        let _ = Command::new("systemctl").args(["--user", "disable", "--now", "sdb.service"]).status();
     }
     let _ = fs::remove_file(&path);
     println!("removed {}", path.display());

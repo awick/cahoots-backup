@@ -70,6 +70,9 @@ pub struct Friend {
     /// Minutes between automatic backups to this destination (0 = default: 60 for a friend, the general setting for a drive).
     #[serde(default)]
     pub every_minutes: u32,
+    /// Fastest this friend may send backups to this computer, in KB/s (0 = unlimited).
+    #[serde(default)]
+    pub max_in_kbps: u64,
     /// Set for a local destination (an external drive or folder) instead of a friend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -118,6 +121,9 @@ pub struct BackupSet {
     /// History rules for this set (absent = the general rules).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<Retention>,
+    /// Names this set had before; restore points made under them still belong to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_names: Vec<String>,
 }
 
 impl BackupSet {
@@ -127,11 +133,7 @@ impl BackupSet {
 
     /// Seconds between automatic backups of this set to one destination.
     pub fn interval_secs(&self, f: &Friend, cfg: &Config) -> u64 {
-        if self.every_minutes > 0 {
-            self.every_minutes as u64 * 60
-        } else {
-            f.interval_secs(cfg)
-        }
+        if self.every_minutes > 0 { self.every_minutes as u64 * 60 } else { f.interval_secs(cfg) }
     }
 }
 
@@ -217,17 +219,10 @@ impl Config {
             upnp: true,
             store_dir: None,
             paths: vec![],
-            exclude: vec![
-                "**/.DS_Store".into(),
-                "**/.Trash".into(),
-                "**/*.sdb-tmp".into(),
-            ],
+            exclude: vec!["**/.DS_Store".into(), "**/.Trash".into(), "**/*.sdb-tmp".into()],
             retention: Retention::default(),
             version_rules: vec![],
-            sets: vec![BackupSet {
-                name: DEFAULT_SET.into(),
-                ..Default::default()
-            }],
+            sets: vec![BackupSet { name: DEFAULT_SET.into(), ..Default::default() }],
             friends: vec![],
             invites: vec![],
         }
@@ -235,15 +230,11 @@ impl Config {
 
     pub fn load(home: &Path) -> Result<Self> {
         let p = home.join("config.toml");
-        let s = fs::read_to_string(&p)
-            .with_context(|| format!("cannot read {} (run `sdb init` first)", p.display()))?;
-        let mut c: Config =
-            toml::from_str(&s).with_context(|| format!("bad config {}", p.display()))?;
+        let s =
+            fs::read_to_string(&p).with_context(|| format!("cannot read {} (run `sdb init` first)", p.display()))?;
+        let mut c: Config = toml::from_str(&s).with_context(|| format!("bad config {}", p.display()))?;
         if c.sets.is_empty() {
-            c.sets.push(BackupSet {
-                name: DEFAULT_SET.into(),
-                ..Default::default()
-            });
+            c.sets.push(BackupSet { name: DEFAULT_SET.into(), ..Default::default() });
         }
         if !c.paths.is_empty() {
             let old = std::mem::take(&mut c.paths);
@@ -260,10 +251,7 @@ impl Config {
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {
-        write_private(
-            &home.join("config.toml"),
-            toml::to_string_pretty(self)?.as_bytes(),
-        )
+        write_private(&home.join("config.toml"), toml::to_string_pretty(self)?.as_bytes())
     }
 
     pub fn store_dir(&self, home: &Path) -> PathBuf {
@@ -306,10 +294,7 @@ impl Identity {
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {
-        write_private(
-            &home.join("identity.key"),
-            serde_json::to_string(self)?.as_bytes(),
-        )
+        write_private(&home.join("identity.key"), serde_json::to_string(self)?.as_bytes())
     }
 
     pub fn bytes(s: &str) -> Result<[u8; 32]> {
@@ -333,11 +318,7 @@ impl Config {
 
     /// The same for one set, whose own hours take the place of the general ones.
     pub fn held_for(&self, set: &BackupSet) -> Option<String> {
-        self.held_with(if set.hours.is_empty() {
-            &self.backup_hours
-        } else {
-            &set.hours
-        })
+        self.held_with(if set.hours.is_empty() { &self.backup_hours } else { &set.hours })
     }
 
     fn held_with(&self, hours: &str) -> Option<String> {
@@ -348,19 +329,24 @@ impl Config {
         }
         let (a, b) = parse_hours(hours)?;
         let h = now.hour();
-        let inside = if a < b {
-            h >= a && h < b
-        } else {
-            h >= a || h < b
-        };
+        let inside = if a < b { h >= a && h < b } else { h >= a || h < b };
         (!inside).then(|| format!("outside the backup hours {hours}"))
     }
 
     pub fn all_paths(&self) -> Vec<PathBuf> {
+        self.sets.iter().flat_map(|s| s.paths.iter().cloned()).collect()
+    }
+
+    /// The current name of the set a restore point was made under.
+    pub fn set_name_now(&self, recorded: &str) -> String {
+        if self.set(recorded).is_some() {
+            return recorded.to_string();
+        }
         self.sets
             .iter()
-            .flat_map(|s| s.paths.iter().cloned())
-            .collect()
+            .find(|b| b.former_names.iter().any(|n| n == recorded))
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| recorded.to_string())
     }
 
     pub fn set(&self, name: &str) -> Option<&BackupSet> {
@@ -392,6 +378,7 @@ mod tests {
             relay: None,
             addrs: vec![],
             every_minutes: 0,
+            max_in_kbps: 0,
             path: drive.then(|| PathBuf::from("/tmp")),
         }
     }
@@ -409,32 +396,33 @@ mod tests {
     fn pacing_defaults() {
         let cfg = Config::new("n".into());
         assert_eq!(friend("bob", false).interval_secs(&cfg), 3600);
-        assert_eq!(
-            friend("usb", true).interval_secs(&cfg),
-            cfg.min_interval_secs
-        );
+        assert_eq!(friend("usb", true).interval_secs(&cfg), cfg.min_interval_secs);
         let mut f = friend("bob", false);
         f.every_minutes = 10;
         assert_eq!(f.interval_secs(&cfg), 600);
-        let set = BackupSet {
-            name: "s".into(),
-            every_minutes: 5,
-            ..Default::default()
-        };
+        let set = BackupSet { name: "s".into(), every_minutes: 5, ..Default::default() };
         assert_eq!(set.interval_secs(&f, &cfg), 300);
     }
 
     #[test]
+    fn renamed_sets_keep_their_restore_points() {
+        let mut cfg = Config::new("n".into());
+        cfg.sets[0].name = "docs".into();
+        cfg.sets[0].former_names = vec![DEFAULT_SET.into(), "documents".into()];
+        cfg.sets.push(BackupSet { name: "photos".into(), ..Default::default() });
+        assert_eq!(cfg.set_name_now("default"), "docs");
+        assert_eq!(cfg.set_name_now("documents"), "docs");
+        assert_eq!(cfg.set_name_now("photos"), "photos");
+        assert_eq!(cfg.set_name_now("gone"), "gone");
+        // A new set may reuse an old name; its own restore points are then its own.
+        cfg.sets.push(BackupSet { name: "default".into(), ..Default::default() });
+        assert_eq!(cfg.set_name_now("default"), "default");
+    }
+
+    #[test]
     fn set_destinations() {
-        let all = BackupSet {
-            name: "a".into(),
-            ..Default::default()
-        };
-        let one = BackupSet {
-            name: "b".into(),
-            destinations: vec!["usb".into()],
-            ..Default::default()
-        };
+        let all = BackupSet { name: "a".into(), ..Default::default() };
+        let one = BackupSet { name: "b".into(), destinations: vec!["usb".into()], ..Default::default() };
         let mut off = friend("bob", false);
         assert!(all.sends_to(&off) && !one.sends_to(&off) && one.sends_to(&friend("usb", true)));
         off.backup_to = false;
@@ -445,11 +433,7 @@ mod tests {
     fn old_config_moves_folders_into_the_default_set() {
         let dir = std::env::temp_dir().join(format!("sdb-test-cfg-{}", rand::random::<u64>()));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("config.toml"),
-            "name = \"old\"\npaths = [\"/home/me/Documents\"]\n",
-        )
-        .unwrap();
+        fs::write(dir.join("config.toml"), "name = \"old\"\npaths = [\"/home/me/Documents\"]\n").unwrap();
         let c = Config::load(&dir).unwrap();
         assert!(c.paths.is_empty());
         assert_eq!(c.sets.len(), 1);
@@ -458,20 +442,10 @@ mod tests {
         c.save(&dir).unwrap();
         let again = Config::load(&dir).unwrap();
         assert_eq!(again.all_paths(), c.all_paths());
-        assert_eq!(
-            fs::metadata(dir.join("config.toml"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        assert_eq!(fs::metadata(dir.join("config.toml")).unwrap().permissions().mode() & 0o777, 0o600);
 
         fs::write(dir.join("config.toml"), "name = \"new\"\nformat = 99\n").unwrap();
-        assert!(
-            Config::load(&dir).is_err(),
-            "a newer config format must be refused"
-        );
+        assert!(Config::load(&dir).is_err(), "a newer config format must be refused");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

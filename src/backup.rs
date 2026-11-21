@@ -38,10 +38,7 @@ impl Excludes {
         for p in &cfg.exclude {
             b.add(Glob::new(p).map_err(|e| anyhow!("bad exclude pattern {p}: {e}"))?);
         }
-        Ok(Excludes {
-            globs: b.build()?,
-            dirs: vec![home.to_path_buf(), cfg.store_dir(home)],
-        })
+        Ok(Excludes { globs: b.build()?, dirs: vec![home.to_path_buf(), cfg.store_dir(home)] })
     }
 
     pub fn is_excluded(&self, p: &Path) -> bool {
@@ -72,35 +69,19 @@ impl Scanner {
         if !self.sent.contains(&id) && !self.known.iter().all(|k| k.contains(&id)) {
             let blob = self.keys.seal(&id, data)?;
             self.new_bytes += blob.len() as u64;
-            self.tx
-                .blocking_send((id, blob))
-                .map_err(|_| anyhow!("upload stopped"))?;
+            self.tx.blocking_send((id, blob)).map_err(|_| anyhow!("upload stopped"))?;
             self.sent.insert(id);
         }
         Ok(id)
     }
 
     fn have(&self, ids: &[Id]) -> bool {
-        ids.iter()
-            .all(|id| self.sent.contains(id) || self.known.iter().all(|k| k.contains(id)))
+        ids.iter().all(|id| self.sent.contains(id) || self.known.iter().all(|k| k.contains(id)))
     }
 }
 
-fn scan(
-    roots: Vec<PathBuf>,
-    ex: Excludes,
-    prev: HashMap<Vec<u8>, Entry>,
-    mut sc: Scanner,
-    out: Out,
-) -> Result<Scan> {
-    let mut res = Scan {
-        entries: vec![],
-        index: vec![],
-        files: 0,
-        bytes: 0,
-        new_bytes: 0,
-        skipped: 0,
-    };
+fn scan(roots: Vec<PathBuf>, ex: Excludes, prev: HashMap<Vec<u8>, Entry>, mut sc: Scanner, out: Out) -> Result<Scan> {
+    let mut res = Scan { entries: vec![], index: vec![], files: 0, bytes: 0, new_bytes: 0, skipped: 0 };
     for root in &roots {
         let walk = walkdir::WalkDir::new(root)
             .follow_links(false)
@@ -129,10 +110,7 @@ fn scan(
             } else if ft.is_file() {
                 let reuse = prev.get(&path).and_then(|p| match &p.kind {
                     Kind::File { size, chunks }
-                        if *size == md.size()
-                            && p.mtime == mtime
-                            && p.ino == md.ino()
-                            && sc.have(chunks) =>
+                        if *size == md.size() && p.mtime == mtime && p.ino == md.ino() && sc.have(chunks) =>
                     {
                         Some(chunks.clone())
                     }
@@ -156,15 +134,7 @@ fn scan(
             } else {
                 continue;
             };
-            res.entries.push(Entry {
-                path,
-                mode: md.mode(),
-                uid: md.uid(),
-                gid: md.gid(),
-                mtime,
-                ino: md.ino(),
-                kind,
-            });
+            res.entries.push(Entry { path, mode: md.mode(), uid: md.uid(), gid: md.gid(), mtime, ino: md.ino(), kind });
         }
     }
     res.entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -178,9 +148,7 @@ fn scan(
 }
 
 pub fn split_index(buf: &[u8]) -> Vec<&[u8]> {
-    FastCDC::new(buf, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK)
-        .map(|c| &buf[c.offset..c.offset + c.length])
-        .collect()
+    FastCDC::new(buf, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK).map(|c| &buf[c.offset..c.offset + c.length]).collect()
 }
 
 /// Re-reads local files that look unchanged since the last backup and compares
@@ -195,10 +163,7 @@ pub fn check_local(keys: &Keys, last: Vec<Entry>, out: &Out) -> (u64, u64) {
         let Ok(md) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if md.size() != *size
-            || md.mtime() * 1_000_000_000 + md.mtime_nsec() != e.mtime
-            || md.ino() != e.ino
-        {
+        if md.size() != *size || md.mtime() * 1_000_000_000 + md.mtime_nsec() != e.mtime || md.ino() != e.ino {
             continue;
         }
         let Ok(f) = fs::File::open(&path) else {
@@ -249,10 +214,7 @@ struct Target {
 
 async fn flush(targets: &mut [Target], batch: &mut Vec<(Id, Vec<u8>)>, out: &Out) -> Result<()> {
     let results = futures::future::join_all(targets.iter().map(|t| {
-        let items: Vec<&(Id, Vec<u8>)> = batch
-            .iter()
-            .filter(|(id, _)| !t.known.contains(id))
-            .collect();
+        let items: Vec<&(Id, Vec<u8>)> = batch.iter().filter(|(id, _)| !t.known.contains(id)).collect();
         async move {
             if t.failed.is_some() || items.is_empty() {
                 return Ok(vec![]);
@@ -292,24 +254,20 @@ pub async fn run(
 ) -> Result<()> {
     let _op = node.op.lock().await;
     let cfg = node.cfg();
-    let sets: Vec<BackupSet> = cfg
-        .sets
-        .iter()
-        .filter(|s| set.is_none_or(|n| n == s.name) && !s.paths.is_empty())
-        .cloned()
-        .collect();
+    let sets: Vec<BackupSet> =
+        cfg.sets.iter().filter(|s| set.is_none_or(|n| n == s.name) && !s.paths.is_empty()).cloned().collect();
     if sets.is_empty() {
         bail!("nothing to back up yet: use `sdb add <path>`");
     }
     let label = sets.len() > 1 || cfg.sets.len() > 1;
     let mut failed = None;
     for s in &sets {
-        let prefix = if label {
-            format!("[{}] ", s.name)
-        } else {
-            String::new()
-        };
-        if let Err(e) = run_set(node, tag.clone(), s, only, &prefix, out).await {
+        let prefix = if label { format!("[{}] ", s.name) } else { String::new() };
+        node.set_running(&s.name, Some("checking files".into()));
+        let res = run_set(node, tag.clone(), s, only, &prefix, out).await;
+        node.set_running(&s.name, None);
+        if let Err(e) = res {
+            node.note(format!("{prefix}backup failed: {e:#}"));
             out.say(format!("{prefix}{e:#}"));
             failed = Some(e);
         }
@@ -336,15 +294,9 @@ async fn run_set(
             return Ok(());
         }
         for f in full {
-            out.say(format!(
-                "  {} is at the quota they gave you, removing your oldest restore points there",
-                f.name
-            ));
+            out.say(format!("  {} is at the quota they gave you, removing your oldest restore points there", f.name));
             if !node.evict(&f, out).await.unwrap_or(false) {
-                out.say(format!(
-                    "  {}: quota is too small for even one restore point, skipping them",
-                    f.name
-                ));
+                out.say(format!("  {}: quota is too small for even one restore point, skipping them", f.name));
                 skip.insert(f.id);
             }
         }
@@ -365,9 +317,7 @@ async fn run_once(
     let friends: Vec<_> = cfg
         .friends
         .iter()
-        .filter(|f| {
-            set.sends_to(f) && !skip.contains(&f.id) && only.is_none_or(|o| o.contains(&f.id))
-        })
+        .filter(|f| set.sends_to(f) && !skip.contains(&f.id) && only.is_none_or(|o| o.contains(&f.id)))
         .cloned()
         .collect();
     if friends.is_empty() {
@@ -388,18 +338,9 @@ async fn run_once(
                 .list_snapshots()
                 .await?
                 .into_iter()
-                .filter_map(|(id, blob)| {
-                    Some((node.open_manifest(&id, &blob).ok()?.index, id, blob))
-                })
+                .filter_map(|(id, blob)| Some((node.open_manifest(&id, &blob).ok()?.index, id, blob)))
                 .collect();
-            Ok::<_, anyhow::Error>(Target {
-                peer,
-                known,
-                added: vec![],
-                snaps,
-                failed: None,
-                full: false,
-            })
+            Ok::<_, anyhow::Error>(Target { peer, known, added: vec![], snaps, failed: None, full: false })
         };
         match t.await {
             Ok(t) => targets.push(t),
@@ -422,20 +363,14 @@ async fn run_once(
         tx,
         new_bytes: 0,
     };
-    let prev: HashMap<Vec<u8>, Entry> = node
-        .load_last_index(&set.name)
-        .into_iter()
-        .map(|e| (e.path.clone(), e))
-        .collect();
+    let prev: HashMap<Vec<u8>, Entry> =
+        node.load_last_index(&set.name).into_iter().map(|e| (e.path.clone(), e)).collect();
     let ex = Excludes::new(&cfg, &node.home)?;
     let (roots, out2) = (set.paths.clone(), out.clone());
     let job = tokio::task::spawn_blocking(move || scan(roots, ex, prev, scanner, out2));
 
-    let batch_limit = if cfg.upload_kbps > 0 {
-        (cfg.upload_kbps as usize * 1024).clamp(64 << 10, BATCH_BYTES)
-    } else {
-        BATCH_BYTES
-    };
+    let batch_limit =
+        if cfg.upload_kbps > 0 { (cfg.upload_kbps as usize * 1024).clamp(64 << 10, BATCH_BYTES) } else { BATCH_BYTES };
     let (mut batch, mut size) = (vec![], 0);
     let (mut total, mut told) = (0u64, std::time::Instant::now());
     while let Some((id, blob)) = rx.recv().await {
@@ -445,6 +380,7 @@ async fn run_once(
         if told.elapsed().as_secs() >= 2 {
             told = std::time::Instant::now();
             out.say(format!("  ... {} uploaded so far", human(total)));
+            node.set_running(&set.name, Some(format!("{} uploaded so far", human(total))));
         }
         if size >= batch_limit || batch.len() >= 512 {
             let began = std::time::Instant::now();
@@ -453,24 +389,15 @@ async fn run_once(
             }
             if cfg.upload_kbps > 0 {
                 // Hold the average upload rate to the limit; local drives do not count.
-                let remote = targets
-                    .iter()
-                    .filter(|t| t.failed.is_none() && t.peer.is_remote())
-                    .count() as u64;
-                let owed = std::time::Duration::from_millis(
-                    size as u64 * remote * 1000 / (cfg.upload_kbps * 1024),
-                );
+                let remote = targets.iter().filter(|t| t.failed.is_none() && t.peer.is_remote()).count() as u64;
+                let owed = std::time::Duration::from_millis(size as u64 * remote * 1000 / (cfg.upload_kbps * 1024));
                 tokio::time::sleep(owed.saturating_sub(began.elapsed())).await;
             }
             size = 0;
         }
     }
     let flushed = flush(&mut targets, &mut batch, out).await;
-    let full: Vec<Friend> = targets
-        .iter()
-        .filter(|t| t.full)
-        .map(|t| t.peer.friend.clone())
-        .collect();
+    let full: Vec<Friend> = targets.iter().filter(|t| t.full).map(|t| t.peer.friend.clone()).collect();
     if flushed.is_err() && !full.is_empty() {
         drop(rx);
         let _ = job.await;
@@ -508,9 +435,7 @@ async fn run_once(
         Some(x) => x,
         None => {
             let id = hex::encode(rand::random::<[u8; 8]>());
-            let sealed = node
-                .keys
-                .seal_raw(id.as_bytes(), &snapshot::encode_manifest(&manifest)?)?;
+            let sealed = node.keys.seal_raw(id.as_bytes(), &snapshot::encode_manifest(&manifest)?)?;
             (id, sealed)
         }
     };
@@ -526,17 +451,12 @@ async fn run_once(
             }
         }
     }
-    let full: Vec<Friend> = targets
-        .iter()
-        .filter(|t| t.full)
-        .map(|t| t.peer.friend.clone())
-        .collect();
-    node.mark_ok(
-        &targets
-            .iter()
-            .filter(|t| t.failed.is_none())
-            .map(|t| t.peer.friend.id.clone())
-            .collect::<Vec<_>>(),
+    let full: Vec<Friend> = targets.iter().filter(|t| t.full).map(|t| t.peer.friend.clone()).collect();
+    node.mark_set(
+        &set.name,
+        &targets.iter().filter(|t| t.failed.is_none()).map(|t| t.peer.friend.id.clone()).collect::<Vec<_>>(),
+        scan.files,
+        scan.bytes,
     );
     for t in targets {
         if t.failed.is_none() {
@@ -548,11 +468,7 @@ async fn run_once(
         }
     }
     node.save_index(&set.name, &scan.entries)?;
-    let skipped = if scan.skipped > 0 {
-        format!(", {} unreadable skipped", scan.skipped)
-    } else {
-        String::new()
-    };
+    let skipped = if scan.skipped > 0 { format!(", {} unreadable skipped", scan.skipped) } else { String::new() };
     if stored.is_empty() && scan.new_bytes > 0 {
         out.say(format!(
             "{prefix}no changes since the last restore point; re-sent {} that friends were missing",
@@ -565,13 +481,15 @@ async fn run_once(
             human(scan.bytes)
         ));
     } else {
-        out.say(format!(
+        let line = format!(
             "{prefix}restore point {snap_id} created on {}: {} files, {}, {} uploaded{skipped}",
             stored.join(", "),
             scan.files,
             human(scan.bytes),
             human(scan.new_bytes)
-        ));
+        );
+        node.note(line.clone());
+        out.say(line);
         *node.last_backup.lock().unwrap() = Some(snapshot::when(manifest.time));
     }
     Ok(full)
@@ -599,11 +517,7 @@ mod tests {
         let buf = noise(6_000_000);
         let pieces = split_index(&buf);
         assert!(pieces.len() > 1);
-        assert!(
-            pieces
-                .iter()
-                .all(|p| p.len() >= MIN_CHUNK || std::ptr::eq(*p, *pieces.last().unwrap()))
-        );
+        assert!(pieces.iter().all(|p| p.len() >= MIN_CHUNK || std::ptr::eq(*p, *pieces.last().unwrap())));
         assert!(pieces.iter().all(|p| p.len() <= MAX_CHUNK));
         assert_eq!(pieces.concat(), buf);
     }
@@ -613,17 +527,11 @@ mod tests {
         let a = noise(24_000_000);
         let mut b = a.clone();
         b.splice(12_000_000..12_000_000, *b"inserted bytes");
-        let ids = |buf: &[u8]| -> HashSet<blake3::Hash> {
-            split_index(buf).iter().map(|p| blake3::hash(p)).collect()
-        };
+        let ids = |buf: &[u8]| -> HashSet<blake3::Hash> { split_index(buf).iter().map(|p| blake3::hash(p)).collect() };
         let (x, y) = (ids(&a), ids(&b));
         let changed = y.difference(&x).count();
         assert!(y.len() >= 8, "expected many chunks, got {}", y.len());
-        assert!(
-            changed <= 2,
-            "{changed} of {} chunks changed after a small insert",
-            y.len()
-        );
+        assert!(changed <= 2, "{changed} of {} chunks changed after a small insert", y.len());
     }
 
     #[test]

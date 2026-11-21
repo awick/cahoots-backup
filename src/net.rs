@@ -28,6 +28,9 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
+/// This build's release number, from Cargo.toml.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub fn offline() -> bool {
     std::env::var_os("SDB_OFFLINE").is_some()
 }
@@ -52,10 +55,7 @@ pub async fn bind(secret: SecretKey, port: u16, upnp: bool) -> Result<Endpoint> 
             }
         }
     }
-    builder(&secret, upnp)
-        .bind()
-        .await
-        .map_err(|e| anyhow!("cannot start networking: {e}"))
+    builder(&secret, upnp).bind().await.map_err(|e| anyhow!("cannot start networking: {e}"))
 }
 
 pub fn my_addrs(ep: &Endpoint) -> (Option<String>, Vec<SocketAddr>) {
@@ -73,11 +73,7 @@ pub fn my_addrs(ep: &Endpoint) -> (Option<String>, Vec<SocketAddr>) {
     (relay, addrs)
 }
 
-pub fn endpoint_addr(
-    id: &str,
-    relay: &Option<String>,
-    addrs: &[SocketAddr],
-) -> Result<EndpointAddr> {
+pub fn endpoint_addr(id: &str, relay: &Option<String>, addrs: &[SocketAddr]) -> Result<EndpointAddr> {
     let pk: PublicKey = id.parse().map_err(|_| anyhow!("bad node id {id}"))?;
     let mut addr = EndpointAddr::new(pk);
     if let Some(r) = relay {
@@ -124,19 +120,13 @@ impl Peer {
         };
         // A new connection starts on the relay; give it a moment to find a direct path.
         for _ in 0..12 {
-            if conn
-                .paths()
-                .iter()
-                .any(|p| p.is_selected() && !p.is_relay())
-            {
+            if conn.paths().iter().any(|p| p.is_selected() && !p.is_relay()) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         match conn.paths().iter().find(|p| p.is_selected()) {
-            Some(p) if p.is_relay() => {
-                "through the relay (still looking for a direct path)".to_string()
-            }
+            Some(p) if p.is_relay() => "through the relay (still looking for a direct path)".to_string(),
             Some(p) => match p.remote_addr() {
                 iroh::TransportAddr::Ip(a) => format!("direct to {a}"),
                 other => format!("direct ({other:?})"),
@@ -150,22 +140,14 @@ impl Peer {
     }
 
     async fn open(&self, req: &Req) -> Result<(SendStream, RecvStream)> {
-        let Link::Remote(conn) = &self.link else {
-            bail!("not a network destination")
-        };
-        let (mut s, r) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow!("{}: {e}", self.friend.name))?;
+        let Link::Remote(conn) = &self.link else { bail!("not a network destination") };
+        let (mut s, r) = conn.open_bi().await.map_err(|e| anyhow!("{}: {e}", self.friend.name))?;
         proto::send(&mut s, req).await?;
         Ok((s, r))
     }
 
     async fn reply(&self, r: &mut RecvStream) -> Result<Resp> {
-        match proto::recv(r)
-            .await
-            .map_err(|e| anyhow!("{}: {e}", self.friend.name))?
-        {
+        match proto::recv(r).await.map_err(|e| anyhow!("{}: {e}", self.friend.name))? {
             Resp::Err(e) => bail!("{}: {e}", self.friend.name),
             resp => Ok(resp),
         }
@@ -190,9 +172,7 @@ impl Peer {
         }
         let (mut s, mut r) = self.open(&Req::ListChunks).await?;
         let _ = s.finish();
-        let Resp::Count(n) = self.reply(&mut r).await? else {
-            bail!("unexpected reply")
-        };
+        let Resp::Count(n) = self.reply(&mut r).await? else { bail!("unexpected reply") };
         let mut set = HashSet::with_capacity(n as usize);
         for _ in 0..n {
             set.insert(proto::read_id(&mut r).await?);
@@ -203,16 +183,11 @@ impl Peer {
     pub async fn put_chunks(&self, items: &[&(Id, Vec<u8>)]) -> Result<()> {
         if let Link::Drive(st, me) = &self.link {
             for (id, data) in items {
-                st.put_chunk(me, id, data, self.quota())
-                    .map_err(|e| anyhow!("{}: {e}", self.friend.name))?;
+                st.put_chunk(me, id, data, self.quota()).map_err(|e| anyhow!("{}: {e}", self.friend.name))?;
             }
             return Ok(());
         }
-        let (mut s, mut r) = self
-            .open(&Req::PutChunks {
-                count: items.len() as u32,
-            })
-            .await?;
+        let (mut s, mut r) = self.open(&Req::PutChunks { count: items.len() as u32 }).await?;
         for (id, data) in items {
             AsyncWriteExt::write_all(&mut s, id).await?;
             proto::write_blob(&mut s, data).await?;
@@ -241,10 +216,7 @@ impl Peer {
             return Ok(());
         }
         for batch in ids.chunks(10_000) {
-            self.simple(Req::DeleteChunks {
-                ids: batch.to_vec(),
-            })
-            .await?;
+            self.simple(Req::DeleteChunks { ids: batch.to_vec() }).await?;
         }
         Ok(())
     }
@@ -253,12 +225,7 @@ impl Peer {
         if let Link::Drive(st, me) = &self.link {
             return st.put_snapshot(me, id, &data, self.quota());
         }
-        self.simple(Req::PutSnapshot {
-            id: id.into(),
-            data,
-        })
-        .await
-        .map(|_| ())
+        self.simple(Req::PutSnapshot { id: id.into(), data }).await.map(|_| ())
     }
 
     pub async fn list_snapshots(&self) -> Result<Vec<(String, Vec<u8>)>> {
@@ -275,9 +242,18 @@ impl Peer {
         if let Link::Drive(st, me) = &self.link {
             return st.delete_snapshot(me, id);
         }
-        self.simple(Req::DeleteSnapshot { id: id.into() })
-            .await
-            .map(|_| ())
+        self.simple(Req::DeleteSnapshot { id: id.into() }).await.map(|_| ())
+    }
+
+    /// The sdb release the destination runs; None for a drive or a node too old to say.
+    pub async fn version(&self) -> Option<String> {
+        if !self.is_remote() {
+            return None;
+        }
+        match self.simple(Req::Version).await {
+            Ok(Resp::Version(v)) => Some(v.chars().filter(|c| c.is_ascii_graphic()).take(24).collect()),
+            _ => None,
+        }
     }
 
     pub async fn usage(&self) -> Result<(u64, u64)> {
@@ -310,6 +286,25 @@ pub struct Guard {
     strangers: Semaphore,
     /// Open connections per friend.
     conns: Mutex<HashMap<String, u32>>,
+    /// Per friend, the earliest moment more of their upload may be read; this is what
+    /// holds a friend to the incoming speed limit set for them.
+    pace: Mutex<HashMap<String, tokio::time::Instant>>,
+}
+
+impl Guard {
+    /// Accounts for `bytes` just received from a friend and returns how long to wait
+    /// before reading more, so their uploads average at most `kbps`.
+    fn owe(&self, friend: &str, bytes: usize, kbps: u64) -> Duration {
+        if kbps == 0 {
+            return Duration::ZERO;
+        }
+        let now = tokio::time::Instant::now();
+        let cost = Duration::from_millis(bytes as u64 * 1000 / (kbps * 1024));
+        let mut pace = self.pace.lock().unwrap();
+        let slot = pace.entry(friend.to_string()).or_insert(now);
+        *slot = (*slot).max(now) + cost;
+        slot.saturating_duration_since(now)
+    }
 }
 
 impl Default for Guard {
@@ -319,6 +314,7 @@ impl Default for Guard {
             bad_invites: AtomicU32::new(0),
             strangers: Semaphore::new(MAX_STRANGERS),
             conns: Mutex::new(HashMap::new()),
+            pace: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -335,12 +331,7 @@ impl ProtocolHandler for Handler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let node = &self.0;
         let remote = conn.remote_id().to_string();
-        let is_friend = |n: &Node| {
-            n.cfg()
-                .friends
-                .iter()
-                .any(|f| f.id == remote && f.path.is_none())
-        };
+        let is_friend = |n: &Node| n.cfg().friends.iter().any(|f| f.id == remote && f.path.is_none());
         if !is_friend(node) {
             // An unknown node gets nothing, except one small, short pairing attempt while an invite is open.
             node.guard.rejected.fetch_add(1, Ordering::Relaxed);
@@ -360,9 +351,7 @@ impl ProtocolHandler for Handler {
                 if is_friend(node) {
                     node.guard.bad_invites.store(0, Ordering::Relaxed);
                     node.guard.rejected.fetch_sub(1, Ordering::Relaxed);
-                } else if node.guard.bad_invites.fetch_add(1, Ordering::Relaxed) + 1
-                    >= MAX_BAD_INVITES
-                {
+                } else if node.guard.bad_invites.fetch_add(1, Ordering::Relaxed) + 1 >= MAX_BAD_INVITES {
                     // Someone is guessing: close the door until the owner makes a new invite.
                     node.revoke_invites();
                     node.guard.bad_invites.store(0, Ordering::Relaxed);
@@ -417,30 +406,13 @@ pub async fn serve_conn(node: Arc<Node>, conn: Connection, remote: String) {
     }
 }
 
-async fn serve(
-    node: &Arc<Node>,
-    remote: &str,
-    s: &mut SendStream,
-    r: &mut RecvStream,
-    max: usize,
-) -> Result<()> {
+async fn serve(node: &Arc<Node>, remote: &str, s: &mut SendStream, r: &mut RecvStream, max: usize) -> Result<()> {
     let req: Req = proto::recv_max(r, max).await?;
-    if let Req::Pair {
-        token,
-        name,
-        relay,
-        addrs,
-    } = req
-    {
+    if let Req::Pair { token, name, relay, addrs } = req {
         let name = node.accept_pair(remote, &token, &name, relay, addrs)?;
         return proto::send(s, &Resp::Paired { name }).await;
     }
-    let Some(friend) = node
-        .cfg()
-        .friends
-        .into_iter()
-        .find(|f| f.id == remote && f.path.is_none())
-    else {
+    let Some(friend) = node.cfg().friends.into_iter().find(|f| f.id == remote && f.path.is_none()) else {
         bail!("you are not on this node's friend list");
     };
     crate::store::check_owner(remote)?;
@@ -459,12 +431,13 @@ async fn serve(
             let mut err = None;
             for _ in 0..count {
                 let id = proto::read_id(r).await?;
-                let data = proto::read_blob(r, MAX_BLOB)
-                    .await?
-                    .ok_or_else(|| anyhow!("bad chunk"))?;
+                let data = proto::read_blob(r, MAX_BLOB).await?.ok_or_else(|| anyhow!("bad chunk"))?;
                 if err.is_none() {
                     err = store.put_chunk(remote, &id, &data, quota).err();
                 }
+                // Not reading the next chunk yet is what slows the sender down.
+                let wait = node.guard.owe(remote, data.len(), friend.max_in_kbps);
+                tokio::time::sleep(wait).await;
             }
             if let Some(e) = err {
                 return Err(e);
@@ -488,23 +461,13 @@ async fn serve(
             store.put_snapshot(remote, &id, &data, quota)?;
             proto::send(s, &Resp::Ok).await?;
         }
-        Req::ListSnapshots => {
-            proto::send(s, &Resp::Snapshots(store.list_snapshots(remote))).await?
-        }
+        Req::ListSnapshots => proto::send(s, &Resp::Snapshots(store.list_snapshots(remote))).await?,
         Req::DeleteSnapshot { id } => {
             store.delete_snapshot(remote, &id)?;
             proto::send(s, &Resp::Ok).await?;
         }
-        Req::Usage => {
-            proto::send(
-                s,
-                &Resp::Usage {
-                    used: store.usage(remote)?,
-                    quota,
-                },
-            )
-            .await?
-        }
+        Req::Usage => proto::send(s, &Resp::Usage { used: store.usage(remote)?, quota }).await?,
+        Req::Version => proto::send(s, &Resp::Version(VERSION.into())).await?,
     }
     Ok(())
 }

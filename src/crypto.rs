@@ -24,9 +24,7 @@ fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
 
 fn encrypt(c: &XChaCha20Poly1305, aad: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
     let nonce: [u8; 24] = rand::random();
-    let ct = c
-        .encrypt(&XNonce::from(nonce), Payload { msg, aad })
-        .map_err(|_| anyhow!("encryption failed"))?;
+    let ct = c.encrypt(&XNonce::from(nonce), Payload { msg, aad }).map_err(|_| anyhow!("encryption failed"))?;
     let mut out = vec![BLOB_FORMAT];
     out.extend(nonce);
     out.extend(ct);
@@ -38,30 +36,18 @@ fn decrypt(c: &XChaCha20Poly1305, aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
         bail!("ciphertext too short");
     }
     if blob[0] != BLOB_FORMAT {
-        bail!(
-            "data is in format {} but this sdb only reads format {BLOB_FORMAT}; upgrade sdb",
-            blob[0]
-        );
+        bail!("data is in format {} but this sdb only reads format {BLOB_FORMAT}; upgrade sdb", blob[0]);
     }
     let nonce: [u8; 24] = blob[1..25].try_into().unwrap();
-    c.decrypt(
-        &XNonce::from(nonce),
-        Payload {
-            msg: &blob[25..],
-            aad,
-        },
-    )
-    .map_err(|_| anyhow!("decryption failed (wrong key or corrupted data)"))
+    c.decrypt(&XNonce::from(nonce), Payload { msg: &blob[25..], aad })
+        .map_err(|_| anyhow!("decryption failed (wrong key or corrupted data)"))
 }
 
 impl Keys {
     pub fn new(master: &[u8; 32]) -> Self {
         Keys {
             id_key: blake3::derive_key("super-duper-backup v1 chunk id", master),
-            cipher: cipher(&blake3::derive_key(
-                "super-duper-backup v1 encryption",
-                master,
-            )),
+            cipher: cipher(&blake3::derive_key("super-duper-backup v1 encryption", master)),
         }
     }
 
@@ -103,8 +89,7 @@ fn kit_key(pass: &str, salt: &[u8]) -> Result<[u8; 32]> {
     let params = argon2::Params::new(64 * 1024, 3, 1, Some(32)).map_err(|e| anyhow!("{e}"))?;
     let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut key = [0u8; 32];
-    a.hash_password_into(pass.as_bytes(), salt, &mut key)
-        .map_err(|e| anyhow!("{e}"))?;
+    a.hash_password_into(pass.as_bytes(), salt, &mut key).map_err(|e| anyhow!("{e}"))?;
     Ok(key)
 }
 
@@ -146,28 +131,16 @@ mod tests {
         let mut bad = blob.clone();
         let last = bad.len() - 1;
         bad[last] ^= 1;
-        assert!(
-            keys.open(&id, &bad).is_err(),
-            "a flipped bit must be rejected"
-        );
+        assert!(keys.open(&id, &bad).is_err(), "a flipped bit must be rejected");
 
         let other = keys.chunk_id(b"something else");
-        assert!(
-            keys.open(&other, &blob).is_err(),
-            "a chunk served under another id must be rejected"
-        );
-        assert!(
-            Keys::new(&[8; 32]).open(&id, &blob).is_err(),
-            "another key must not decrypt"
-        );
+        assert!(keys.open(&other, &blob).is_err(), "a chunk served under another id must be rejected");
+        assert!(Keys::new(&[8; 32]).open(&id, &blob).is_err(), "another key must not decrypt");
     }
 
     #[test]
     fn ids_are_keyed() {
-        assert_ne!(
-            Keys::new(&[1; 32]).chunk_id(b"same"),
-            Keys::new(&[2; 32]).chunk_id(b"same")
-        );
+        assert_ne!(Keys::new(&[1; 32]).chunk_id(b"same"), Keys::new(&[2; 32]).chunk_id(b"same"));
     }
 
     #[test]

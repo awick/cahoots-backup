@@ -107,9 +107,9 @@ pub fn decode_manifest(buf: &[u8]) -> Result<Manifest> {
                 set: crate::config::DEFAULT_SET.into(),
             })
         }
-        Some(v) => bail!(
-            "restore point is in format {v} but this sdb only reads up to format {MANIFEST_FORMAT}; upgrade sdb"
-        ),
+        Some(v) => {
+            bail!("restore point is in format {v} but this sdb only reads up to format {MANIFEST_FORMAT}; upgrade sdb")
+        }
         None => bail!("empty restore point"),
     }
 }
@@ -129,11 +129,7 @@ pub fn decode_index(mut buf: &[u8]) -> Result<Vec<Entry>> {
         bail!("not a snapshot index");
     }
     if buf[4] != INDEX_MAGIC[4] {
-        bail!(
-            "snapshot index is in format {} but this sdb only reads format {}; upgrade sdb",
-            buf[4],
-            INDEX_MAGIC[4]
-        );
+        bail!("snapshot index is in format {} but this sdb only reads format {}; upgrade sdb", buf[4], INDEX_MAGIC[4]);
     }
     buf = &buf[5..];
     let mut out = Vec::new();
@@ -159,11 +155,7 @@ pub fn human(n: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    if i == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", U[i])
-    }
+    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", U[i]) }
 }
 
 pub fn when(t: i64) -> String {
@@ -179,25 +171,11 @@ pub fn when(t: i64) -> String {
 pub fn parse_when(spec: &str) -> Option<i64> {
     use chrono::{NaiveDate, NaiveDateTime, TimeZone};
     let spec = spec.trim();
-    let dt = [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M",
-    ]
-    .iter()
-    .find_map(|f| NaiveDateTime::parse_from_str(spec, f).ok())
-    .or_else(|| {
-        NaiveDate::parse_from_str(spec, "%Y-%m-%d")
-            .ok()?
-            .and_hms_opt(23, 59, 59)
-    })?;
-    Some(
-        chrono::Local
-            .from_local_datetime(&dt)
-            .earliest()?
-            .timestamp(),
-    )
+    let dt = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"]
+        .iter()
+        .find_map(|f| NaiveDateTime::parse_from_str(spec, f).ok())
+        .or_else(|| NaiveDate::parse_from_str(spec, "%Y-%m-%d").ok()?.and_hms_opt(23, 59, 59))?;
+    Some(chrono::Local.from_local_datetime(&dt).earliest()?.timestamp())
 }
 
 #[cfg(test)]
@@ -205,28 +183,14 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, kind: Kind) -> Entry {
-        Entry {
-            path: path.as_bytes().to_vec(),
-            mode: 0o644,
-            uid: 1,
-            gid: 2,
-            mtime: 3,
-            ino: 4,
-            kind,
-        }
+        Entry { path: path.as_bytes().to_vec(), mode: 0o644, uid: 1, gid: 2, mtime: 3, ino: 4, kind }
     }
 
     #[test]
     fn index_round_trip() {
         let entries = vec![
             entry("/a", Kind::Dir),
-            entry(
-                "/a/f",
-                Kind::File {
-                    size: 5,
-                    chunks: vec![[9; 32], [8; 32]],
-                },
-            ),
+            entry("/a/f", Kind::File { size: 5, chunks: vec![[9; 32], [8; 32]] }),
             entry("/a/l", Kind::Symlink(b"f".to_vec())),
         ];
         let buf = encode_index(&entries).unwrap();
@@ -241,12 +205,7 @@ mod tests {
         assert!(decode_index(b"nope").is_err());
         let mut buf = encode_index(&[]).unwrap();
         buf[4] += 1;
-        assert!(
-            decode_index(&buf)
-                .unwrap_err()
-                .to_string()
-                .contains("upgrade")
-        );
+        assert!(decode_index(&buf).unwrap_err().to_string().contains("upgrade"));
         let mut cut = encode_index(&[entry("/a", Kind::Dir)]).unwrap();
         cut.pop();
         assert!(decode_index(&cut).is_err());
@@ -274,31 +233,13 @@ mod tests {
         assert_eq!(back.tag.as_deref(), Some("t"));
 
         // A restore point written before backup sets existed belongs to the default set.
-        let v1 = (
-            1u8,
-            100i64,
-            5u32,
-            "h",
-            vec!["/a"],
-            vec![[1u8; 32]],
-            2u64,
-            3u64,
-            4u64,
-            None::<String>,
-            0u64,
-            "0.1.0",
-        );
+        let v1 = (1u8, 100i64, 5u32, "h", vec!["/a"], vec![[1u8; 32]], 2u64, 3u64, 4u64, None::<String>, 0u64, "0.1.0");
         let mut old = vec![1u8];
         old.extend(postcard::to_stdvec(&v1).unwrap());
         let m1 = decode_manifest(&old).unwrap();
         assert_eq!((m1.set.as_str(), m1.files, m1.time), ("default", 2, 100));
 
-        assert!(
-            decode_manifest(&[99, 0, 0])
-                .unwrap_err()
-                .to_string()
-                .contains("upgrade")
-        );
+        assert!(decode_manifest(&[99, 0, 0]).unwrap_err().to_string().contains("upgrade"));
         assert!(decode_manifest(&[]).is_err());
     }
 

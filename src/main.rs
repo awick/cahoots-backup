@@ -28,11 +28,7 @@ use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
-#[command(
-    name = "sdb",
-    version,
-    about = "Super Duper Backup: encrypted, deduplicated backups between friends"
-)]
+#[command(name = "sdb", version, about = "Super Duper Backup: encrypted, deduplicated backups between friends")]
 struct Cli {
     #[command(subcommand)]
     cmd: C,
@@ -77,6 +73,9 @@ enum C {
         /// Always keep this many most recent restore points of this set
         #[arg(long)]
         last: Option<u32>,
+        /// Give the set a new name (its restore points stay with it)
+        #[arg(long)]
+        rename: Option<String>,
         /// Delete the set (its restore points stay until pruned)
         #[arg(long)]
         delete: bool,
@@ -93,10 +92,12 @@ enum C {
     Invite,
     /// Accept a friend's invite
     Join { ticket: String },
-    /// List friends
-    Friends,
-    /// Manage one friend
-    Friend {
+    /// List destinations: friends and drives
+    #[command(alias = "friends")]
+    Destinations,
+    /// Manage one destination
+    #[command(alias = "friend")]
+    Destination {
         #[command(subcommand)]
         cmd: FriendCmd,
     },
@@ -186,8 +187,10 @@ enum C {
     },
     /// Check the data friends store on this computer for disk damage
     Scrub,
-    /// Show configuration, friends and usage
+    /// Show configuration, destinations and usage
     Status,
+    /// Stop the background daemon (the next command starts it again)
+    Stop,
     /// Interactive setup: pick folders and friends, browse and restore files
     #[command(alias = "setup")]
     Tui,
@@ -214,6 +217,8 @@ enum FriendCmd {
     },
     /// Set how many GB a friend may store on this computer
     Quota { name: String, gb: u64 },
+    /// Fastest a friend may send backups to this computer, in KB/s (0 = unlimited)
+    Limit { name: String, kbps: u64 },
     /// Start or stop sending your backups to a friend
     BackupTo {
         name: String,
@@ -255,10 +260,7 @@ fn passphrase(confirm: bool) -> Result<String> {
 }
 
 fn hostname() -> String {
-    let name = rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned();
+    let name = rustix::system::uname().nodename().to_string_lossy().into_owned();
     let h = name.split('.').next().unwrap_or("").to_string();
     if h.is_empty() { "computer".into() } else { h }
 }
@@ -270,64 +272,106 @@ fn abs(p: &PathBuf) -> Result<String> {
 fn lock(home: &std::path::Path) -> Result<fs::File> {
     let f = fs::File::create(home.join("lock"))?;
     if fs2::FileExt::try_lock_exclusive(&f).is_err() {
-        bail!(
-            "another sdb command is running on {}; wait for it to finish and try again",
-            home.display()
-        );
+        bail!("another sdb command is running on {}; wait for it to finish and try again", home.display());
     }
     Ok(f)
 }
 
 async fn daemon(home: PathBuf) -> Result<()> {
     let _lock = lock(&home)?;
+    control::started_fingerprint();
     let (node, router) = Node::start(home.clone(), true, true).await?;
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let history = node.clone();
     tokio::spawn(async move {
         while let Some(l) = rx.recv().await {
             println!("{} {l}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+            // Backup results reach the history from the engine itself.
+            if !l.contains("restore point ") && !l.starts_with("watching ") && !l.trim_start().starts_with("...") {
+                history.note(l);
+            }
         }
     });
     let out = Out(tx);
-    out.say(format!(
-        "Super Duper Backup daemon started as {} ({})",
-        node.cfg().name,
-        node.id()
-    ));
+    out.say(format!("Super Duper Backup daemon started as {} ({})", node.cfg().name, node.id()));
     tokio::spawn(control::serve(node.clone(), control::listen(&home)?));
     tokio::spawn(watch::run(node.clone(), out));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
+        _ = node.quit.notified() => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
     }
     let _ = fs::remove_file(control::sock_path(&home));
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), router.shutdown()).await;
     Ok(())
 }
 
+/// Starts the daemon in the background, detached from this terminal.
+fn spawn_daemon(home: &std::path::Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let log = fs::OpenOptions::new().create(true).append(true).open(home.join("daemon.log"))?;
+    std::process::Command::new(std::env::current_exe()?)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .process_group(0)
+        .spawn()
+        .context("cannot start the sdb daemon")?;
+    Ok(())
+}
+
+/// Connects to the daemon, starting it if it is not running and replacing it
+/// if it was started from an older build than this client.
+async fn daemon_stream(home: &std::path::Path) -> Result<tokio::net::UnixStream> {
+    Config::load(home)?;
+    for _ in 0..2 {
+        if let Some(s) = control::connect(home).await {
+            let mut theirs = String::new();
+            let known = control::request(s, &Cmd::Hello, &mut |l| theirs = l).await.is_ok();
+            if known && theirs == control::fingerprint() {
+                if let Some(s) = control::connect(home).await {
+                    return Ok(s);
+                }
+            }
+            if let Some(s) = control::connect(home).await {
+                let _ = control::request(s, &Cmd::Stop, &mut |_| {}).await;
+            }
+            for _ in 0..50 {
+                if control::connect(home).await.is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        if control::connect(home).await.is_none() {
+            spawn_daemon(home)?;
+        }
+        for _ in 0..100 {
+            if control::connect(home).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    control::connect(home).await.ok_or_else(|| {
+        anyhow::anyhow!("the sdb daemon could not be started; see {}", home.join("daemon.log").display())
+    })
+}
+
 async fn run(cmd: Cmd) -> Result<()> {
     let home = config::home();
-    if let Some(stream) = control::connect(&home).await {
-        return control::client(stream, &cmd).await;
+    if matches!(cmd, Cmd::Stop) {
+        return match control::connect(&home).await {
+            Some(s) => control::client(s, &cmd).await,
+            None => {
+                println!("the daemon is not running");
+                Ok(())
+            }
+        };
     }
-    Config::load(&home)?;
-    let _lock = lock(&home)?;
-    let (node, router) = Node::start(home, false, false).await?;
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let printer = tokio::spawn(async move {
-        while let Some(l) = rx.recv().await {
-            println!("{l}");
-        }
-    });
-    let out = Out(tx);
-    let res = tokio::select! {
-        r = node.run(cmd, &out) => r,
-        _ = tokio::signal::ctrl_c() => Ok(()),
-    };
-    drop(out);
-    let _ = printer.await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), router.shutdown()).await;
-    res
+    control::client(daemon_stream(&home).await?, &cmd).await
 }
 
 async fn tui_main(home: PathBuf) -> Result<()> {
@@ -337,17 +381,8 @@ async fn tui_main(home: PathBuf) -> Result<()> {
         Identity::generate().save(&home)?;
         Config::new(hostname()).save(&home)?;
     }
-    if control::connect(&home).await.is_some() {
-        return tui::run(tui::Exec::Daemon(home)).await;
-    }
-    let _lock = lock(&home)?;
-    let (node, router) = Node::start(home.clone(), true, false).await?;
-    // Other sdb commands keep working while the TUI is open.
-    tokio::spawn(control::serve(node.clone(), control::listen(&home)?));
-    let res = tui::run(tui::Exec::Local(node)).await;
-    let _ = fs::remove_file(control::sock_path(&home));
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), router.shutdown()).await;
-    res
+    drop(daemon_stream(&home).await?);
+    tui::run(home).await
 }
 
 #[tokio::main]
@@ -371,31 +406,29 @@ async fn real_main() -> Result<()> {
             let cfg = Config::new(name.unwrap_or_else(hostname));
             cfg.save(&home)?;
             println!("Set up \"{}\" in {}", cfg.name, home.display());
-            println!(
-                "Next: `sdb add <folder>`, `sdb invite` (or `sdb join <invite>`), `sdb service install`."
-            );
-            println!(
-                "Then run `sdb recovery export <file>` and keep that file somewhere other than this computer."
-            );
+            println!("Next: `sdb add <folder>`, `sdb invite` (or `sdb join <invite>`), `sdb service install`.");
+            println!("Then run `sdb recovery export <file>` and keep that file somewhere other than this computer.");
             return Ok(());
         }
         C::Daemon => return daemon(home).await,
         C::Tui => return tui_main(home).await,
         C::Service { cmd } => {
             return match cmd {
-                ServiceCmd::Install => service::install(),
+                ServiceCmd::Install => {
+                    // Hand over: a daemon this user started by hand would block the service's one.
+                    if let Some(s) = control::connect(&home).await {
+                        let _ = control::request(s, &Cmd::Stop, &mut |_| {}).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    service::install()
+                }
                 ServiceCmd::Uninstall => service::uninstall(),
             };
         }
-        C::Recovery {
-            cmd: RecoveryCmd::Export { file },
-        } => {
+        C::Recovery { cmd: RecoveryCmd::Export { file } } => {
             let mut config = Config::load(&home)?;
             config.invites.clear();
-            let data = KitData {
-                identity: Identity::load(&home)?,
-                config,
-            };
+            let data = KitData { identity: Identity::load(&home)?, config };
             let kit = crypto::kit_seal(&passphrase(true)?, &serde_json::to_vec(&data)?)?;
             config::write_private(&file, kit.as_bytes())?;
             println!(
@@ -405,27 +438,18 @@ async fn real_main() -> Result<()> {
             println!("Export again after adding friends so the kit knows how to reach them.");
             return Ok(());
         }
-        C::Recovery {
-            cmd: RecoveryCmd::Import { file },
-        } => {
+        C::Recovery { cmd: RecoveryCmd::Import { file } } => {
             if home.join("identity.key").exists() {
                 bail!("{} is already set up; move it away first", home.display());
             }
             let kit = fs::read_to_string(&file).with_context(|| file.display().to_string())?;
-            let data: KitData =
-                serde_json::from_slice(&crypto::kit_open(&passphrase(false)?, &kit)?)?;
+            let data: KitData = serde_json::from_slice(&crypto::kit_open(&passphrase(false)?, &kit)?)?;
             fs::create_dir_all(&home)?;
             fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
             data.identity.save(&home)?;
             data.config.save(&home)?;
-            println!(
-                "Recovered \"{}\" with {} friends.",
-                data.config.name,
-                data.config.friends.len()
-            );
-            println!(
-                "Run `sdb snapshots`, then `sdb restore latest --to <folder>` (or --in-place)."
-            );
+            println!("Recovered \"{}\" with {} friends.", data.config.name, data.config.friends.len());
+            println!("Run `sdb snapshots`, then `sdb restore latest --to <folder>` (or --in-place).");
             return Ok(());
         }
         C::Add { paths, set } => {
@@ -438,39 +462,27 @@ async fn real_main() -> Result<()> {
                 .collect::<Result<_>>()?;
             Cmd::AddPaths { paths, set }
         }
-        C::Rm { path } => Cmd::RemovePath {
-            path: fs::canonicalize(&path).unwrap_or(std::path::absolute(&path)?),
-        },
+        C::Rm { path } => Cmd::RemovePath { path: fs::canonicalize(&path).unwrap_or(std::path::absolute(&path)?) },
         C::Exclude { pattern, remove } => Cmd::Exclude { pattern, remove },
         C::Invite => Cmd::Invite,
         C::Join { ticket } => Cmd::Join { ticket },
-        C::Friends => Cmd::Friends,
-        C::Friend { cmd } => match cmd {
+        C::Destinations => Cmd::Friends,
+        C::Destination { cmd } => match cmd {
             FriendCmd::Rm { name, purge } => Cmd::FriendRemove { name, purge },
             FriendCmd::Quota { name, gb } => Cmd::FriendQuota { name, gb },
+            FriendCmd::Limit { name, kbps } => Cmd::FriendLimit { name, kbps },
             FriendCmd::BackupTo { name, on } => Cmd::FriendBackupTo { name, on },
         },
         C::Backup { tag, set } => Cmd::Backup { tag, set },
         C::Sets => Cmd::Sets,
-        C::Set {
-            name,
-            to,
-            every,
-            hours,
-            days,
-            versions,
-            last,
-            delete,
-        } => Cmd::SetEdit {
+        C::Set { name, rename: Some(to), .. } => Cmd::SetRename { name, to },
+        C::Set { name, to, every, hours, days, versions, last, delete, .. } => Cmd::SetEdit {
             name,
             to: to.map(|t| {
                 if t == "all" {
                     vec![]
                 } else {
-                    t.split(',')
-                        .map(|x| x.trim().to_string())
-                        .filter(|x| !x.is_empty())
-                        .collect()
+                    t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
                 }
             }),
             every,
@@ -481,38 +493,16 @@ async fn real_main() -> Result<()> {
             delete,
         },
         C::Snapshots => Cmd::Snapshots,
-        C::Ls { snap, path } => Cmd::Ls {
-            snap,
-            path: path.as_ref().map(abs).transpose()?,
-        },
+        C::Ls { snap, path } => Cmd::Ls { snap, path: path.as_ref().map(abs).transpose()? },
         C::Diff { a, b } => Cmd::Diff { a, b },
         C::History { path } => Cmd::History { path: abs(&path)? },
-        C::Restore {
-            snap,
-            paths,
-            to,
-            in_place,
-            from,
-        } => Cmd::Restore {
+        C::Restore { snap, paths, to, in_place, from } => Cmd::Restore {
             from,
             snap,
             paths: paths.iter().map(abs).collect::<Result<_>>()?,
-            to: if in_place {
-                PathBuf::from("/")
-            } else {
-                std::path::absolute(to.unwrap())?
-            },
+            to: if in_place { PathBuf::from("/") } else { std::path::absolute(to.unwrap())? },
         },
-        C::Keep {
-            days,
-            versions,
-            pattern,
-            last,
-            hourly,
-            daily,
-            weekly,
-            monthly,
-        } => {
+        C::Keep { days, versions, pattern, last, hourly, daily, weekly, monthly } => {
             let set = [
                 ("days", days),
                 ("last", last),
@@ -524,56 +514,32 @@ async fn real_main() -> Result<()> {
             .into_iter()
             .filter_map(|(k, v)| Some((k.to_string(), v?)))
             .collect();
-            Cmd::Keep {
-                set,
-                versions,
-                pattern,
-            }
+            Cmd::Keep { set, versions, pattern }
         }
-        C::Limit { upload_kbps } => Cmd::Tune {
-            upload_kbps: Some(upload_kbps),
-            hours: None,
-            pause_hours: None,
-            warn_days: None,
-        },
+        C::Limit { upload_kbps } => {
+            Cmd::Tune { upload_kbps: Some(upload_kbps), hours: None, pause_hours: None, warn_days: None }
+        }
         C::Schedule { hours } => Cmd::Tune {
             upload_kbps: None,
-            hours: Some(if hours == "always" {
-                String::new()
-            } else {
-                hours
-            }),
+            hours: Some(if hours == "always" { String::new() } else { hours }),
             pause_hours: None,
             warn_days: None,
         },
-        C::Pause { hours } => Cmd::Tune {
-            upload_kbps: None,
-            hours: None,
-            pause_hours: Some(hours.unwrap_or(24 * 3650)),
-            warn_days: None,
-        },
-        C::Resume => Cmd::Tune {
-            upload_kbps: None,
-            hours: None,
-            pause_hours: Some(0),
-            warn_days: None,
-        },
-        C::WarnAfter { days } => Cmd::Tune {
-            upload_kbps: None,
-            hours: None,
-            pause_hours: None,
-            warn_days: Some(days),
-        },
+        C::Pause { hours } => {
+            Cmd::Tune { upload_kbps: None, hours: None, pause_hours: Some(hours.unwrap_or(24 * 3650)), warn_days: None }
+        }
+        C::Resume => Cmd::Tune { upload_kbps: None, hours: None, pause_hours: Some(0), warn_days: None },
+        C::WarnAfter { days } => Cmd::Tune { upload_kbps: None, hours: None, pause_hours: None, warn_days: Some(days) },
         C::Every { minutes, name } => Cmd::Every { name, minutes },
-        C::Drive { name, path } => Cmd::DriveAdd {
-            name,
-            path: fs::canonicalize(&path).with_context(|| path.display().to_string())?,
-        },
+        C::Drive { name, path } => {
+            Cmd::DriveAdd { name, path: fs::canonicalize(&path).with_context(|| path.display().to_string())? }
+        }
         C::Prune { dry_run } => Cmd::Prune { dry_run },
         C::Forget { snap } => Cmd::Forget { snap },
         C::Verify { full, local } => Cmd::Verify { full, local },
         C::Scrub => Cmd::Scrub,
         C::Status => Cmd::Status,
+        C::Stop => Cmd::Stop,
     };
     run(cmd).await
 }

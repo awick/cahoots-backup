@@ -39,6 +39,9 @@ pub enum Req {
         id: String,
     },
     Usage,
+    /// Which sdb release the other side runs. Added after the first release, so it stays
+    /// last: an older node answers it with an error, which reads as "unknown".
+    Version,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -49,6 +52,7 @@ pub enum Resp {
     Count(u64),
     Snapshots(Vec<(String, Vec<u8>)>),
     Usage { used: u64, quota: u64 },
+    Version(String),
 }
 
 pub async fn send<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
@@ -59,13 +63,8 @@ pub async fn recv<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Resul
     recv_max(r, MAX_MSG).await
 }
 
-pub async fn recv_max<R: AsyncRead + Unpin, T: DeserializeOwned>(
-    r: &mut R,
-    max: usize,
-) -> Result<T> {
-    Ok(postcard::from_bytes(
-        &read_blob(r, max).await?.unwrap_or_default(),
-    )?)
+pub async fn recv_max<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R, max: usize) -> Result<T> {
+    Ok(postcard::from_bytes(&read_blob(r, max).await?.unwrap_or_default())?)
 }
 
 pub async fn write_blob<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Result<()> {

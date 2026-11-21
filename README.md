@@ -9,7 +9,7 @@ Friends only ever hold ciphertext.
 
 ```bash
 cargo build --release              # binary is target/release/sdb
-sdb tui                            # interactive: folders, friends, settings, restore, status
+sdb tui                            # interactive: backup sets, restore, destinations, settings
 ```
 
 Or from the command line:
@@ -30,7 +30,7 @@ restore point shortly after files stop changing.
 
 | Command | What it does |
 | --- | --- |
-| `sdb status` | folders, friends, usage, how you are reachable |
+| `sdb status` | folders, destinations, usage, how you are reachable |
 | `sdb backup [--tag NAME]` | restore point now; tagged ones are kept until `sdb forget` |
 | `sdb snapshots` | list restore points |
 | `sdb history FILE` | every version of one file |
@@ -48,26 +48,44 @@ restore point shortly after files stop changing.
 | `sdb schedule 22-7` / `sdb schedule always` | hours of the day automatic backups may run |
 | `sdb pause [HOURS]` / `sdb resume` | hold automatic backups |
 | `sdb warn-after DAYS` | warn when a backup, yours or a friend's to you, is this stale (default 3) |
-| `sdb friend quota NAME GB` | how much a friend may store on your computer |
-| `sdb friend backup-to NAME false` | stop sending your backups to a friend |
+| `sdb destinations` | list friends and drives |
+| `sdb destination quota NAME GB` | how much a friend may store on your computer |
+| `sdb destination limit NAME KBPS` | fastest a friend may send backups to your computer (0 = unlimited) |
+| `sdb set NAME --rename NEW` | rename a backup set; its restore points stay with it |
+| `sdb destination backup-to NAME false` | stop using a destination |
 | `sdb verify [--full]` | check friends still hold your data and it decrypts; repairs damage from another friend |
 | `sdb verify --local` | fingerprint your unmodified files against the last backup to catch silent disk corruption |
 | `sdb scrub` | check the data friends store on your computer for disk damage |
 
 ## The TUI
 
-`sdb tui` has five pages (number keys or Tab). `b` backs up now from any page;
-long jobs run in the background with progress in the bottom bar.
+`sdb tui` has a menu on the left and, on the right, whatever the highlighted
+item is about. Enter goes into an item and the menu changes to that item's own
+choices (Backup, then a backup set, then its files, destinations or schedule);
+Esc goes back up. Up and down move, and that is all there is to learn. When the
+cursor moves into the right-hand side (a folder tree, a list to tick), space
+marks things and Esc returns to the menu.
 
-| Page | What you do there |
+The first screen shows every backup set with its files, its destinations (and
+when each last got a backup), its schedule, and what it is doing right now.
+
+| Page | What is there |
 | --- | --- |
-| 1 Folders | space marks a folder for the current set; arrows open and close; shift+up/down pages |
-| 2 Friends | space sends the current set there or not; `i` invite, `a` accept an invite, `d` add a drive, `e` how often, `+`/`-` quota, `x` remove |
-| 3 Settings | hours, pause, pace, upload limit, warnings and history rules, general and per set; left/right or Enter to type |
-| 4 Restore | browse files as of any restore point; space picks, `r` restores, `/` searches names, `t` timeline, `g` jump to a date, `v` versions of a file, `s` choose the destination to read from, `w` choose the set |
-| 5 Status | warnings, what is backed up where, and for each friend whether the link is direct or relayed |
+| Backup | the backup sets and their status; create a set, choose its files, its destinations and its schedule and history rules, back up now |
+| Restore | browse files as of any restore point, search by name, step through time, list a file's versions, choose which destination to read from, restore |
+| Destinations | friends' computers and local drives: whether each is reachable and how, what you store there, what they store here; invite, accept an invite, add a drive, set pace and quota |
+| Settings | hours, pause, pace, upload limit, warnings and history rules that apply to every set |
+| History | what the daemon has done since it started |
+| Status | the full `sdb status` report |
 
-`w` switches the backup set being edited and `n` creates one.
+## The daemon
+
+One background process per computer does all the work: it serves your friends,
+watches your files and runs backups. Every `sdb` command and the TUI are clients
+that talk to it over a private local socket. The first command starts it if it
+is not running, and replaces it if it was started by an older build;
+`sdb stop` stops it and `sdb service install` starts it at login. Its log is
+`~/.super-duper-backup/daemon.log`.
 
 ## How it works
 
@@ -191,6 +209,18 @@ it with `store_dir`), `cache/`.
   one friend and run `sdb verify` occasionally.
 - On macOS the binary needs Full Disk Access to read Documents, Desktop and
   Downloads when run by launchd.
+
+## Development
+
+```bash
+git config --local core.hooksPath .githooks/   # once per clone: run the checks before every commit
+./check.sh                                     # or run them by hand
+```
+
+`check.sh` runs `cargo fmt --check`, clippy with warnings as errors, the unit
+tests, and `tests/e2e.sh`, which starts three local nodes and a drive (no
+internet needed) and exercises pairing, backup, restore, sets, a refused
+stranger, corruption detection and repair, and pruning.
 
 ## License
 

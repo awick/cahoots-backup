@@ -22,10 +22,7 @@ use std::{
 /// original path when restoring in place or when two backed up folders share a name.
 fn dest(to: &Path, e: &Entry, roots: &[PathBuf]) -> PathBuf {
     let p = e.path();
-    let base = roots
-        .iter()
-        .find(|r| p.starts_with(r))
-        .and_then(|r| r.parent());
+    let base = roots.iter().find(|r| p.starts_with(r)).and_then(|r| r.parent());
     to.join(p.strip_prefix(base.unwrap_or(Path::new("/"))).unwrap_or(&p))
 }
 
@@ -36,10 +33,7 @@ fn finish(path: &Path, e: &Entry, root: bool) {
     if root {
         let _ = std::os::unix::fs::lchown(path, Some(e.uid), Some(e.gid));
     }
-    let t = FileTime::from_unix_time(
-        e.mtime.div_euclid(1_000_000_000),
-        e.mtime.rem_euclid(1_000_000_000) as u32,
-    );
+    let t = FileTime::from_unix_time(e.mtime.div_euclid(1_000_000_000), e.mtime.rem_euclid(1_000_000_000) as u32);
     #[allow(deprecated)]
     let _ = filetime::set_symlink_file_times(path, t, t);
 }
@@ -53,10 +47,7 @@ pub async fn run(
     out: &Out,
 ) -> Result<()> {
     let mut roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-    let names: std::collections::HashSet<_> = roots
-        .iter()
-        .map(|r| r.file_name().map(|n| n.to_owned()))
-        .collect();
+    let names: std::collections::HashSet<_> = roots.iter().map(|r| r.file_name().map(|n| n.to_owned())).collect();
     if to == Path::new("/") || names.len() != roots.len() {
         roots.clear();
     }
@@ -93,10 +84,7 @@ pub async fn run(
                         written += data.len() as u64;
                         if told.elapsed().as_secs() >= 2 {
                             told = std::time::Instant::now();
-                            out.say(format!(
-                                "  ... {files} files, {} restored so far",
-                                human(bytes)
-                            ));
+                            out.say(format!("  ... {files} files, {} restored so far", human(bytes)));
                         }
                         f.write_all(&data)?;
                     }
@@ -104,10 +92,7 @@ pub async fn run(
                 drop(f);
                 if written != *size {
                     let _ = fs::remove_file(&tmp);
-                    anyhow::bail!(
-                        "{}: restored {written} bytes but the backup recorded {size}",
-                        e.show()
-                    );
+                    anyhow::bail!("{}: restored {written} bytes but the backup recorded {size}", e.show());
                 }
                 fs::rename(&tmp, &path)?;
                 finish(&path, e, root);
@@ -118,10 +103,6 @@ pub async fn run(
     for e in entries.iter().rev().filter(|e| e.kind == Kind::Dir) {
         finish(&dest(to, e, roots), e, root);
     }
-    out.say(format!(
-        "restored {files} files ({}) into {}",
-        human(bytes),
-        to.display()
-    ));
+    out.say(format!("restored {files} files ({}) into {}", human(bytes), to.display()));
     Ok(())
 }

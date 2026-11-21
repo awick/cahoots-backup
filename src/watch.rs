@@ -40,20 +40,14 @@ pub async fn run(node: Arc<Node>, out: Out) {
             if matches!(ev.kind, EventKind::Access(_)) {
                 return;
             }
-            for p in ev
-                .paths
-                .into_iter()
-                .filter(|p| ex.as_ref().is_none_or(|x| !x.is_excluded(p)))
-            {
+            for p in ev.paths.into_iter().filter(|p| ex.as_ref().is_none_or(|x| !x.is_excluded(p))) {
                 let _ = tx.send(p);
             }
         });
         let mut watcher = match watcher {
             Ok(w) => Some(w),
             Err(e) => {
-                out.say(format!(
-                    "file watching unavailable ({e}), falling back to periodic scans"
-                ));
+                out.say(format!("file watching unavailable ({e}), falling back to periodic scans"));
                 None
             }
         };
@@ -97,41 +91,35 @@ pub async fn run(node: Arc<Node>, out: Out) {
             }
             if refill {
                 refill = false;
-                for b in cfg.sets.iter().filter(|b| {
-                    !b.paths.is_empty() && touched.as_ref().is_none_or(|t| t.contains(&b.name))
-                }) {
-                    pending.extend(
-                        cfg.friends
-                            .iter()
-                            .filter(|f| b.sends_to(f))
-                            .map(|f| (b.name.clone(), f.id.clone())),
-                    );
+                for b in cfg
+                    .sets
+                    .iter()
+                    .filter(|b| !b.paths.is_empty() && touched.as_ref().is_none_or(|t| t.contains(&b.name)))
+                {
+                    pending
+                        .extend(cfg.friends.iter().filter(|f| b.sends_to(f)).map(|f| (b.name.clone(), f.id.clone())));
                 }
                 touched = Some(HashSet::new());
             }
             pending.retain(|(set, id)| {
-                cfg.set(set)
-                    .is_some_and(|b| cfg.friends.iter().any(|f| &f.id == id && b.sends_to(f)))
+                cfg.set(set).is_some_and(|b| cfg.friends.iter().any(|f| &f.id == id && b.sends_to(f)))
             });
             if pending.is_empty() {
                 dirty_since = None;
             }
-            let settled = dirty_since.is_some_and(|since| {
-                last_event.elapsed() >= settle || since.elapsed() >= settle * 10
-            });
+            let settled =
+                dirty_since.is_some_and(|since| last_event.elapsed() >= settle || since.elapsed() >= settle * 10);
             // Each set and destination has its own pace, such as a drive every 15 minutes and a friend every hour.
             let due: Vec<(String, String)> = pending
                 .iter()
                 .filter(|key| {
-                    let (Some(b), Some(f)) =
-                        (cfg.set(&key.0), cfg.friends.iter().find(|f| f.id == key.1))
-                    else {
+                    let (Some(b), Some(f)) = (cfg.set(&key.0), cfg.friends.iter().find(|f| f.id == key.1)) else {
                         return false;
                     };
                     cfg.held_for(b).is_none()
-                        && sent_at.get(*key).is_none_or(|t| {
-                            t.elapsed() >= Duration::from_secs(b.interval_secs(f, &cfg))
-                        })
+                        && sent_at
+                            .get(*key)
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(b.interval_secs(f, &cfg)))
                 })
                 .cloned()
                 .collect();
@@ -148,9 +136,7 @@ pub async fn run(node: Arc<Node>, out: Out) {
             if last_alert.elapsed() > Duration::from_secs(3600) {
                 last_alert = Instant::now();
                 let w = node.warnings();
-                if !w.is_empty()
-                    && (w != alerted || last_notice.elapsed() > Duration::from_secs(86400))
-                {
+                if !w.is_empty() && (w != alerted || last_notice.elapsed() > Duration::from_secs(86400)) {
                     last_notice = Instant::now();
                     for line in &w {
                         out.say(format!("WARNING: {line}"));
@@ -159,16 +145,29 @@ pub async fn run(node: Arc<Node>, out: Out) {
                 }
                 alerted = w;
             }
+            // Tell the home screen when each waiting backup is expected.
+            {
+                let now = chrono::Utc::now().timestamp();
+                let wait_to_settle = if settled { 0 } else { settle.saturating_sub(last_event.elapsed()).as_secs() };
+                let mut next = node.next.lock().unwrap();
+                next.clear();
+                for key in &pending {
+                    let (Some(b), Some(f)) = (cfg.set(&key.0), cfg.friends.iter().find(|f| f.id == key.1)) else {
+                        continue;
+                    };
+                    let pace = Duration::from_secs(b.interval_secs(f, &cfg));
+                    let wait = sent_at.get(key).map(|t| pace.saturating_sub(t.elapsed()).as_secs()).unwrap_or(0);
+                    let at = if cfg.held_for(b).is_some() { i64::MAX } else { now + wait.max(wait_to_settle) as i64 };
+                    next.insert(format!("{}|{}", key.0, key.1), at);
+                }
+            }
             if !settled || due.is_empty() {
                 continue;
             }
             last_scan = Instant::now();
             for b in &cfg.sets {
-                let ids: HashSet<String> = due
-                    .iter()
-                    .filter(|(set, _)| *set == b.name)
-                    .map(|(_, id)| id.clone())
-                    .collect();
+                let ids: HashSet<String> =
+                    due.iter().filter(|(set, _)| *set == b.name).map(|(_, id)| id.clone()).collect();
                 if ids.is_empty() {
                     continue;
                 }
@@ -206,14 +205,9 @@ fn notify_desktop(text: &str) {
     let text = text.replace(['"', '\\'], "'");
     let _ = if cfg!(target_os = "macos") {
         std::process::Command::new("osascript")
-            .args([
-                "-e",
-                &format!("display notification \"{text}\" with title \"Super Duper Backup\""),
-            ])
+            .args(["-e", &format!("display notification \"{text}\" with title \"Super Duper Backup\"")])
             .output()
     } else {
-        std::process::Command::new("notify-send")
-            .args(["Super Duper Backup", &text])
-            .output()
+        std::process::Command::new("notify-send").args(["Super Duper Backup", &text]).output()
     };
 }

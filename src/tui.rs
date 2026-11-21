@@ -1,12 +1,14 @@
 // Copyright Andy Wick
 // SPDX-License-Identifier: Apache-2.0
 
-//! Interactive setup: choose folders and friends, tune history, browse and restore.
+//! The interactive interface: a menu on the left, and on the right the backup
+//! sets with their status, restore, destinations, settings, history and status.
+//! It is only a client: everything it shows and does goes through the daemon.
 
 use crate::{
     config::{BackupSet, Config, DEFAULT_SET},
     control,
-    node::{Cmd, Node, Out},
+    node::Cmd,
     snapshot::{human, parse_when, when},
 };
 use anyhow::Result;
@@ -15,20 +17,20 @@ use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
-pub enum Exec {
-    Daemon(PathBuf),
-    Local(Arc<Node>),
-}
+/// Sends commands to the daemon over its local socket.
+struct Exec(PathBuf);
 
 impl Exec {
     async fn call(&self, cmd: Cmd) -> Result<Vec<String>> {
@@ -37,53 +39,20 @@ impl Exec {
     }
 
     /// Runs a command, passing each output line to `progress` as it arrives.
-    async fn live(
-        &self,
-        cmd: Cmd,
-        progress: &mpsc::UnboundedSender<String>,
-    ) -> Result<Vec<String>> {
+    async fn live(&self, cmd: Cmd, progress: &mpsc::UnboundedSender<String>) -> Result<Vec<String>> {
         let mut lines = vec![];
         let mut seen = |l: String| {
             let _ = progress.send(l.clone());
             lines.push(l);
         };
-        match self {
-            Exec::Daemon(sock) => {
-                let stream = control::connect(sock)
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("the daemon is no longer running"))?;
-                let res = control::request(stream, &cmd, &mut seen).await;
-                if let Err(e) = res {
-                    lines.push(format!("{e:#}"));
-                    anyhow::bail!("{}", lines.join("\n"));
-                }
-            }
-            Exec::Local(node) => {
-                let (tx, mut rx) = mpsc::unbounded_channel();
-                let out = Out(tx);
-                let res = {
-                    let job = node.run(cmd, &out);
-                    tokio::pin!(job);
-                    loop {
-                        tokio::select! {
-                            r = &mut job => break r,
-                            Some(l) = rx.recv() => seen(l),
-                        }
-                    }
-                };
-                while let Ok(l) = rx.try_recv() {
-                    seen(l);
-                }
-                if let Err(e) = res {
-                    lines.push(format!("{e:#}"));
-                    anyhow::bail!("{}", lines.join("\n"));
-                }
-            }
+        let stream = control::connect(&self.0)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the daemon is not running; quit and start sdb again"))?;
+        if let Err(e) = control::request(stream, &cmd, &mut seen).await {
+            lines.push(format!("{e:#}"));
+            anyhow::bail!("{}", lines.join("\n"));
         }
-        Ok(lines
-            .into_iter()
-            .filter(|l| !l.trim_start().starts_with("..."))
-            .collect())
+        Ok(lines.into_iter().filter(|l| !l.trim_start().starts_with("...")).collect())
     }
 }
 
@@ -100,31 +69,23 @@ enum Done {
 
 fn lines_or_error(r: Result<Vec<String>>) -> Vec<String> {
     r.unwrap_or_else(|e| {
-        format!("{e:#}")
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("..."))
-            .map(String::from)
-            .collect()
+        format!("{e:#}").lines().filter(|l| !l.trim_start().starts_with("...")).map(String::from).collect()
     })
 }
+
+type Item = (String, bool, u64);
+type Listing = Vec<(String, bool, u64, String)>;
 
 fn parse_listing(lines: Vec<String>) -> Listing {
     lines
         .iter()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .map(|v| {
             let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
-            (
-                s("p"),
-                v["d"].as_bool().unwrap_or(false),
-                v["s"].as_u64().unwrap_or(0),
-                s("v"),
-            )
+            (s("p"), v["d"].as_bool().unwrap_or(false), v["s"].as_u64().unwrap_or(0), s("v"))
         })
         .collect()
 }
-
-type Item = (String, bool, u64);
 
 struct Row {
     path: String,
@@ -134,6 +95,7 @@ struct Row {
     size: u64,
 }
 
+/// A collapsible tree shown as a flat list of rows.
 #[derive(Default)]
 struct Tree {
     rows: Vec<Row>,
@@ -142,18 +104,8 @@ struct Tree {
 
 impl Tree {
     fn reset(&mut self, items: Vec<Item>) {
-        self.rows = items
-            .into_iter()
-            .map(|(path, dir, size)| Row {
-                path,
-                depth: 0,
-                dir,
-                open: false,
-                size,
-            })
-            .collect();
-        self.st
-            .select(if self.rows.is_empty() { None } else { Some(0) });
+        self.rows = items.into_iter().map(|(path, dir, size)| Row { path, depth: 0, dir, open: false, size }).collect();
+        self.st.select(if self.rows.is_empty() { None } else { Some(0) });
     }
 
     fn cur(&self) -> Option<&Row> {
@@ -161,12 +113,10 @@ impl Tree {
     }
 
     fn mv(&mut self, d: isize) {
-        if self.rows.is_empty() {
-            return;
+        if !self.rows.is_empty() {
+            let i = self.st.selected().unwrap_or(0) as isize + d;
+            self.st.select(Some(i.clamp(0, self.rows.len() as isize - 1) as usize));
         }
-        let i = self.st.selected().unwrap_or(0) as isize + d;
-        self.st
-            .select(Some(i.clamp(0, self.rows.len() as isize - 1) as usize));
     }
 
     fn open(&mut self, kids: Vec<Item>) {
@@ -178,25 +128,17 @@ impl Tree {
     fn open_at(&mut self, i: usize, kids: Vec<Item>) {
         let depth = self.rows[i].depth + 1;
         self.rows[i].open = true;
-        let new = kids.into_iter().map(|(path, dir, size)| Row {
-            path,
-            depth,
-            dir,
-            open: false,
-            size,
-        });
+        let new = kids.into_iter().map(|(path, dir, size)| Row { path, depth, dir, open: false, size });
         self.rows.splice(i + 1..i + 1, new);
     }
 
+    /// Closes the folder under the cursor, or moves to its parent.
     fn close(&mut self) {
         let Some(i) = self.st.selected() else { return };
         let depth = self.rows[i].depth;
         if self.rows[i].open {
-            let end = self.rows[i + 1..]
-                .iter()
-                .position(|r| r.depth <= depth)
-                .map(|n| i + 1 + n)
-                .unwrap_or(self.rows.len());
+            let end =
+                self.rows[i + 1..].iter().position(|r| r.depth <= depth).map(|n| i + 1 + n).unwrap_or(self.rows.len());
             self.rows.drain(i + 1..end);
             self.rows[i].open = false;
         } else if let Some(p) = self.rows[..i].iter().rposition(|r| r.depth < depth) {
@@ -213,11 +155,7 @@ fn list_dir(dir: &str, hidden: bool) -> Vec<Item> {
         .filter(|e| hidden || !e.file_name().to_string_lossy().starts_with('.'))
         .filter_map(|e| {
             let md = e.metadata().ok()?;
-            Some((
-                e.path().to_string_lossy().into_owned(),
-                md.is_dir(),
-                md.len(),
-            ))
+            Some((e.path().to_string_lossy().into_owned(), md.is_dir(), md.len()))
         })
         .collect();
     v.sort_by_key(|a| (!a.1, a.0.to_lowercase()));
@@ -225,10 +163,38 @@ fn list_dir(dir: &str, hidden: bool) -> Vec<Item> {
 }
 
 fn name(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+    Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
+}
+
+/// "5 min ago", "3 h ago", "2 days ago" or "never".
+fn ago(ts: Option<i64>) -> String {
+    let Some(t) = ts else { return "never".into() };
+    let s = (chrono::Utc::now().timestamp() - t).max(0);
+    match s {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", s / 60),
+        3600..=86399 => format!("{} h ago", s / 3600),
+        _ => format!("{} days ago", s / 86400),
+    }
+}
+
+/// "now", "in 5 min" or "in 3 h".
+fn until(ts: i64) -> String {
+    let s = ts - chrono::Utc::now().timestamp();
+    match s {
+        i64::MIN..=20 => "any moment".into(),
+        21..=119 => "in a minute".into(),
+        120..=5399 => format!("in {} min", s / 60),
+        _ => format!("in {} h", (s + 1800) / 3600),
+    }
+}
+
+/// Shortens a path by replacing the home folder with `~`.
+fn tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && path.starts_with(&h) => format!("~{}", &path[h.len()..]),
+        _ => path.to_string(),
+    }
 }
 
 struct Snap {
@@ -259,8 +225,6 @@ struct RestoreView {
     filter: String,
 }
 
-type Listing = Vec<(String, bool, u64, String)>;
-
 impl RestoreView {
     /// Shows only entries whose name contains the filter text, or the full tree when it is empty.
     fn apply_filter(&mut self) {
@@ -269,13 +233,8 @@ impl RestoreView {
             self.tree.reset(self.roots.clone());
             return;
         }
-        let hits: Vec<Item> = self
-            .all
-            .iter()
-            .filter(|i| name(&i.0).to_lowercase().contains(&needle))
-            .take(5000)
-            .cloned()
-            .collect();
+        let hits: Vec<Item> =
+            self.all.iter().filter(|i| name(&i.0).to_lowercase().contains(&needle)).take(5000).cloned().collect();
         self.tree.reset(hits);
     }
 
@@ -290,115 +249,169 @@ impl RestoreView {
         }
         match self.latest.get(&r.path) {
             None => Some(("deleted since", Color::Red)),
-            Some(v) if !r.dir && self.sigs.get(&r.path) != Some(v) => {
-                Some(("different now", Color::Yellow))
-            }
-            Some(_) if r.dir && self.changed_dirs.contains(&r.path) => {
-                Some(("changes inside", Color::Yellow))
-            }
+            Some(v) if !r.dir && self.sigs.get(&r.path) != Some(v) => Some(("different now", Color::Yellow)),
+            Some(_) if r.dir && self.changed_dirs.contains(&r.path) => Some(("changes inside", Color::Yellow)),
             _ => None,
         }
     }
 }
 
 enum Prompt {
+    FolderFilter,
     Setting(&'static str),
     Filter,
     NewSet,
+    DeleteSet(String),
+    RenameSet(String),
     Drive,
     Remove(String),
     Every(String),
+    Quota(String),
+    InLimit(String),
     Join,
     RestoreTo,
     Date,
 }
 
-struct App {
-    exec: Arc<Exec>,
-    done_tx: mpsc::UnboundedSender<Done>,
-    progress_tx: mpsc::UnboundedSender<String>,
-    info_tx: mpsc::UnboundedSender<Vec<String>>,
-    busy: Option<String>,
-    progress: String,
-    spin: usize,
-    cfg: Config,
-    tab: usize,
-    root: String,
-    hidden: bool,
-    folders: Tree,
-    friends: ListState,
-    settings: ListState,
-    restore: RestoreView,
-    input: Option<(Prompt, String)>,
-    popup: Option<Vec<String>>,
-    versions: Option<(Vec<(usize, String)>, ListState)>,
-    /// Restore from this destination only; None means any of them.
-    source: Option<String>,
-    /// The backup set the Folders, Friends and Settings pages are editing.
-    set: String,
-    /// The backup set shown on the Restore page (None = whichever has the newest restore point).
-    rset: Option<String>,
-    info: Vec<String>,
-    info_loaded: bool,
-    info_at: std::time::Instant,
-    status: String,
+/// Everything that can be chosen from a menu or done in a pane.
+#[derive(Clone, Copy, PartialEq)]
+enum Act {
+    BackupSet,
+    BackupAll,
+    NewSet,
+    DeleteSet,
+    RenameSet,
+    Toggle,
+    Hidden,
+    UpFolder,
+    Invite,
+    Accept,
+    AddDrive,
+    Pace,
+    Quota,
+    InLimit,
+    ServiceInfo,
+    UseDest,
+    RemoveDest,
+    Pick,
+    RestorePicked,
+    Search,
+    Timeline,
+    Date,
+    Versions,
+    Source,
+    WhichSet,
+    Older,
+    Newer,
+    Refresh,
 }
 
-const TABS: [&str; 5] = [
-    "1 Folders",
-    "2 Friends",
-    "3 Settings",
-    "4 Restore",
-    "5 Status",
-];
-const SETTINGS: [(&str, &str); 16] = [
-    (
-        "set-every",
-        "This set: minutes between automatic backups (0 = each destination's own pace)",
-    ),
-    (
-        "set-hours",
-        "This set: hours it may back up, such as 22-7 ('always' = the general hours below)",
-    ),
-    (
-        "set-versions",
-        "This set: max versions kept of each file (0 = unlimited)",
-    ),
-    (
-        "set-days",
-        "This set: delete restore points older than this many days (0 = never)",
-    ),
-    (
-        "hours",
-        "Hours automatic backups may run, such as 22-7 (enter to change; 'always' for any time)",
-    ),
-    (
-        "pause",
-        "Automatic backups (enter: pause for a number of hours; 0 resumes)",
-    ),
-    (
-        "every",
-        "Minutes between automatic backups to local drives (friends default to 60; e on the Friends page)",
-    ),
-    (
-        "limit",
-        "Upload speed limit in KB/s across friends (0 = unlimited)",
-    ),
-    (
-        "warn",
-        "Warn when a backup is this many days old (0 = never)",
-    ),
+/// The pages, in the order of the top-level menu.
+const BACKUP: usize = 0;
+const RESTORE: usize = 1;
+const DESTS: usize = 2;
+const SETTINGS: usize = 3;
+const HISTORY: usize = 4;
+const STATUS: usize = 5;
+
+/// What the Backup page is showing.
+#[derive(PartialEq)]
+enum Sub {
+    Sets,
+    Files,
+    Dests,
+    Rules,
+}
+
+/// One level of the drill-down menu on the left.
+#[derive(Clone, PartialEq)]
+enum Kind {
+    Root,
+    Backup,
+    Set(String),
+    Rules(String),
+    Restore,
+    Dests,
+    Dest(String),
+    Settings,
+}
+
+/// What choosing a menu item does.
+#[derive(Clone)]
+enum Choice {
+    /// Go one level down.
+    Open(Kind),
+    /// Move into the pane on the right.
+    Focus,
+    Do(Act),
+    /// Type a new value for a setting.
+    Value(&'static str),
+}
+
+const GENERAL: [(&str, &str); 12] = [
+    ("hours", "Hours automatic backups may run, such as 22-7 ('always' for any time)"),
+    ("pause", "Automatic backups (enter: pause for a number of hours; 0 resumes)"),
+    ("every", "Minutes between automatic backups to local drives (friends default to 60)"),
+    ("limit", "Upload speed limit in KB/s across friends (0 = unlimited)"),
+    ("warn", "Warn when a backup is this many days old (0 = never)"),
     ("versions", "Max versions kept of each file (0 = unlimited)"),
-    (
-        "days",
-        "Delete restore points older than this many days (0 = never)",
-    ),
+    ("days", "Delete restore points older than this many days (0 = never)"),
     ("last", "Always keep this many most recent restore points"),
     ("hourly", "Keep one per hour for this many hours"),
     ("daily", "Keep one per day for this many days"),
     ("weekly", "Keep one per week for this many weeks"),
     ("monthly", "Keep one per month for this many months"),
 ];
+
+const RULES: [(&str, &str); 4] = [
+    ("set-every", "Minutes between automatic backups of this set (0 = each destination's own pace)"),
+    ("set-hours", "Hours this set may back up, such as 22-7 ('always' = the general hours)"),
+    ("set-versions", "Max versions kept of each file in this set (0 = unlimited)"),
+    ("set-days", "Delete this set's restore points older than this many days (0 = never)"),
+];
+
+struct App {
+    exec: Arc<Exec>,
+    done_tx: mpsc::UnboundedSender<Done>,
+    progress_tx: mpsc::UnboundedSender<String>,
+    busy: Option<String>,
+    progress: String,
+    spin: usize,
+    cfg: Config,
+    /// The daemon's picture of sets, destinations and warnings.
+    ov: Value,
+    /// The menu levels entered so far, each with its cursor; the last one is on screen.
+    stack: Vec<(Kind, usize)>,
+    page: usize,
+    in_menu: bool,
+    sub: Sub,
+    /// The backup set being looked at or edited.
+    set: String,
+    sets: ListState,
+    root: String,
+    hidden: bool,
+    folders: Tree,
+    /// Text the folder picker is searching for, and a counter that tells stale results apart.
+    folder_filter: String,
+    folder_search: u64,
+    found_tx: mpsc::UnboundedSender<(u64, Vec<Item>)>,
+    set_dests: ListState,
+    rules: ListState,
+    dests: ListState,
+    settings: ListState,
+    restore: RestoreView,
+    /// Restore from this destination only; None means any of them.
+    source: Option<String>,
+    /// The backup set shown on the Restore page (None = whichever has the newest restore point).
+    rset: Option<String>,
+    text: Vec<String>,
+    text_at: Instant,
+    scroll: usize,
+    input: Option<(Prompt, String)>,
+    popup: Option<Vec<String>>,
+    versions: Option<(Vec<(usize, String)>, ListState)>,
+    status: String,
+}
 
 impl App {
     async fn reload(&mut self) {
@@ -408,6 +421,14 @@ impl App {
                 None => self.status = "could not read the configuration".into(),
             },
             Err(e) => self.status = format!("{e:#}"),
+        }
+        if let Ok(l) = self.exec.call(Cmd::Overview).await {
+            if let Some(v) = l.first().and_then(|s| serde_json::from_str(s).ok()) {
+                self.ov = v;
+            }
+        }
+        if self.cfg.set(&self.set).is_none() {
+            self.set = self.cfg.sets.first().map(|b| b.name.clone()).unwrap_or_else(|| DEFAULT_SET.into());
         }
     }
 
@@ -420,51 +441,104 @@ impl App {
     }
 
     fn set_root(&mut self, root: String) {
+        self.folder_filter.clear();
+        // Backed up folders are stored by their real path, so browse by real path too.
+        let root = std::fs::canonicalize(&root).map(|p| p.to_string_lossy().into_owned()).unwrap_or(root);
         self.folders.reset(list_dir(&root, self.hidden));
         self.root = root;
+    }
+
+    /// Searches below the folder being browsed for names containing the text, in the
+    /// background, so typing stays smooth in a large home folder.
+    fn search_folders(&mut self, text: String) {
+        self.folder_filter = text.clone();
+        self.folder_search += 1;
+        if text.is_empty() {
+            self.set_root(self.root.clone());
+            return;
+        }
+        let (root, hidden, search, tx) = (self.root.clone(), self.hidden, self.folder_search, self.found_tx.clone());
+        tokio::task::spawn_blocking(move || {
+            // Level by level, so what is near the top is found first however large the
+            // folders beside it are; results so far are shown after each level.
+            let needle = text.to_lowercase();
+            let began = Instant::now();
+            let mut hits: Vec<Item> = vec![];
+            let mut level = vec![PathBuf::from(&root)];
+            let mut seen = 0u64;
+            while !level.is_empty() && hits.len() < 2000 && seen < 3_000_000 && began.elapsed() < Duration::from_secs(8)
+            {
+                let mut next = vec![];
+                for dir in &level {
+                    let Ok(rd) = std::fs::read_dir(dir) else { continue };
+                    for e in rd.flatten() {
+                        seen += 1;
+                        let fname = e.file_name().to_string_lossy().into_owned();
+                        if !hidden && fname.starts_with('.') {
+                            continue;
+                        }
+                        let Ok(ft) = e.file_type() else { continue };
+                        if fname.to_lowercase().contains(&needle) && hits.len() < 2000 {
+                            let size = if ft.is_dir() { 0 } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
+                            hits.push((e.path().to_string_lossy().into_owned(), ft.is_dir(), size));
+                        }
+                        if ft.is_dir() {
+                            next.push(e.path());
+                        }
+                    }
+                }
+                let mut sorted = hits.clone();
+                sorted.sort_by_key(|a| (!a.1, a.0.matches('/').count(), a.0.to_lowercase()));
+                if tx.send((search, sorted)).is_err() {
+                    return;
+                }
+                level = next;
+            }
+        });
+    }
+
+    fn cur_set(&self) -> BackupSet {
+        self.cfg.set(&self.set).cloned().unwrap_or_else(|| BackupSet { name: self.set.clone(), ..Default::default() })
     }
 
     fn excluded(&self, path: &str) -> bool {
         self.cfg.exclude.contains(&globset::escape(path))
     }
 
-    fn cur_set(&self) -> BackupSet {
-        self.cfg
-            .set(&self.set)
-            .cloned()
-            .unwrap_or_else(|| BackupSet {
-                name: self.set.clone(),
-                ..Default::default()
-            })
-    }
-
     /// The other set that already backs up this exact folder, if any.
     fn other_set(&self, path: &str) -> Option<&str> {
         let p = Path::new(path);
-        self.cfg
-            .sets
-            .iter()
-            .find(|b| b.name != self.set && b.paths.iter().any(|x| x == p))
-            .map(|b| b.name.as_str())
+        self.cfg.sets.iter().find(|b| b.name != self.set && b.paths.iter().any(|x| x == p)).map(|b| b.name.as_str())
     }
 
     fn folder_mark(&self, path: &str) -> (&'static str, Color) {
         let p = Path::new(path);
         let paths = self.cur_set().paths;
+        let inside = paths.iter().any(|x| p.starts_with(x));
         if paths.iter().any(|x| x == p) {
             ("[x]", Color::Green)
-        } else if self
-            .cfg
-            .exclude
-            .iter()
-            .any(|e| p.starts_with(e.replace('\\', "")))
-            && paths.iter().any(|x| p.starts_with(x))
-        {
+        } else if inside && self.cfg.exclude.iter().any(|e| p.starts_with(e.replace('\\', ""))) {
             ("[-]", Color::Red)
-        } else if paths.iter().any(|x| p.starts_with(x)) {
+        } else if inside {
             ("[+]", Color::Green)
+        } else if paths.iter().any(|x| x.starts_with(p)) {
+            // Not backed up itself, but something inside it is.
+            ("[o]", Color::Cyan)
         } else {
             ("[ ]", Color::Reset)
+        }
+    }
+
+    /// A list of multi-line cards. The chosen card is marked by a bar down its left edge
+    /// and bold text, which keeps the colours inside it readable.
+    fn cards<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, chosen: bool) -> List<'a> {
+        let list = List::new(items).block(block).highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
+        if chosen {
+            list.highlight_symbol("▌ ")
+                .repeat_highlight_symbol(true)
+                .highlight_style(Style::new().add_modifier(Modifier::BOLD))
+        } else {
+            list.highlight_symbol("  ")
         }
     }
 
@@ -477,32 +551,33 @@ impl App {
         let cmd = if paths.contains(&p) {
             Cmd::RemovePath { path: p }
         } else if paths.iter().any(|x| p.starts_with(x)) {
-            Cmd::Exclude {
-                pattern: globset::escape(&path),
-                remove: self.excluded(&path),
-            }
+            Cmd::Exclude { pattern: globset::escape(&path), remove: self.excluded(&path) }
         } else {
-            Cmd::AddPaths {
-                paths: vec![p],
-                set: Some(self.set.clone()),
-            }
+            Cmd::AddPaths { paths: vec![p], set: Some(self.set.clone()) }
         };
         self.apply(cmd).await;
     }
 
-    /// Switches which destinations the current set goes to.
+    fn set_edit(&self, to: Option<Vec<String>>) -> Cmd {
+        Cmd::SetEdit {
+            name: self.set.clone(),
+            to,
+            every: None,
+            hours: None,
+            days: None,
+            versions: None,
+            last: None,
+            delete: false,
+        }
+    }
+
+    /// Switches whether the current set goes to a destination.
     async fn toggle_destination(&mut self, name: &str) {
         let b = self.cur_set();
         let Some(f) = self.cfg.friends.iter().find(|f| f.name == name).cloned() else {
             return;
         };
-        let mut list: Vec<String> = self
-            .cfg
-            .friends
-            .iter()
-            .filter(|x| b.sends_to(x))
-            .map(|x| x.name.clone())
-            .collect();
+        let mut list: Vec<String> = self.cfg.friends.iter().filter(|x| b.sends_to(x)).map(|x| x.name.clone()).collect();
         if b.sends_to(&f) {
             list.retain(|n| n != name);
             if list.is_empty() {
@@ -511,25 +586,11 @@ impl App {
             }
         } else {
             if !f.backup_to {
-                self.apply(Cmd::FriendBackupTo {
-                    name: name.to_string(),
-                    on: true,
-                })
-                .await;
+                self.apply(Cmd::FriendBackupTo { name: name.to_string(), on: true }).await;
             }
             list.push(name.to_string());
         }
-        self.apply(Cmd::SetEdit {
-            name: self.set.clone(),
-            to: Some(list),
-            every: None,
-            hours: None,
-            days: None,
-            versions: None,
-            last: None,
-            delete: false,
-        })
-        .await;
+        self.apply(self.set_edit(Some(list))).await;
     }
 
     fn setting(&self, key: &str) -> u32 {
@@ -554,17 +615,15 @@ impl App {
     }
 
     fn setting_text(&self, key: &str) -> String {
+        let now = chrono::Utc::now().timestamp();
         match key {
             "set-hours" if self.cur_set().hours.is_empty() => "general".into(),
             "set-hours" => self.cur_set().hours,
             "hours" if self.cfg.backup_hours.is_empty() => "any time".into(),
             "hours" => self.cfg.backup_hours.clone(),
-            "pause" if self.cfg.paused_until > chrono::Utc::now().timestamp() => {
-                if self.cfg.paused_until - chrono::Utc::now().timestamp() > 365 * 86400 {
-                    "paused".into()
-                } else {
-                    format!("paused to {}", &when(self.cfg.paused_until)[5..16])
-                }
+            "pause" if self.cfg.paused_until - now > 365 * 86400 => "paused".into(),
+            "pause" if self.cfg.paused_until > now => {
+                format!("paused to {}", &when(self.cfg.paused_until)[5..16])
             }
             "pause" => "running".into(),
             _ => self.setting(key).to_string(),
@@ -575,6 +634,8 @@ impl App {
     async fn set_setting(&mut self, key: &str, text: &str) -> bool {
         let text = text.trim();
         let num = text.parse::<u32>().ok();
+        let always = ["always", "any time", "general"].iter().any(|w| text.eq_ignore_ascii_case(w));
+        let hours = if always { String::new() } else { text.to_string() };
         let edit = |every, hours, days, versions| Cmd::SetEdit {
             name: self.set.clone(),
             to: None,
@@ -585,109 +646,31 @@ impl App {
             last: None,
             delete: false,
         };
+        let tune =
+            |upload_kbps, hours, pause_hours, warn_days| Cmd::Tune { upload_kbps, hours, pause_hours, warn_days };
         let cmd = match (key, num) {
             ("set-every", Some(n)) => edit(Some(n), None, None, None),
-            ("set-hours", _) => edit(
-                None,
-                Some(
-                    if text.eq_ignore_ascii_case("always") || text.eq_ignore_ascii_case("general") {
-                        String::new()
-                    } else {
-                        text.to_string()
-                    },
-                ),
-                None,
-                None,
-            ),
+            ("set-hours", _) => edit(None, Some(hours), None, None),
             ("set-versions", Some(n)) => edit(None, None, None, Some(n)),
             ("set-days", Some(n)) => edit(None, None, Some(n), None),
-            ("hours", _) => {
-                let h = if text.eq_ignore_ascii_case("always")
-                    || text.eq_ignore_ascii_case("any time")
-                {
-                    String::new()
-                } else {
-                    text.to_string()
-                };
-                Cmd::Tune {
-                    hours: Some(h),
-                    upload_kbps: None,
-                    pause_hours: None,
-                    warn_days: None,
-                }
+            ("hours", _) => tune(None, Some(hours), None, None),
+            ("pause", _) if text.is_empty() => tune(None, None, Some(24 * 3650), None),
+            ("pause", Some(n)) => tune(None, None, Some(n as i64), None),
+            ("every", Some(n)) => Cmd::Every { name: None, minutes: n },
+            ("limit", Some(n)) => tune(Some(n as u64), None, None, None),
+            ("warn", Some(n)) => tune(None, None, None, Some(n)),
+            ("versions", Some(n)) => Cmd::Keep { set: vec![], versions: Some(n), pattern: None },
+            (k, Some(n)) if !["hours", "pause", "set-hours"].contains(&k) => {
+                Cmd::Keep { set: vec![(k.to_string(), n)], versions: None, pattern: None }
             }
-            ("pause", _) if text.is_empty() => Cmd::Tune {
-                pause_hours: Some(24 * 3650),
-                upload_kbps: None,
-                hours: None,
-                warn_days: None,
-            },
-            ("pause", Some(n)) => Cmd::Tune {
-                pause_hours: Some(n as i64),
-                upload_kbps: None,
-                hours: None,
-                warn_days: None,
-            },
-            ("every", Some(n)) => Cmd::Every {
-                name: None,
-                minutes: n,
-            },
-            ("limit", Some(n)) => Cmd::Tune {
-                upload_kbps: Some(n as u64),
-                hours: None,
-                pause_hours: None,
-                warn_days: None,
-            },
-            ("warn", Some(n)) => Cmd::Tune {
-                warn_days: Some(n),
-                upload_kbps: None,
-                hours: None,
-                pause_hours: None,
-            },
-            ("versions", Some(n)) => Cmd::Keep {
-                set: vec![],
-                versions: Some(n),
-                pattern: None,
-            },
-            (k, Some(n)) if !["hours", "pause", "set-hours"].contains(&k) => Cmd::Keep {
-                set: vec![(k.to_string(), n)],
-                versions: None,
-                pattern: None,
-            },
             _ => return false,
         };
         self.apply(cmd).await;
-        self.info_loaded = false;
         true
     }
 
-    async fn bump(&mut self, d: i64) {
-        let key = SETTINGS[self.settings.selected().unwrap_or(0)].0;
-        match key {
-            "hours" | "set-hours" => {
-                self.status = "press enter to type the hours, such as 22-7".into()
-            }
-            "pause" if d < 0 => {
-                self.set_setting("pause", "0").await;
-            }
-            "pause" => {
-                let left = (self.cfg.paused_until - chrono::Utc::now().timestamp()).max(0) / 3600;
-                self.set_setting("pause", &(left + 1).to_string()).await;
-            }
-            _ => {
-                let step = if key == "limit" { 100 } else { 1 };
-                let v = (self.setting(key) as i64 + d * step).max(0);
-                self.set_setting(key, &v.to_string()).await;
-            }
-        }
-    }
-
     /// Starts a background job unless one is already running.
-    fn start<F>(
-        &mut self,
-        label: &str,
-        make: impl FnOnce(Arc<Exec>, mpsc::UnboundedSender<String>) -> F,
-    ) -> bool
+    fn start<F>(&mut self, label: &str, make: impl FnOnce(Arc<Exec>, mpsc::UnboundedSender<String>) -> F) -> bool
     where
         F: std::future::Future<Output = Done> + Send + 'static,
     {
@@ -716,17 +699,13 @@ impl App {
             };
             let snaps: Vec<Snap> = lines
                 .iter()
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
                 .filter(|v| v["id"].is_string())
                 .map(|v| Snap {
                     set: v["set"].as_str().unwrap_or(DEFAULT_SET).to_string(),
                     at: v["at"]
                         .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str().map(String::from))
-                                .collect()
-                        })
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default(),
                     id: v["id"].as_str().unwrap_or_default().into(),
                     time: v["time"].as_i64().unwrap_or(0),
@@ -737,26 +716,13 @@ impl App {
                 .collect();
             // One set at a time: the one asked for, or the one with the newest restore point.
             let set = want.or_else(|| snaps.last().map(|s| s.set.clone()));
-            let snaps: Vec<Snap> = snaps
-                .into_iter()
-                .filter(|s| Some(&s.set) == set.as_ref())
-                .collect();
+            let snaps: Vec<Snap> = snaps.into_iter().filter(|s| Some(&s.set) == set.as_ref()).collect();
             let tree = match snaps.last() {
-                Some(s) => ex
-                    .call(Cmd::Tree {
-                        snap: s.id.clone(),
-                        from,
-                    })
-                    .await
-                    .ok()
-                    .map(parse_listing),
+                Some(s) => ex.call(Cmd::Tree { snap: s.id.clone(), from }).await.ok().map(parse_listing),
                 None => None,
             };
-            let notes = lines
-                .iter()
-                .filter(|l| !l.trim_start().starts_with('{'))
-                .map(|l| l.trim().to_string())
-                .collect();
+            let notes =
+                lines.iter().filter(|l| !l.trim_start().starts_with('{')).map(|l| l.trim().to_string()).collect();
             Done::Snaps(snaps, tree, notes, set)
         });
         if started {
@@ -778,46 +744,23 @@ impl App {
         });
     }
 
-    /// Status is quick and read-only, so it loads even while a backup or restore is running.
-    fn load_info(&mut self) {
-        self.info_loaded = true;
-        self.info_at = std::time::Instant::now();
-        if self.info.is_empty() {
-            self.info = vec!["checking...".into()];
-        }
-        let (ex, tx) = (self.exec.clone(), self.info_tx.clone());
+    /// Loads the text pages (History, Status) in the background.
+    fn load_text(&mut self, tx: &mpsc::UnboundedSender<(usize, Vec<String>)>) {
+        self.text_at = Instant::now();
+        let (ex, tx, page) = (self.exec.clone(), tx.clone(), self.page);
         tokio::spawn(async move {
-            let mut lines = lines_or_error(ex.call(Cmd::Status).await);
-            let snaps = ex
-                .call(Cmd::SnapList { from: None })
-                .await
-                .unwrap_or_default();
-            let last = snaps.iter().rev().find_map(|l| {
-                serde_json::from_str::<serde_json::Value>(l)
-                    .ok()
-                    .filter(|v| v["id"].is_string())
-            });
-            lines.push(String::new());
-            lines.push(match last {
-                Some(v) => format!(
-                    "restore points: {}, latest {} ({} files, {})",
-                    snaps.len(),
-                    when(v["time"].as_i64().unwrap_or(0)),
-                    v["files"].as_u64().unwrap_or(0),
-                    human(v["bytes"].as_u64().unwrap_or(0))
-                ),
-                None => "restore points: none yet (the first one appears when a backup finishes; press b to start one)".into(),
-            });
-            let _ = tx.send(lines);
+            let cmd = if page == HISTORY { Cmd::Log } else { Cmd::Status };
+            let mut lines = lines_or_error(ex.call(cmd).await);
+            if page == HISTORY && lines.is_empty() {
+                lines.push("Nothing has happened since the daemon started.".into());
+            }
+            let _ = tx.send((page, lines));
         });
     }
 
-    /// Loads whatever the current page still needs, once nothing else is running.
+    /// Loads whatever the current page still needs.
     fn kick(&mut self) {
-        if self.tab == 4 && !self.info_loaded {
-            self.load_info();
-        }
-        if self.busy.is_none() && self.tab == 3 && !self.restore.loaded {
+        if self.busy.is_none() && self.page == RESTORE && !self.restore.loaded {
             self.load_snaps();
         }
     }
@@ -830,30 +773,22 @@ impl App {
             Done::BackedUp(lines) => {
                 self.popup = Some(lines);
                 self.restore.loaded = false;
-                self.info_loaded = false;
+                self.reload().await;
             }
             Done::Paired(lines) => {
                 self.popup = Some(lines);
-                self.info_loaded = false;
                 self.reload().await;
             }
             Done::Snaps(snaps, tree, notes, set) => {
                 self.rset = set;
                 if !notes.is_empty() {
-                    self.status = format!(
-                        "{} (showing what the others hold; u retries)",
-                        notes.join("; ")
-                    );
+                    self.status = format!("{} (showing what the others hold; u retries)", notes.join("; "));
                 }
-                self.restore = RestoreView {
-                    loaded: true,
-                    ..Default::default()
-                };
+                self.restore = RestoreView { loaded: true, ..Default::default() };
                 self.restore.cur = snaps.len().saturating_sub(1);
                 self.restore.snaps = snaps;
                 if let Some(items) = tree {
-                    self.restore.latest =
-                        items.iter().map(|i| (i.0.clone(), i.3.clone())).collect();
+                    self.restore.latest = items.iter().map(|i| (i.0.clone(), i.3.clone())).collect();
                     self.show_tree(items);
                 }
             }
@@ -864,15 +799,8 @@ impl App {
             }
             Done::Versions(lines) => {
                 let mut list = vec![];
-                for v in lines
-                    .iter()
-                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                {
-                    let Some(idx) = self
-                        .restore
-                        .snaps
-                        .iter()
-                        .position(|s| Some(s.id.as_str()) == v["id"].as_str())
+                for v in lines.iter().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+                    let Some(idx) = self.restore.snaps.iter().position(|s| Some(s.id.as_str()) == v["id"].as_str())
                     else {
                         continue;
                     };
@@ -880,26 +808,16 @@ impl App {
                         Some(n) => format!("{:>10}", human(n)),
                         None => "  (deleted)".into(),
                     };
-                    let at: Vec<&str> = v["at"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-                        .unwrap_or_default();
+                    let at: Vec<&str> =
+                        v["at"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
                     list.push((
                         idx,
-                        format!(
-                            "{}  {what}   on {}",
-                            when(v["time"].as_i64().unwrap_or(0)),
-                            at.join(", ")
-                        ),
+                        format!("{}  {what}   on {}", when(v["time"].as_i64().unwrap_or(0)), at.join(", ")),
                     ));
                 }
                 list.reverse();
                 let mut st = ListState::default();
-                st.select(
-                    list.iter()
-                        .position(|(i, _)| *i <= self.restore.cur)
-                        .or(Some(0)),
-                );
+                st.select(list.iter().position(|(i, _)| *i <= self.restore.cur).or(Some(0)));
                 self.versions = Some((list, st));
             }
             Done::Failed(e) => self.status = e,
@@ -909,15 +827,8 @@ impl App {
     /// Shows a restore point's files, keeping the same folders open and the same entry selected.
     fn show_tree(&mut self, items: Listing) {
         let rv = &mut self.restore;
-        let open: HashSet<String> = rv
-            .tree
-            .rows
-            .iter()
-            .filter(|r| r.open)
-            .map(|r| r.path.clone())
-            .collect();
+        let open: HashSet<String> = rv.tree.rows.iter().filter(|r| r.open).map(|r| r.path.clone()).collect();
         let at = rv.tree.cur().map(|r| r.path.clone());
-        rv.kids.clear();
         rv.picked.clear();
         rv.sigs.clear();
         rv.changed_dirs.clear();
@@ -934,11 +845,8 @@ impl App {
             }
             rv.sigs.insert(p.clone(), v.clone());
             let it = (p.clone(), *dir, *size);
-            match Path::new(p)
-                .parent()
-                .map(|x| x.to_string_lossy().into_owned())
-                .filter(|x| all.contains(x.as_str()))
-            {
+            let parent = Path::new(p).parent().map(|x| x.to_string_lossy().into_owned());
+            match parent.filter(|x| all.contains(x.as_str())) {
                 Some(parent) => kids.entry(parent).or_default().push(it),
                 None => roots.push(it),
             }
@@ -947,21 +855,14 @@ impl App {
             v.sort_by_key(|a| (!a.1, a.0.to_lowercase()));
         }
         rv.kids = kids;
-        rv.all = items
-            .iter()
-            .map(|(p, d, s, _)| (p.clone(), *d, *s))
-            .collect();
+        rv.all = items.iter().map(|(p, d, s, _)| (p.clone(), *d, *s)).collect();
         rv.all.sort_by(|a, b| a.0.cmp(&b.0));
         rv.roots = roots;
         rv.apply_filter();
         let mut i = 0;
         while i < rv.tree.rows.len() {
             if rv.tree.rows[i].dir && open.contains(&rv.tree.rows[i].path) {
-                let k = rv
-                    .kids
-                    .get(&rv.tree.rows[i].path)
-                    .cloned()
-                    .unwrap_or_default();
+                let k = rv.kids.get(&rv.tree.rows[i].path).cloned().unwrap_or_default();
                 rv.tree.open_at(i, k);
             }
             i += 1;
@@ -969,31 +870,388 @@ impl App {
         if let Some(pos) = at.and_then(|p| rv.tree.rows.iter().position(|r| r.path == p)) {
             rv.tree.st.select(Some(pos));
         }
-        rv.tl.select(Some(
-            rv.snaps.len().saturating_sub(1) - rv.cur.min(rv.snaps.len().saturating_sub(1)),
-        ));
+        let last = rv.snaps.len().saturating_sub(1);
+        rv.tl.select(Some(last - rv.cur.min(last)));
     }
 
-    fn show_versions(&mut self) {
-        let Some(path) = self
-            .restore
-            .tree
-            .cur()
-            .filter(|r| !r.dir)
-            .map(|r| r.path.clone())
-        else {
-            self.status = "move to a file first".into();
-            return;
-        };
-        let from = self.source.clone();
-        self.start("finding versions", |ex, _| async move {
-            match ex.call(Cmd::Versions { path, from }).await {
-                Ok(l) => Done::Versions(l),
-                Err(e) => Done::Failed(format!("{e:#}")),
+    /// The name of the set under the cursor on the Backup page, if the cursor is on one.
+    fn picked_set(&self) -> Option<String> {
+        self.cfg.sets.get(self.sets.selected().unwrap_or(0)).map(|b| b.name.clone())
+    }
+
+    fn picked_dest(&self) -> Option<crate::config::Friend> {
+        self.cfg.friends.get(self.dests.selected().unwrap_or(0)).cloned()
+    }
+
+    /// The items of one menu level, with current values shown where there is one.
+    fn items(&self, kind: &Kind) -> Vec<(String, Choice)> {
+        let val = |label: &str, key: &'static str| (format!("{label}: {}", self.setting_text(key)), Choice::Value(key));
+        let go = |label: &str, k: Kind| (label.to_string(), Choice::Open(k));
+        let act = |label: String, a: Act| (label, Choice::Do(a));
+        match kind {
+            Kind::Root => vec![
+                go("Backup", Kind::Backup),
+                go("Restore", Kind::Restore),
+                go("Destinations", Kind::Dests),
+                go("Settings", Kind::Settings),
+                ("History".into(), Choice::Focus),
+                ("Status".into(), Choice::Focus),
+            ],
+            Kind::Backup => {
+                let mut v: Vec<_> = self.cfg.sets.iter().map(|b| go(&b.name, Kind::Set(b.name.clone()))).collect();
+                v.push(act("+ New backup set".into(), Act::NewSet));
+                v.push(act("Back up all sets now".into(), Act::BackupAll));
+                v
             }
-        });
+            Kind::Set(n) => vec![
+                act("Back up now".into(), Act::BackupSet),
+                ("Files and folders".into(), Choice::Focus),
+                ("Destinations".into(), Choice::Focus),
+                go("Schedule and history", Kind::Rules(n.clone())),
+                act(format!("Hidden files: {}", if self.hidden { "shown" } else { "not shown" }), Act::Hidden),
+                act("Rename this set".into(), Act::RenameSet),
+                act("Delete this set".into(), Act::DeleteSet),
+            ],
+            Kind::Rules(_) => vec![
+                val("Minutes between backups", "set-every"),
+                val("Backup hours", "set-hours"),
+                val("Max versions of a file", "set-versions"),
+                val("Max age in days", "set-days"),
+            ],
+            Kind::Restore => {
+                let rv = &self.restore;
+                let file = rv.tree.cur().filter(|r| !r.dir).map(|r| name(&r.path));
+                let mut v = vec![
+                    ("Browse and pick files".to_string(), Choice::Focus),
+                    act(format!("Restore picked ({})", rv.picked.len()), Act::RestorePicked),
+                    act(
+                        if rv.filter.is_empty() {
+                            "Search by name".into()
+                        } else {
+                            format!("Search: \"{}\"", rv.filter)
+                        },
+                        Act::Search,
+                    ),
+                    act("Go back in time".into(), Act::Timeline),
+                    act("Jump to a date".into(), Act::Date),
+                    act(format!("Versions of {}", file.as_deref().unwrap_or("a file")), Act::Versions),
+                    act(format!("Read from: {}", self.source.as_deref().unwrap_or("all destinations")), Act::Source),
+                ];
+                if self.cfg.sets.len() > 1 {
+                    v.push(act(format!("Backup set: {}", self.rset.as_deref().unwrap_or("newest")), Act::WhichSet));
+                }
+                v.push(act("Older restore point".into(), Act::Older));
+                v.push(act("Newer restore point".into(), Act::Newer));
+                v.push(act("Look again".into(), Act::Refresh));
+                v
+            }
+            Kind::Dests => {
+                let mut v: Vec<_> = self.cfg.friends.iter().map(|f| go(&f.name, Kind::Dest(f.name.clone()))).collect();
+                v.push(act("+ Invite a friend".into(), Act::Invite));
+                v.push(act("+ Accept an invite".into(), Act::Accept));
+                v.push(act("+ Add a drive or folder".into(), Act::AddDrive));
+                v
+            }
+            Kind::Dest(n) => {
+                let Some(f) = self.cfg.friends.iter().find(|f| &f.name == n) else { return vec![] };
+                let mut v = vec![
+                    act(format!("In use: {}", if f.backup_to { "yes" } else { "no" }), Act::UseDest),
+                    act(format!("Back up here every: {} min", f.interval_secs(&self.cfg) / 60), Act::Pace),
+                ];
+                if f.path.is_none() {
+                    v.push(act(format!("They may store here: {} GB", f.quota_gb), Act::Quota));
+                    let speed = if f.max_in_kbps == 0 { "any".to_string() } else { format!("{} KB/s", f.max_in_kbps) };
+                    v.push(act(format!("Their upload speed here: {speed}"), Act::InLimit));
+                }
+                v.push(act("Remove this destination".into(), Act::RemoveDest));
+                v
+            }
+            Kind::Settings => vec![
+                act(
+                    format!(
+                        "Start at login: {}",
+                        if self.ov["service"].as_bool() == Some(true) { "yes" } else { "no" }
+                    ),
+                    Act::ServiceInfo,
+                ),
+                val("Backup hours", "hours"),
+                val("Automatic backups", "pause"),
+                val("Minutes between drive backups", "every"),
+                val("Upload limit KB/s", "limit"),
+                val("Warn after days", "warn"),
+                val("Max versions of a file", "versions"),
+                val("Max age in days", "days"),
+                val("Keep most recent", "last"),
+                val("Keep hourly", "hourly"),
+                val("Keep daily", "daily"),
+                val("Keep weekly", "weekly"),
+                val("Keep monthly", "monthly"),
+            ],
+        }
     }
 
+    /// Makes the right-hand side follow the menu: which page, which set, which row.
+    fn sync(&mut self) {
+        // Leave levels whose subject no longer exists, such as a deleted set.
+        loop {
+            let alive = match &self.stack.last().expect("the root level is never removed").0 {
+                Kind::Set(n) | Kind::Rules(n) => self.cfg.set(n).is_some(),
+                Kind::Dest(n) => self.cfg.friends.iter().any(|f| &f.name == n),
+                _ => true,
+            };
+            if alive || self.stack.len() == 1 {
+                break;
+            }
+            self.stack.pop();
+            self.in_menu = true;
+        }
+        let (kind, sel) = self.stack.last().cloned().expect("the root level is never removed");
+        let sel = sel.min(self.items(&kind).len().saturating_sub(1));
+        self.stack.last_mut().expect("the root level is never removed").1 = sel;
+        let before = self.page;
+        self.sub = Sub::Sets;
+        match &kind {
+            Kind::Root => self.page = sel,
+            Kind::Backup => {
+                self.page = BACKUP;
+                self.sets.select(Some(sel.min(self.cfg.sets.len())));
+                if let Some(b) = self.cfg.sets.get(sel) {
+                    self.set = b.name.clone();
+                }
+            }
+            Kind::Set(n) | Kind::Rules(n) => {
+                self.page = BACKUP;
+                self.set = n.clone();
+                self.sets.select(self.cfg.sets.iter().position(|b| &b.name == n));
+                if matches!(kind, Kind::Rules(_)) {
+                    self.sub = Sub::Rules;
+                    self.rules.select(Some(sel));
+                } else if sel == 1 {
+                    self.sub = Sub::Files;
+                } else if sel == 2 {
+                    self.sub = Sub::Dests;
+                }
+            }
+            Kind::Restore => self.page = RESTORE,
+            Kind::Dests => {
+                self.page = DESTS;
+                self.dests.select(Some(sel.min(self.cfg.friends.len().saturating_sub(1))));
+            }
+            Kind::Dest(n) => {
+                self.page = DESTS;
+                self.dests.select(self.cfg.friends.iter().position(|f| &f.name == n));
+            }
+            Kind::Settings => {
+                self.page = SETTINGS;
+                // The first menu row is the start-at-login line, which has no row in the table.
+                self.settings.select(sel.checked_sub(1));
+            }
+        }
+        if self.page != before {
+            self.scroll = 0;
+            self.text_at = Instant::now() - Duration::from_secs(3600);
+        }
+    }
+
+    async fn act(&mut self, a: Act) {
+        match a {
+            Act::BackupSet | Act::BackupAll => {
+                if a == Act::BackupSet && self.picked_set().is_none() {
+                    self.status = "choose a backup set first".into();
+                    return;
+                }
+                let set = if a == Act::BackupSet { self.picked_set() } else { None };
+                self.start("backing up", |ex, pr| async move {
+                    Done::BackedUp(lines_or_error(ex.live(Cmd::Backup { tag: None, set }, &pr).await))
+                });
+            }
+            Act::NewSet => self.input = Some((Prompt::NewSet, String::new())),
+            Act::RenameSet => {
+                if let Some(n) = self.picked_set() {
+                    self.input = Some((Prompt::RenameSet(n.clone()), n));
+                }
+            }
+            Act::DeleteSet => match self.picked_set() {
+                Some(_) if self.cfg.sets.len() <= 1 => self.status = "the last set cannot be deleted".into(),
+                Some(n) => self.input = Some((Prompt::DeleteSet(n), String::new())),
+                None => {}
+            },
+            Act::Toggle if self.sub == Sub::Files => self.toggle_folder().await,
+            Act::Toggle => {
+                let i = self.set_dests.selected().unwrap_or(0);
+                if let Some(n) = self.cfg.friends.get(i).map(|f| f.name.clone()) {
+                    self.toggle_destination(&n).await;
+                }
+            }
+            Act::Hidden => {
+                self.hidden = !self.hidden;
+                self.set_root(self.root.clone());
+            }
+            Act::UpFolder => {
+                if let Some(parent) = Path::new(&self.root).parent() {
+                    self.set_root(parent.to_string_lossy().into_owned());
+                }
+            }
+            Act::ServiceInfo => {
+                let on = self.ov["service"].as_bool() == Some(true);
+                self.popup = Some(if on {
+                    vec![
+                        "The background service is installed: the daemon starts by itself when you log in.".into(),
+                        String::new(),
+                        "To remove it, quit and run:  sdb service uninstall".into(),
+                    ]
+                } else {
+                    vec![
+                        "The background service is not installed.".into(),
+                        "The daemon runs now because sdb started it, but after a restart of this computer".into(),
+                        "nothing is backed up, and friends cannot back up to you, until you run sdb again.".into(),
+                        String::new(),
+                        "To have it start at login, quit and run:  sdb service install".into(),
+                    ]
+                });
+            }
+            Act::Invite => {
+                self.start("creating an invite", |ex, _| async move {
+                    Done::Popup(lines_or_error(ex.call(Cmd::Invite).await))
+                });
+            }
+            Act::Accept => self.input = Some((Prompt::Join, String::new())),
+            Act::AddDrive => self.input = Some((Prompt::Drive, "/Volumes/".into())),
+            Act::Pace | Act::Quota | Act::InLimit | Act::RemoveDest | Act::UseDest => {
+                let Some(f) = self.picked_dest() else {
+                    self.status = "there is no destination yet: invite a friend or add a drive".into();
+                    return;
+                };
+                match a {
+                    Act::Pace => self.input = Some((Prompt::Every(f.name), String::new())),
+                    Act::Quota if f.path.is_some() => self.status = "a drive has no quota".into(),
+                    Act::Quota => self.input = Some((Prompt::Quota(f.name), String::new())),
+                    Act::InLimit if f.path.is_some() => self.status = "a drive has no speed limit".into(),
+                    Act::InLimit => self.input = Some((Prompt::InLimit(f.name), String::new())),
+                    Act::RemoveDest => self.input = Some((Prompt::Remove(f.name), String::new())),
+                    _ => self.apply(Cmd::FriendBackupTo { name: f.name, on: !f.backup_to }).await,
+                }
+            }
+            Act::Pick if self.restore.timeline => {
+                let n = self.restore.snaps.len();
+                let i = self.restore.tl.selected().unwrap_or(0);
+                if n > 0 {
+                    self.goto(n - 1 - i.min(n - 1));
+                }
+            }
+            Act::Pick => {
+                let rv = &mut self.restore;
+                if let Some(p) = rv.tree.cur().map(|r| r.path.clone()) {
+                    if !rv.picked.remove(&p) {
+                        rv.picked.insert(p);
+                    }
+                }
+            }
+            Act::RestorePicked => {
+                if self.restore.picked.is_empty() {
+                    self.status = "pick files or folders with space first".into();
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    self.input = Some((Prompt::RestoreTo, format!("{home}/sdb-restore")));
+                }
+            }
+            Act::Search => self.input = Some((Prompt::Filter, self.restore.filter.clone())),
+            Act::Timeline => {
+                self.restore.timeline = true;
+                self.in_menu = false;
+            }
+            Act::Date => self.input = Some((Prompt::Date, String::new())),
+            Act::Versions => {
+                let Some(path) = self.restore.tree.cur().filter(|r| !r.dir).map(|r| r.path.clone()) else {
+                    self.status = "move to a file first".into();
+                    return;
+                };
+                let from = self.source.clone();
+                self.start("finding versions", |ex, _| async move {
+                    match ex.call(Cmd::Versions { path, from }).await {
+                        Ok(l) => Done::Versions(l),
+                        Err(e) => Done::Failed(format!("{e:#}")),
+                    }
+                });
+            }
+            Act::Source => {
+                // Cycle: all destinations, then each one by itself.
+                let names: Vec<String> = self.cfg.friends.iter().map(|f| f.name.clone()).collect();
+                self.source = match &self.source {
+                    None => names.first().cloned(),
+                    Some(cur) => names.iter().position(|n| n == cur).and_then(|i| names.get(i + 1)).cloned(),
+                };
+                self.load_snaps();
+            }
+            Act::WhichSet => {
+                let names: Vec<String> = self.cfg.sets.iter().map(|b| b.name.clone()).collect();
+                let i = self
+                    .rset
+                    .as_ref()
+                    .and_then(|c| names.iter().position(|n| n == c))
+                    .map(|i| (i + 1) % names.len().max(1))
+                    .unwrap_or(0);
+                self.rset = names.get(i).cloned();
+                self.load_snaps();
+            }
+            Act::Older if self.restore.cur > 0 => self.goto(self.restore.cur - 1),
+            Act::Newer if self.restore.cur + 1 < self.restore.snaps.len() => self.goto(self.restore.cur + 1),
+            Act::Older | Act::Newer => {}
+            Act::Refresh if self.page == RESTORE => self.load_snaps(),
+            Act::Refresh => self.text_at = Instant::now() - Duration::from_secs(3600),
+        }
+    }
+
+    /// Cursor movement and folder opening for whichever list is on screen.
+    /// Returns false when the key was not a movement key.
+    fn navigate(&mut self, code: KeyCode) -> bool {
+        let d: isize = match code {
+            KeyCode::Up | KeyCode::Char('k') => -1,
+            KeyCode::Down | KeyCode::Char('j') => 1,
+            KeyCode::PageUp => -15,
+            KeyCode::PageDown => 15,
+            _ => 0,
+        };
+        let step = |st: &mut ListState, len: usize| {
+            let i = st.selected().unwrap_or(0) as isize + d;
+            st.select(Some(i.clamp(0, len.max(1) as isize - 1) as usize));
+        };
+        let tree_key = matches!(code, KeyCode::Right | KeyCode::Left | KeyCode::Enter | KeyCode::Char('l' | 'h'));
+        match (self.page, &self.sub) {
+            (BACKUP, Sub::Files) if d != 0 => self.folders.mv(d),
+            (BACKUP, Sub::Files) if tree_key => {
+                if code == KeyCode::Left || code == KeyCode::Char('h') {
+                    self.folders.close();
+                } else if let Some(r) = self.folders.cur().filter(|r| r.dir && !r.open) {
+                    let kids = list_dir(&r.path, self.hidden);
+                    self.folders.open(kids);
+                }
+            }
+            (RESTORE, _) if self.restore.timeline && d != 0 => step(&mut self.restore.tl, self.restore.snaps.len()),
+            (RESTORE, _) if !self.restore.timeline && d != 0 => self.restore.tree.mv(d),
+            (RESTORE, _) if !self.restore.timeline && tree_key => {
+                let rv = &mut self.restore;
+                if code == KeyCode::Left || code == KeyCode::Char('h') {
+                    rv.tree.close();
+                } else if let Some(r) = rv.tree.cur().filter(|r| r.dir && !r.open) {
+                    let kids = rv.kids.get(&r.path).cloned().unwrap_or_default();
+                    rv.tree.open(kids);
+                }
+            }
+            (BACKUP, Sub::Sets) if d != 0 => step(&mut self.sets, self.cfg.sets.len() + 1),
+            (BACKUP, Sub::Dests) if d != 0 => step(&mut self.set_dests, self.cfg.friends.len()),
+            (BACKUP, Sub::Rules) if d != 0 => step(&mut self.rules, RULES.len()),
+            (DESTS, _) if d != 0 => step(&mut self.dests, self.cfg.friends.len()),
+            (SETTINGS, _) if d != 0 => step(&mut self.settings, GENERAL.len()),
+            (HISTORY | STATUS, _) if d != 0 => {
+                self.scroll = (self.scroll as isize - d).clamp(0, self.text.len() as isize) as usize
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Handles one key; returns false to quit.
     async fn key(&mut self, code: KeyCode) -> bool {
         if self.popup.take().is_some() {
             return true;
@@ -1002,9 +1260,7 @@ impl App {
             let i = st.selected().unwrap_or(0);
             match code {
                 KeyCode::Up | KeyCode::Char('k') => st.select(Some(i.saturating_sub(1))),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    st.select(Some((i + 1).min(list.len().saturating_sub(1))))
-                }
+                KeyCode::Down | KeyCode::Char('j') => st.select(Some((i + 1).min(list.len().saturating_sub(1)))),
                 KeyCode::Enter => {
                     if let Some((idx, _)) = list.get(i) {
                         self.goto(*idx);
@@ -1017,26 +1273,22 @@ impl App {
             return true;
         }
         if let Some((prompt, mut text)) = self.input.take() {
-            let filtering = matches!(prompt, Prompt::Filter);
-            // Moving in the list ends typing, so the next keys (space, v, r) act on the results.
-            if filtering
-                && matches!(
-                    code,
-                    KeyCode::Up
-                        | KeyCode::Down
-                        | KeyCode::PageUp
-                        | KeyCode::PageDown
-                        | KeyCode::Left
-                        | KeyCode::Right
-                )
-            {
-                self.key_restore(code).await;
+            let folder_filtering = matches!(prompt, Prompt::FolderFilter);
+            let filtering = folder_filtering || matches!(prompt, Prompt::Filter);
+            // Moving in the list ends typing and puts the cursor among the results.
+            if filtering && matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown) {
+                self.in_menu = false;
+                self.restore.timeline = false;
+                self.navigate(code);
                 return true;
             }
             match code {
                 KeyCode::Esc if filtering => text.clear(),
                 KeyCode::Esc => {}
-                KeyCode::Enter if filtering => {}
+                KeyCode::Enter if filtering => {
+                    self.in_menu = false;
+                    self.restore.timeline = false;
+                }
                 KeyCode::Enter => self.submit(prompt, text.trim().to_string()).await,
                 KeyCode::Backspace => {
                     text.pop();
@@ -1048,248 +1300,75 @@ impl App {
                 }
                 _ => self.input = Some((prompt, text.clone())),
             }
-            if filtering && self.restore.filter != text {
+            if folder_filtering && self.folder_filter != text {
+                self.search_folders(text);
+            } else if filtering && !folder_filtering && self.restore.filter != text {
                 self.restore.filter = text;
                 self.restore.apply_filter();
             }
+            self.sync();
             return true;
         }
-        match code {
-            KeyCode::Esc if self.tab == 3 && !self.restore.filter.is_empty() => {
-                self.key_restore(code).await
-            }
-            KeyCode::Char('q') | KeyCode::Esc => return false,
-            KeyCode::Tab => self.tab = (self.tab + 1) % TABS.len(),
-            KeyCode::BackTab => self.tab = (self.tab + TABS.len() - 1) % TABS.len(),
-            KeyCode::Char(c @ '1'..='5') => self.tab = c as usize - '1' as usize,
-            KeyCode::Char('w') if self.tab != 3 => {
-                let names: Vec<String> = self.cfg.sets.iter().map(|b| b.name.clone()).collect();
-                let i = names
-                    .iter()
-                    .position(|n| *n == self.set)
-                    .map(|i| (i + 1) % names.len())
-                    .unwrap_or(0);
-                self.set = names.get(i).cloned().unwrap_or_else(|| DEFAULT_SET.into());
-                self.status = format!("now editing set \"{}\"", self.set);
-            }
-            KeyCode::Char('n') if self.tab != 3 => {
-                self.input = Some((Prompt::NewSet, String::new()))
-            }
-            KeyCode::Char('b') => {
-                self.start("backing up", |ex, pr| async move {
-                    Done::BackedUp(lines_or_error(
-                        ex.live(
-                            Cmd::Backup {
-                                tag: None,
-                                set: None,
-                            },
-                            &pr,
-                        )
-                        .await,
-                    ))
-                });
-            }
-            _ => match self.tab {
-                0 => self.key_folders(code).await,
-                1 => self.key_friends(code).await,
-                2 => self.key_settings(code).await,
-                3 => self.key_restore(code).await,
-                _ if code == KeyCode::Char('u') => self.info_loaded = false,
-                _ => {}
-            },
+        if code == KeyCode::Char('q') {
+            return false;
         }
-        true
-    }
-
-    async fn key_folders(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => self.folders.mv(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.folders.mv(1),
-            KeyCode::PageUp => self.folders.mv(-15),
-            KeyCode::PageDown => self.folders.mv(15),
-            KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => {
-                if let Some(r) = self.folders.cur().filter(|r| r.dir && !r.open) {
-                    let kids = list_dir(&r.path, self.hidden);
-                    self.folders.open(kids);
-                }
-            }
-            KeyCode::Left | KeyCode::Char('h') => self.folders.close(),
-            KeyCode::Backspace => {
-                if let Some(parent) = Path::new(&self.root).parent() {
-                    self.set_root(parent.to_string_lossy().into_owned());
-                }
-            }
-            KeyCode::Char('.') => {
-                self.hidden = !self.hidden;
-                self.set_root(self.root.clone());
-            }
-            KeyCode::Char(' ') => self.toggle_folder().await,
-            _ => {}
-        }
-    }
-
-    async fn key_friends(&mut self, code: KeyCode) {
-        let n = self.cfg.friends.len();
-        let i = self
-            .friends
-            .selected()
-            .unwrap_or(0)
-            .min(n.saturating_sub(1));
-        let cur = self.cfg.friends.get(i).cloned();
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => self.friends.select(Some(i.saturating_sub(1))),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.friends.select(Some((i + 1).min(n.saturating_sub(1))))
-            }
-            KeyCode::Char(' ') => {
-                if let Some(f) = cur {
-                    self.toggle_destination(&f.name).await;
-                }
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right => {
-                if let Some(f) = cur {
-                    self.apply(Cmd::FriendQuota {
-                        name: f.name,
-                        gb: f.quota_gb + 10,
-                    })
-                    .await;
-                }
-            }
-            KeyCode::Char('-') | KeyCode::Left => {
-                if let Some(f) = cur {
-                    self.apply(Cmd::FriendQuota {
-                        name: f.name,
-                        gb: f.quota_gb.saturating_sub(10),
-                    })
-                    .await;
-                }
-            }
-            KeyCode::Char('i') => {
-                self.start("creating an invite", |ex, _| async move {
-                    Done::Popup(lines_or_error(ex.call(Cmd::Invite).await))
-                });
-            }
-            KeyCode::Char('a') => self.input = Some((Prompt::Join, String::new())),
-            KeyCode::Char('e') => {
-                if let Some(f) = cur {
-                    self.input = Some((Prompt::Every(f.name), String::new()));
-                }
-            }
-            KeyCode::Char('d') => self.input = Some((Prompt::Drive, "/Volumes/".into())),
-            KeyCode::Char('x') => {
-                if let Some(f) = cur {
-                    self.input = Some((Prompt::Remove(f.name), String::new()));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    async fn key_settings(&mut self, code: KeyCode) {
-        let i = self.settings.selected().unwrap_or(0);
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => self.settings.select(Some(i.saturating_sub(1))),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.settings.select(Some((i + 1).min(SETTINGS.len() - 1)))
-            }
-            KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => self.bump(1).await,
-            KeyCode::Left | KeyCode::Char('-') => self.bump(-1).await,
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                self.input = Some((Prompt::Setting(SETTINGS[i].0), String::new()))
-            }
-            _ => {}
-        }
-    }
-
-    async fn key_restore(&mut self, code: KeyCode) {
-        let rv = &mut self.restore;
-        let n = rv.snaps.len();
-        if rv.timeline {
-            let i = rv.tl.selected().unwrap_or(0);
+        if self.in_menu {
+            let (kind, sel) = self.stack.last().cloned().expect("the root level is never removed");
+            let items = self.items(&kind);
+            let last = items.len().saturating_sub(1);
+            let top = self.stack.len() - 1;
             match code {
-                KeyCode::Up | KeyCode::Char('k') => rv.tl.select(Some(i.saturating_sub(1))),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    rv.tl.select(Some((i + 1).min(n.saturating_sub(1))))
+                KeyCode::Up | KeyCode::Char('k') => self.stack[top].1 = sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.stack[top].1 = (sel + 1).min(last),
+                KeyCode::PageUp => self.stack[top].1 = sel.saturating_sub(10),
+                KeyCode::PageDown => self.stack[top].1 = (sel + 10).min(last),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match items.get(sel).map(|i| i.1.clone()) {
+                    Some(Choice::Open(k)) => self.stack.push((k, 0)),
+                    Some(Choice::Focus) => {
+                        self.restore.timeline = false;
+                        self.in_menu = false;
+                    }
+                    // Right only moves; doing something takes Enter.
+                    Some(Choice::Do(a)) if code == KeyCode::Enter => self.act(a).await,
+                    Some(Choice::Value(key)) if code == KeyCode::Enter => {
+                        self.input = Some((Prompt::Setting(key), String::new()))
+                    }
+                    _ => {}
+                },
+                KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') if self.stack.len() > 1 => {
+                    self.stack.pop();
                 }
-                KeyCode::PageUp => rv.tl.select(Some(i.saturating_sub(15))),
-                KeyCode::PageDown => rv.tl.select(Some((i + 15).min(n.saturating_sub(1)))),
-                KeyCode::Enter | KeyCode::Char(' ') if n > 0 => self.goto(n - 1 - i),
-                KeyCode::Char('t') | KeyCode::Left => rv.timeline = false,
-                KeyCode::Char('g') => self.input = Some((Prompt::Date, String::new())),
                 _ => {}
             }
-            return;
+            self.sync();
+            return true;
         }
-        match code {
-            KeyCode::Char('t') => rv.timeline = true,
-            KeyCode::Char('g') => self.input = Some((Prompt::Date, String::new())),
-            KeyCode::Char('v') => self.show_versions(),
-            KeyCode::Char('w') => {
-                let names: Vec<String> = self.cfg.sets.iter().map(|b| b.name.clone()).collect();
-                let i = self
-                    .rset
-                    .as_ref()
-                    .and_then(|c| names.iter().position(|n| n == c))
-                    .map(|i| (i + 1) % names.len().max(1))
-                    .unwrap_or(0);
-                self.rset = names.get(i).cloned();
-                self.load_snaps();
+        // The cursor is in the pane on the right.
+        let top_of_tree = self.folders.cur().is_some_and(|r| r.depth == 0 && !r.open);
+        match (code, self.page, &self.sub) {
+            (KeyCode::Char('/'), BACKUP, Sub::Files) => {
+                self.input = Some((Prompt::FolderFilter, self.folder_filter.clone()))
             }
-            KeyCode::Char('s') => {
-                // Cycle: all destinations, then each one by itself.
-                let names: Vec<String> = self.cfg.friends.iter().map(|f| f.name.clone()).collect();
-                self.source = match &self.source {
-                    None => names.first().cloned(),
-                    Some(cur) => names
-                        .iter()
-                        .position(|n| n == cur)
-                        .and_then(|i| names.get(i + 1))
-                        .cloned(),
-                };
-                self.load_snaps();
+            (KeyCode::Char('/'), RESTORE, _) if !self.restore.timeline => self.act(Act::Search).await,
+            (KeyCode::Esc, BACKUP, Sub::Files) if !self.folder_filter.is_empty() => self.search_folders(String::new()),
+            (KeyCode::Esc, RESTORE, _) if !self.restore.timeline && !self.restore.filter.is_empty() => {
+                self.restore.filter.clear();
+                self.restore.apply_filter();
             }
-            KeyCode::Char('/') => self.input = Some((Prompt::Filter, rv.filter.clone())),
-            KeyCode::Esc if !rv.filter.is_empty() => {
-                rv.filter.clear();
-                rv.apply_filter();
+            (KeyCode::Esc | KeyCode::Tab, _, _) => {
+                self.restore.timeline = false;
+                self.in_menu = true;
             }
-            KeyCode::Up | KeyCode::Char('k') => rv.tree.mv(-1),
-            KeyCode::Down | KeyCode::Char('j') => rv.tree.mv(1),
-            KeyCode::PageUp => rv.tree.mv(-15),
-            KeyCode::PageDown => rv.tree.mv(15),
-            KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => {
-                if let Some(r) = rv.tree.cur().filter(|r| r.dir && !r.open) {
-                    let kids = rv.kids.get(&r.path).cloned().unwrap_or_default();
-                    rv.tree.open(kids);
-                }
+            (KeyCode::Char(' '), BACKUP, Sub::Files | Sub::Dests) => self.act(Act::Toggle).await,
+            (KeyCode::Char(' '), RESTORE, _) if !self.restore.timeline => self.act(Act::Pick).await,
+            (KeyCode::Enter, RESTORE, _) if self.restore.timeline => self.act(Act::Pick).await,
+            (KeyCode::Left, BACKUP, Sub::Files) if top_of_tree => self.act(Act::UpFolder).await,
+            _ => {
+                self.navigate(code);
             }
-            KeyCode::Left | KeyCode::Char('h') => rv.tree.close(),
-            KeyCode::Char(' ') => {
-                if let Some(p) = rv.tree.cur().map(|r| r.path.clone()) {
-                    if !rv.picked.remove(&p) {
-                        rv.picked.insert(p);
-                    }
-                }
-            }
-            KeyCode::Char('[') if rv.cur > 0 => {
-                let i = rv.cur - 1;
-                self.goto(i);
-            }
-            KeyCode::Char(']') if rv.cur + 1 < rv.snaps.len() => {
-                let i = rv.cur + 1;
-                self.goto(i);
-            }
-            KeyCode::Char('u') => self.load_snaps(),
-            KeyCode::Char('r') => {
-                if rv.picked.is_empty() {
-                    self.status = "pick files or folders with space first".into();
-                } else {
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    self.input = Some((Prompt::RestoreTo, format!("{home}/sdb-restore")));
-                }
-            }
-            _ => {}
         }
+        self.sync();
+        true
     }
 
     async fn submit(&mut self, prompt: Prompt, text: String) {
@@ -1297,32 +1376,61 @@ impl App {
             return;
         }
         match prompt {
-            Prompt::Filter => {}
+            Prompt::Filter | Prompt::FolderFilter => {}
             Prompt::NewSet => {
-                let name: String = text
-                    .chars()
-                    .filter(|c| c.is_alphanumeric() || "-_.".contains(*c))
-                    .take(32)
-                    .collect();
+                let name: String =
+                    text.chars().filter(|c| c.is_alphanumeric() || "-_.".contains(*c)).take(32).collect();
                 if name.is_empty() {
                     self.status = "use letters and digits for a set name".into();
                 } else {
+                    self.set = name.clone();
+                    self.apply(self.set_edit(None)).await;
+                    let idx = self.cfg.sets.iter().position(|b| b.name == name).unwrap_or(0);
+                    self.stack = vec![(Kind::Root, BACKUP), (Kind::Backup, idx), (Kind::Set(name), 1)];
+                    self.in_menu = false;
+                    self.status = format!("set \"{}\" created: mark what it backs up with space, then esc", self.set);
+                }
+            }
+            Prompt::RenameSet(name) => {
+                let to: String = text.chars().filter(|c| c.is_alphanumeric() || "-_.".contains(*c)).take(32).collect();
+                if to.is_empty() {
+                    self.status = "use letters and digits for a set name".into();
+                } else {
+                    match self.exec.call(Cmd::SetRename { name: name.clone(), to: to.clone() }).await {
+                        Ok(_) => {
+                            // Follow the set to its new name so the menu stays where it was.
+                            for level in self.stack.iter_mut() {
+                                match &mut level.0 {
+                                    Kind::Set(n) | Kind::Rules(n) if *n == name => *n = to.clone(),
+                                    _ => {}
+                                }
+                            }
+                            if self.rset.as_deref() == Some(name.as_str()) {
+                                self.rset = Some(to.clone());
+                            }
+                            self.set = to;
+                            self.restore.loaded = false;
+                            self.status = "renamed".into();
+                        }
+                        Err(e) => self.status = format!("{e:#}"),
+                    }
+                    self.reload().await;
+                }
+            }
+            Prompt::DeleteSet(name) => {
+                if text.eq_ignore_ascii_case("yes") {
                     self.apply(Cmd::SetEdit {
-                        name: name.clone(),
+                        name,
                         to: None,
                         every: None,
                         hours: None,
                         days: None,
                         versions: None,
                         last: None,
-                        delete: false,
+                        delete: true,
                     })
                     .await;
-                    self.set = name;
-                    self.status = format!(
-                        "set \"{}\" created: pick its folders on page 1 and its destinations on page 2",
-                        self.set
-                    );
+                    self.sets.select(Some(0));
                 }
             }
             Prompt::Drive => {
@@ -1344,19 +1452,21 @@ impl App {
                 }
             }
             Prompt::Every(name) => match text.parse::<u32>() {
-                Ok(minutes) => {
-                    self.apply(Cmd::Every {
-                        name: Some(name),
-                        minutes,
-                    })
-                    .await
-                }
+                Ok(minutes) => self.apply(Cmd::Every { name: Some(name), minutes }).await,
                 Err(_) => self.status = "type a number of minutes".into(),
+            },
+            Prompt::InLimit(name) => match text.parse::<u64>() {
+                Ok(kbps) => self.apply(Cmd::FriendLimit { name, kbps }).await,
+                Err(_) => self.status = "type a number of KB/s (0 = unlimited)".into(),
+            },
+            Prompt::Quota(name) => match text.parse::<u64>() {
+                Ok(gb) => self.apply(Cmd::FriendQuota { name, gb }).await,
+                Err(_) => self.status = "type a number of GB".into(),
             },
             Prompt::Remove(name) => {
                 if text.eq_ignore_ascii_case("yes") {
                     self.apply(Cmd::FriendRemove { name, purge: false }).await;
-                    self.friends.select(Some(0));
+                    self.dests.select(Some(0));
                 }
             }
             Prompt::Setting(key) => {
@@ -1365,13 +1475,12 @@ impl App {
                 }
             }
             Prompt::Date => {
-                match parse_when(&text)
-                    .and_then(|t| self.restore.snaps.iter().rposition(|s| s.time <= t))
-                {
+                let found = parse_when(&text).and_then(|t| self.restore.snaps.iter().rposition(|s| s.time <= t));
+                match found {
                     Some(i) => self.goto(i),
-                    None => self.status =
-                        "no restore point at or before that (try 2026-11-20 or 2026-11-20 14:30)"
-                            .into(),
+                    None => {
+                        self.status = "no restore point at or before that (try 2026-11-20 or 2026-11-20 14:30)".into()
+                    }
                 }
             }
             Prompt::Join => {
@@ -1381,315 +1490,472 @@ impl App {
                 });
             }
             Prompt::RestoreTo => {
-                let Some(snap) = self
-                    .restore
-                    .snaps
-                    .get(self.restore.cur)
-                    .map(|s| s.id.clone())
-                else {
+                let Some(snap) = self.restore.snaps.get(self.restore.cur).map(|s| s.id.clone()) else {
                     return;
                 };
                 let paths = self.restore.picked.iter().cloned().collect();
-                let cmd = Cmd::Restore {
-                    snap,
-                    paths,
-                    to: PathBuf::from(text),
-                    from: self.source.clone(),
-                };
-                self.start("restoring", |ex, pr| async move {
-                    Done::Popup(lines_or_error(ex.live(cmd, &pr).await))
-                });
+                let cmd = Cmd::Restore { snap, paths, to: PathBuf::from(text), from: self.source.clone() };
+                self.start("restoring", |ex, pr| async move { Done::Popup(lines_or_error(ex.live(cmd, &pr).await)) });
             }
         }
     }
 
-    fn draw(&mut self, f: &mut Frame) {
-        let [top, body, help] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(4),
-        ])
-        .areas(f.area());
-        let tabs = Tabs::new(TABS.to_vec())
-            .select(self.tab)
-            .highlight_style(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-            .block(Block::bordered().title(format!(
-                " Super Duper Backup: {} | backup set: {} of {} (w: switch set, n: new set) ",
-                self.cfg.name,
-                self.set,
-                self.cfg.sets.len()
-            )));
-        f.render_widget(tabs, top);
-        let hl = Style::new().add_modifier(Modifier::REVERSED);
-        let keys = match self.tab {
-            0 => {
-                let items: Vec<ListItem> = self
-                    .folders
-                    .rows
-                    .iter()
-                    .map(|r| {
-                        let (mark, color) = self.folder_mark(&r.path);
-                        let arrow = if !r.dir {
-                            " "
-                        } else if r.open {
-                            "v"
-                        } else {
-                            ">"
-                        };
-                        ListItem::new(Line::from(vec![
-                            Span::styled(mark, Style::new().fg(color)),
-                            Span::raw(format!(
-                                " {}{arrow} {}{}",
-                                "  ".repeat(r.depth),
-                                name(&r.path),
-                                if r.dir { "/" } else { "" }
-                            )),
-                            Span::styled(
-                                self.other_set(&r.path)
-                                    .map(|o| format!("   (in set {o})"))
-                                    .unwrap_or_default(),
-                                Style::new().fg(Color::DarkGray),
-                            ),
-                        ]))
-                    })
-                    .collect();
-                let title = format!(" What set \"{}\" backs up: {} ", self.set, self.root);
-                f.render_stateful_widget(
-                    List::new(items)
-                        .block(Block::bordered().title(title))
-                        .highlight_style(hl),
-                    body,
-                    &mut self.folders.st,
-                );
-                "space: back up / stop ([x] chosen, [+] inside a chosen folder, [-] left out)   arrows: move, open, close\nshift+up/down: page   backspace: go up a folder   .: show hidden files"
-            }
-            1 => {
-                let cur_set = self.cur_set();
-                let items: Vec<ListItem> = self
-                    .cfg
-                    .friends
-                    .iter()
-                    .map(|fr| {
-                        let mark = if cur_set.sends_to(fr) {
-                            Span::styled("[x]", Style::new().fg(Color::Green))
-                        } else {
-                            Span::raw("[ ]")
-                        };
-                        let what = match &fr.path {
-                            Some(p) => format!("local drive at {}", p.display()),
-                            None => {
-                                format!("they may store up to {} GB on this computer", fr.quota_gb)
-                            }
-                        };
-                        let every = fr.interval_secs(&self.cfg) / 60;
-                        ListItem::new(Line::from(vec![
-                            mark,
-                            Span::raw(format!(" {:<20} every {every:>3} min   {what}", fr.name)),
-                        ]))
-                    })
-                    .collect();
-                if self.friends.selected().is_none() && !self.cfg.friends.is_empty() {
-                    self.friends.select(Some(0));
-                }
-                let title = format!(
-                    " Friends and drives ([x] = set \"{}\" is sent there) ",
-                    self.set
-                );
-                if items.is_empty() {
-                    f.render_widget(Paragraph::new("No destinations yet. Press i to create an invite to send, a to accept one you were sent, or d to add a local drive.").block(Block::bordered().title(title.as_str())), body);
-                } else {
-                    f.render_stateful_widget(
-                        List::new(items)
-                            .block(Block::bordered().title(title.as_str()))
-                            .highlight_style(hl),
-                        body,
-                        &mut self.friends,
-                    );
-                }
-                "space: send / stop sending my backups here   +/-: change a friend's quota by 10 GB   x: remove\ne: how often to send here   i: invite a friend   a: accept an invite   d: add a local drive or folder"
-            }
-            2 => {
-                let items: Vec<ListItem> = SETTINGS
-                    .iter()
-                    .map(|(k, label)| {
-                        ListItem::new(format!("{:>18}   {label}", self.setting_text(k)))
-                    })
-                    .collect();
-                if self.settings.selected().is_none() {
-                    self.settings.select(Some(0));
-                }
-                f.render_stateful_widget(
-                    List::new(items)
-                        .block(Block::bordered().title(format!(
-                            " Settings (rows starting \"This set\" apply to set \"{}\") ",
-                            self.set
-                        )))
-                        .highlight_style(hl),
-                    body,
-                    &mut self.settings,
-                );
-                "left/right: change   enter: type a value (pause: hours, blank = until resumed)\nper-pattern version limits: sdb keep --versions 5 --pattern '**/*.iso'"
-            }
-            3 => {
-                let rv = &mut self.restore;
-                let title = match rv.snaps.get(rv.cur) {
-                    Some(s) => format!(
-                        " Your files as of {}{} ({} files, {}){} ",
-                        when(s.time),
-                        s.tag
-                            .as_ref()
-                            .map(|t| format!(" \"{t}\""))
-                            .unwrap_or_default(),
-                        s.files,
-                        human(s.bytes),
-                        if rv.at_latest() { ", latest" } else { "" }
-                    ),
-                    None => " Restore ".into(),
-                };
-                let title = match &self.source {
-                    Some(n) => format!("{title}| from {n} only "),
-                    None => format!("{title}| from all destinations "),
-                };
-                let title = if self.cfg.sets.len() > 1 {
-                    format!("{title}| set {} ", self.rset.as_deref().unwrap_or("?"))
-                } else {
-                    title
-                };
-                let title = if rv.filter.is_empty() {
-                    title
-                } else {
-                    format!(
-                        "{title}| {} matching \"{}\" ",
-                        rv.tree.rows.len(),
-                        rv.filter
-                    )
-                };
-                let focus = |on: bool| {
-                    if on {
-                        Style::new().fg(Color::Yellow)
-                    } else {
-                        Style::new()
-                    }
-                };
-                if rv.snaps.is_empty() {
-                    f.render_widget(Paragraph::new("No restore points found yet (or no friend is reachable). Press u to look again.").block(Block::bordered().title(title)), body);
-                } else {
-                    let [left, right] =
-                        Layout::horizontal([Constraint::Min(30), Constraint::Length(48)])
-                            .areas(body);
-                    let items: Vec<ListItem> = rv
-                        .tree
-                        .rows
-                        .iter()
-                        .map(|r| {
-                            let mark = if rv.picked.contains(&r.path) {
-                                Span::styled("[x]", Style::new().fg(Color::Green))
-                            } else if rv.picked.iter().any(|p| Path::new(&r.path).starts_with(p)) {
-                                Span::styled("[+]", Style::new().fg(Color::Green))
-                            } else {
-                                Span::raw("[ ]")
-                            };
-                            let arrow = if !r.dir {
-                                " "
-                            } else if r.open {
-                                "v"
-                            } else {
-                                ">"
-                            };
-                            let label = if r.depth > 0 {
-                                name(&r.path)
-                            } else if rv.filter.is_empty() {
-                                r.path.clone()
-                            } else {
-                                // Search results lead with the name so it is never cut off.
-                                let dir = Path::new(&r.path)
-                                    .parent()
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                format!("{}   in {dir}", name(&r.path))
-                            };
-                            let size = if r.dir || !rv.filter.is_empty() && r.depth == 0 {
-                                String::new()
-                            } else {
-                                format!("  {}", human(r.size))
-                            };
-                            let slash = if r.dir && (rv.filter.is_empty() || r.depth > 0) {
-                                "/"
-                            } else {
-                                ""
-                            };
-                            let mut spans = vec![
-                                mark,
-                                Span::raw(format!(
-                                    " {}{arrow} {label}{slash}{size}",
-                                    "  ".repeat(r.depth)
-                                )),
-                            ];
-                            if let Some((text, color)) = rv.marker(r) {
-                                spans.push(Span::styled(
-                                    format!("  {text}"),
-                                    Style::new().fg(color),
-                                ));
-                            }
-                            ListItem::new(Line::from(spans))
-                        })
-                        .collect();
-                    let block = Block::bordered()
-                        .title(title)
-                        .border_style(focus(!rv.timeline));
-                    f.render_stateful_widget(
-                        List::new(items).block(block).highlight_style(hl),
-                        left,
-                        &mut rv.tree.st,
-                    );
-                    let times: Vec<ListItem> = rv
-                        .snaps
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .map(|(i, s)| {
-                            let here = if i == rv.cur { ">" } else { " " };
-                            let tag = s.tag.as_ref().map(|t| format!(" {t}")).unwrap_or_default();
-                            let line = format!("{here} {}{tag}  {}", when(s.time), s.at.join(", "));
-                            ListItem::new(if i == rv.cur {
-                                Line::styled(line, Style::new().fg(Color::Green))
-                            } else {
-                                Line::raw(line)
-                            })
-                        })
-                        .collect();
-                    let block = Block::bordered()
-                        .title(format!(
-                            " Timeline ({}) and where each is stored ",
-                            rv.snaps.len()
-                        ))
-                        .border_style(focus(rv.timeline));
-                    let mut list = List::new(times).block(block);
-                    if rv.timeline {
-                        list = list.highlight_style(hl);
-                    }
-                    f.render_stateful_widget(list, right, &mut rv.tl);
-                }
-                if rv.timeline {
-                    "up/down: move through time   enter: show my files as they were then   g: jump to a date\nt: back to the files"
-                } else {
-                    "space: pick   r: restore picked   /: search names   t: timeline   g: jump to a date   v: versions of this file\ns: all / one destination   w: which set   [ and ]: older / newer   shift+up/down: page   u: refresh"
+    // ---------------------------------------------------------------- drawing
+
+    fn dest_state(&self, name: &str) -> (String, Color) {
+        let d = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == name));
+        match d.and_then(|d| d["state"].as_str()) {
+            Some("online") | Some("connected") => ("●".into(), Color::Green),
+            Some("checking") => ("◌".into(), Color::Yellow),
+            _ => ("○".into(), Color::Red),
+        }
+    }
+
+    fn draw_sets(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
+        let warnings: Vec<String> = self.ov["warnings"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|w| w.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let mut top: Vec<Line> =
+            warnings.iter().map(|w| Line::styled(format!("! {w}"), Style::new().fg(Color::Red))).collect();
+        if let Some(h) = self.ov["held"].as_str() {
+            top.push(Line::styled(format!("Automatic backups are held: {h}"), Style::new().fg(Color::Yellow)));
+        }
+        let [warn, body] = Layout::vertical([Constraint::Length(top.len() as u16), Constraint::Min(3)]).areas(area);
+        f.render_widget(Paragraph::new(top), warn);
+
+        let dim = Style::new().fg(Color::DarkGray);
+        let warn_secs = self.cfg.warn_after_days.max(1) as i64 * 86400;
+        let now = chrono::Utc::now().timestamp();
+        let mut items: Vec<ListItem> = vec![];
+        for b in &self.cfg.sets {
+            let o = self.ov["sets"].as_array().and_then(|a| a.iter().find(|s| s["name"] == b.name.as_str()));
+            let size = match o.and_then(|o| o["files"].as_u64()) {
+                Some(n) => format!("{n} files, {}", human(o.and_then(|o| o["bytes"].as_u64()).unwrap_or(0))),
+                None => "not backed up yet".into(),
+            };
+            let running = o.and_then(|o| o["running"].as_str());
+            let mut head = vec![
+                Span::styled(b.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("   {size}")),
+            ];
+            match running {
+                Some(r) => head.push(Span::styled(format!("   backing up: {r}"), Style::new().fg(Color::Cyan))),
+                None => {
+                    head.push(Span::styled(format!("   last backup {}", ago(o.and_then(|o| o["last"].as_i64()))), dim))
                 }
             }
-            _ => "",
-        };
-        let keys = if self.tab == 4 {
-            f.render_widget(
-                Paragraph::new(self.info.join("\n"))
-                    .wrap(Wrap { trim: false })
-                    .block(Block::bordered().title(" Status ")),
-                body,
-            );
-            "u: refresh"
+            let files = if b.paths.is_empty() {
+                "nothing chosen yet".to_string()
+            } else {
+                b.paths.iter().map(|p| tilde(&p.display().to_string())).collect::<Vec<_>>().join(", ")
+            };
+            let mut dests = vec![Span::styled("  Destinations  ", dim)];
+            let list: Vec<_> = self.cfg.friends.iter().filter(|x| b.sends_to(x)).collect();
+            if list.is_empty() {
+                dests.push(Span::raw("none yet"));
+            }
+            for x in list {
+                let d =
+                    o.and_then(|o| o["dests"].as_array()).and_then(|a| a.iter().find(|d| d["name"] == x.name.as_str()));
+                let last = d.and_then(|d| d["last"].as_i64());
+                // When the daemon will next send to this destination, if anything is waiting.
+                let next = match d {
+                    Some(d) if d["held"].as_bool() == Some(true) => ", next: held".to_string(),
+                    Some(d) => match d["next"].as_i64() {
+                        Some(t) => format!(", next {}", until(t)),
+                        None if last.is_some() => ", up to date".to_string(),
+                        None => String::new(),
+                    },
+                    None => String::new(),
+                };
+                let (dot, color) = self.dest_state(&x.name);
+                let stale = last.is_none_or(|t| now - t > warn_secs);
+                dests.push(Span::styled(format!("{dot} "), Style::new().fg(color)));
+                dests.push(Span::raw(x.name.clone()));
+                dests.push(Span::styled(
+                    format!(" {}{next}    ", ago(last)),
+                    if stale && !b.paths.is_empty() { Style::new().fg(Color::Yellow) } else { dim },
+                ));
+            }
+            let pace = if b.every_minutes > 0 {
+                format!("every {} min", b.every_minutes)
+            } else {
+                "each destination's own pace".into()
+            };
+            let hours = if b.hours.is_empty() { "general hours".to_string() } else { format!("hours {}", b.hours) };
+            let keep = match &b.retention {
+                Some(r) if r.max_versions > 0 || r.keep_days > 0 => {
+                    format!("own history rules (versions {}, days {})", r.max_versions, r.keep_days)
+                }
+                _ => "general history rules".into(),
+            };
+            items.push(ListItem::new(Text::from(vec![
+                Line::from(head),
+                Line::from(vec![Span::styled("  Files         ", dim), Span::raw(files)]),
+                Line::from(dests),
+                Line::from(vec![
+                    Span::styled("  Schedule      ", dim),
+                    Span::raw(format!("{pace} · {hours} · {keep}")),
+                ]),
+            ])));
+        }
+        items.push(ListItem::new(Line::styled("+ New backup set", Style::new().fg(Color::Green))));
+        if self.sets.selected().is_none() {
+            self.sets.select(Some(0));
+        }
+        let block = Block::bordered().title(" Backup sets ").border_style(focus);
+        f.render_stateful_widget(Self::cards(items, block, hl != Style::new()), body, &mut self.sets);
+    }
+
+    fn draw_files(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
+        let items: Vec<ListItem> = self
+            .folders
+            .rows
+            .iter()
+            .map(|r| {
+                let (mark, color) = self.folder_mark(&r.path);
+                let arrow = if !r.dir {
+                    " "
+                } else if r.open {
+                    "v"
+                } else {
+                    ">"
+                };
+                let other = self.other_set(&r.path).map(|o| format!("   (in set {o})")).unwrap_or_default();
+                // Search results lead with the name and say where it is.
+                let label = if !self.folder_filter.is_empty() && r.depth == 0 {
+                    let dir = Path::new(&r.path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                    format!("{}{}   in {}", name(&r.path), if r.dir { "/" } else { "" }, tilde(&dir))
+                } else {
+                    format!("{}{}", name(&r.path), if r.dir { "/" } else { "" })
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(mark, Style::new().fg(color)),
+                    Span::raw(format!(" {}{arrow} {label}", "  ".repeat(r.depth))),
+                    Span::styled(other, Style::new().fg(Color::DarkGray)),
+                ]))
+            })
+            .collect();
+        let mut title = format!(" Backup > {} > Files: {} ", self.set, tilde(&self.root));
+        if !self.folder_filter.is_empty() {
+            title += &format!("| {} matching \"{}\" ", self.folders.rows.len(), self.folder_filter);
+        }
+        let block = Block::bordered().title(title).border_style(focus);
+        f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, &mut self.folders.st);
+    }
+
+    fn draw_set_dests(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
+        let b = self.cur_set();
+        let items: Vec<ListItem> = self
+            .cfg
+            .friends
+            .iter()
+            .map(|x| {
+                let mark =
+                    if b.sends_to(x) { Span::styled("[x]", Style::new().fg(Color::Green)) } else { Span::raw("[ ]") };
+                let kind = if x.path.is_some() { "drive " } else { "friend" };
+                let (dot, color) = self.dest_state(&x.name);
+                ListItem::new(Line::from(vec![
+                    mark,
+                    Span::styled(format!(" {dot} "), Style::new().fg(color)),
+                    Span::raw(format!("{:<20} {kind}   every {} min", x.name, b.interval_secs(x, &self.cfg) / 60)),
+                ]))
+            })
+            .collect();
+        let title = format!(" Backup > {} > Destinations ", self.set);
+        let block = Block::bordered().title(title).border_style(focus);
+        if items.is_empty() {
+            let text = "No destinations yet. Go to Destinations in the menu to invite a friend or add a drive.";
+            f.render_widget(Paragraph::new(text).block(block), area);
         } else {
-            keys
+            if self.set_dests.selected().is_none() {
+                self.set_dests.select(Some(0));
+            }
+            f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, &mut self.set_dests);
+        }
+    }
+
+    fn draw_values(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
+        let (rows, title): (&[(&str, &str)], String) = if self.page == SETTINGS {
+            (&GENERAL, " Defaults: backup sets can override ".into())
+        } else {
+            (&RULES, format!(" Backup > {} > Schedule and history rules ", self.set))
         };
-        let footer = format!("{keys}   b: back up now   tab: next page   q: quit");
+        let items: Vec<ListItem> =
+            rows.iter().map(|(k, label)| ListItem::new(format!("{:>18}   {label}", self.setting_text(k)))).collect();
+        let st = if self.page == SETTINGS { &mut self.settings } else { &mut self.rules };
+        if st.selected().is_none() {
+            st.select(Some(0));
+        }
+        let block = Block::bordered().title(title).border_style(focus);
+        f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, st);
+    }
+
+    fn draw_dests(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
+        let dim = Style::new().fg(Color::DarkGray);
+        let mut items: Vec<ListItem> = vec![];
+        for x in &self.cfg.friends {
+            let o = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == x.name.as_str()));
+            let get = |k: &str| o.map(|o| o[k].clone()).unwrap_or(Value::Null);
+            let (dot, color) = self.dest_state(&x.name);
+            let state = get("state").as_str().unwrap_or("checking").to_string();
+            let link = get("link").as_str().map(|l| format!(", {l}")).unwrap_or_default();
+            let link = match get("version").as_str() {
+                Some(v) => format!("{link}, version {v}"),
+                None if x.path.is_none() && get("state") == "online" => format!("{link}, older version"),
+                None => link,
+            };
+            let there = match (get("used_there").as_u64(), get("quota_there").as_u64()) {
+                (Some(u), Some(q)) => format!("you use {} of {} there", human(u), human(q)),
+                (Some(u), None) => format!("you use {} there", human(u)),
+                _ => String::new(),
+            };
+            let off = if x.backup_to { "" } else { "   NOT IN USE" };
+            let head = Line::from(vec![
+                Span::styled(format!("{dot} "), Style::new().fg(color)),
+                Span::styled(format!("{:<18}", x.name), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{}   {state}{link}", if x.path.is_some() { "drive " } else { "friend" })),
+                Span::styled(off, Style::new().fg(Color::Yellow)),
+            ]);
+            let second = match &x.path {
+                Some(p) => format!("    {}   {there}", p.display()),
+                None => format!(
+                    "    {there}   they use {} of {} GB here{}, last backup from them {}",
+                    human(get("used_here").as_u64().unwrap_or(0)),
+                    x.quota_gb,
+                    if x.max_in_kbps > 0 { format!(" at up to {} KB/s", x.max_in_kbps) } else { String::new() },
+                    ago(get("last_in").as_i64())
+                ),
+            };
+            let third = format!(
+                "    automatic backups every {} min, last sent {}",
+                x.interval_secs(&self.cfg) / 60,
+                ago(get("last_out").as_i64())
+            );
+            items.push(ListItem::new(Text::from(vec![head, Line::raw(second), Line::styled(third, dim)])));
+        }
+        let block = Block::bordered().title(" Destinations: friends' computers and local drives ").border_style(focus);
+        if items.is_empty() {
+            let text = "No destinations yet.\n\n  i  invite a friend (you send them a one-time code)\n  a  accept an invite a friend sent you\n  d  add a local drive or folder";
+            f.render_widget(Paragraph::new(text).block(block), area);
+        } else {
+            if self.dests.selected().is_none() {
+                self.dests.select(Some(0));
+            }
+            f.render_stateful_widget(Self::cards(items, block, hl != Style::new()), area, &mut self.dests);
+        }
+    }
+
+    fn draw_restore(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
+        let sets = self.cfg.sets.len();
+        let rv = &mut self.restore;
+        let mut title = match rv.snaps.get(rv.cur) {
+            Some(s) => format!(
+                " Files as of {}{} ({} files, {}){} ",
+                when(s.time),
+                s.tag.as_ref().map(|t| format!(" \"{t}\"")).unwrap_or_default(),
+                s.files,
+                human(s.bytes),
+                if rv.at_latest() { ", latest" } else { "" }
+            ),
+            None => " Restore ".into(),
+        };
+        title += &match &self.source {
+            Some(n) => format!("| {n} only "),
+            None => "| all destinations ".into(),
+        };
+        if sets > 1 {
+            title += &format!("| set {} ", self.rset.as_deref().unwrap_or("?"));
+        }
+        if !rv.filter.is_empty() {
+            title += &format!("| {} matching \"{}\" ", rv.tree.rows.len(), rv.filter);
+        }
+        if rv.snaps.is_empty() {
+            let text = if self.busy.is_some() {
+                "Looking up restore points..."
+            } else {
+                "No restore points found yet (or no destination is reachable). Press u to look again."
+            };
+            f.render_widget(Paragraph::new(text).block(Block::bordered().title(title).border_style(focus)), area);
+            return;
+        }
+        let [left, right] = Layout::horizontal([Constraint::Min(30), Constraint::Length(44)]).areas(area);
+        let items: Vec<ListItem> = rv
+            .tree
+            .rows
+            .iter()
+            .map(|r| {
+                let mark = if rv.picked.contains(&r.path) {
+                    Span::styled("[x]", Style::new().fg(Color::Green))
+                } else if rv.picked.iter().any(|p| Path::new(p).starts_with(&r.path)) {
+                    Span::styled("[o]", Style::new().fg(Color::Cyan))
+                } else if rv.picked.iter().any(|p| Path::new(&r.path).starts_with(p)) {
+                    Span::styled("[+]", Style::new().fg(Color::Green))
+                } else {
+                    Span::raw("[ ]")
+                };
+                let arrow = if !r.dir {
+                    " "
+                } else if r.open {
+                    "v"
+                } else {
+                    ">"
+                };
+                let found = !rv.filter.is_empty() && r.depth == 0;
+                let label = if r.depth > 0 {
+                    name(&r.path)
+                } else if found {
+                    // Search results lead with the name so it is never cut off.
+                    let dir = Path::new(&r.path).parent().map(|p| p.to_string_lossy().into_owned());
+                    format!("{}   in {}", name(&r.path), tilde(&dir.unwrap_or_default()))
+                } else {
+                    tilde(&r.path)
+                };
+                let size = if r.dir || found { String::new() } else { format!("  {}", human(r.size)) };
+                let slash = if r.dir && !found { "/" } else { "" };
+                let mut spans = vec![mark, Span::raw(format!(" {}{arrow} {label}{slash}{size}", "  ".repeat(r.depth)))];
+                if let Some((text, color)) = rv.marker(r) {
+                    spans.push(Span::styled(format!("  {text}"), Style::new().fg(color)));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let none = Style::new();
+        let block = Block::bordered().title(title).border_style(if rv.timeline { none } else { focus });
+        f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), left, &mut rv.tree.st);
+        let times: Vec<ListItem> = rv
+            .snaps
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, s)| {
+                let here = if i == rv.cur { ">" } else { " " };
+                let tag = s.tag.as_ref().map(|t| format!(" {t}")).unwrap_or_default();
+                let line = format!("{here} {}{tag}  {}", when(s.time), s.at.join(", "));
+                ListItem::new(if i == rv.cur {
+                    Line::styled(line, Style::new().fg(Color::Green))
+                } else {
+                    Line::raw(line)
+                })
+            })
+            .collect();
+        let block = Block::bordered()
+            .title(format!(" Timeline ({}), stored on ", rv.snaps.len()))
+            .border_style(if rv.timeline { focus } else { none });
+        let mut list = List::new(times).block(block);
+        if rv.timeline {
+            list = list.highlight_style(hl);
+        }
+        f.render_stateful_widget(list, right, &mut rv.tl);
+    }
+
+    fn draw_text(&mut self, f: &mut Frame, area: Rect, focus: Style) {
+        let title = if self.page == HISTORY { " History: what the daemon has done, newest last " } else { " Status " };
+        let inner = area.height.saturating_sub(2) as usize;
+        let lines: Vec<Line> = if self.page == HISTORY {
+            // Newest at the bottom; scrolling up goes back in time.
+            let end = self.text.len().saturating_sub(self.scroll.min(self.text.len().saturating_sub(inner)));
+            self.text[end.saturating_sub(inner)..end].iter().map(|l| Line::raw(l.clone())).collect()
+        } else {
+            self.text
+                .iter()
+                .map(|l| {
+                    if l.starts_with("WARNING") {
+                        Line::styled(l.clone(), Style::new().fg(Color::Red))
+                    } else {
+                        Line::raw(l.clone())
+                    }
+                })
+                .collect()
+        };
+        f.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(title).border_style(focus)),
+            area,
+        );
+    }
+
+    fn draw(&mut self, f: &mut Frame) {
+        let [main, help] = Layout::vertical([Constraint::Min(5), Constraint::Length(4)]).areas(f.area());
+        let [side, body] = Layout::horizontal([Constraint::Length(36), Constraint::Min(40)]).areas(main);
+        let on = Style::new().fg(Color::Yellow);
+        let (menu_focus, page_focus) = if self.in_menu { (on, Style::new()) } else { (Style::new(), on) };
+        let hl = Style::new().add_modifier(Modifier::REVERSED);
+
+        // The menu: the level we are in, with the path to it as the title.
+        let (kind, sel) = self.stack.last().cloned().expect("the root level is never removed");
+        let warn = self.ov["warnings"].as_array().is_some_and(|a| !a.is_empty());
+        let rows: Vec<ListItem> = self
+            .items(&kind)
+            .into_iter()
+            .map(|(label, choice)| {
+                let more = if matches!(choice, Choice::Open(_)) { " >" } else { "" };
+                let flag = if kind == Kind::Root && label == "Backup" && warn { " !" } else { "" };
+                ListItem::new(format!(" {label}{flag}{more}"))
+            })
+            .collect();
+        let crumbs: Vec<String> = self
+            .stack
+            .iter()
+            .skip(1)
+            .map(|(k, _)| match k {
+                Kind::Root => String::new(),
+                Kind::Backup => "Backup".into(),
+                Kind::Set(n) | Kind::Dest(n) => n.clone(),
+                Kind::Rules(_) => "Schedule".into(),
+                Kind::Restore => "Restore".into(),
+                Kind::Dests => "Destinations".into(),
+                Kind::Settings => "Settings".into(),
+            })
+            .collect();
+        let title = if crumbs.is_empty() {
+            format!(
+                " {} · sdb {} ",
+                self.ov["name"].as_str().unwrap_or(&self.cfg.name),
+                self.ov["version"].as_str().unwrap_or(crate::net::VERSION)
+            )
+        } else {
+            format!(" {} ", crumbs.join(" > "))
+        };
+        let mut st = ListState::default();
+        st.select(Some(sel));
+        let dim = Style::new().add_modifier(Modifier::BOLD);
+        let menu = List::new(rows)
+            .block(Block::bordered().title(title).border_style(menu_focus))
+            .highlight_style(if self.in_menu { hl } else { dim });
+        f.render_stateful_widget(menu, side, &mut st);
+
+        // At the top level the right side is a preview, so nothing in it is highlighted.
+        let row_hl = if kind == Kind::Root { Style::new() } else { hl };
+        match (self.page, &self.sub) {
+            (BACKUP, Sub::Sets) => self.draw_sets(f, body, page_focus, row_hl),
+            (BACKUP, Sub::Files) => self.draw_files(f, body, page_focus, if self.in_menu { Style::new() } else { hl }),
+            (BACKUP, Sub::Dests) => {
+                self.draw_set_dests(f, body, page_focus, if self.in_menu { Style::new() } else { hl })
+            }
+            (BACKUP, Sub::Rules) | (SETTINGS, _) => self.draw_values(f, body, page_focus, row_hl),
+            (RESTORE, _) => self.draw_restore(f, body, page_focus, if self.in_menu { Style::new() } else { hl }),
+            (DESTS, _) => self.draw_dests(f, body, page_focus, row_hl),
+            _ => self.draw_text(f, body, page_focus),
+        }
+
+        let keys = if self.in_menu {
+            "up/down: move   enter: choose   esc: back   q: quit"
+        } else {
+            match (self.page, &self.sub) {
+                (BACKUP, Sub::Files) => {
+                    "space: back up or stop   /: search   [x] chosen  [+] inside a chosen folder  [o] has chosen items inside  [-] left out   right/left: open/close   esc: done"
+                }
+                (BACKUP, Sub::Dests) => "space: send this set here or stop   esc: done",
+                (RESTORE, _) if self.restore.timeline => {
+                    "up/down: move through time   enter: show files as they were then   esc: back to the menu"
+                }
+                (RESTORE, _) => {
+                    "space: pick for restore   /: search   [x] picked  [o] has picked items inside   right/left: open/close a folder   esc: back to the menu"
+                }
+                _ => "up/down: scroll   esc: back to the menu",
+            }
+        };
         let title = match &self.busy {
             Some(b) => format!(
                 " {} {b}... {} ",
@@ -1698,72 +1964,54 @@ impl App {
             ),
             None => format!(" {} ", self.status),
         };
-        let style = if self.busy.is_some() {
-            Style::new().fg(Color::Yellow)
-        } else {
-            Style::new()
-        };
+        let style = if self.busy.is_some() { on } else { Style::new() };
         f.render_widget(
-            Paragraph::new(footer).block(Block::bordered().title(title).border_style(style)),
+            Paragraph::new(keys).wrap(Wrap { trim: true }).block(Block::bordered().title(title).border_style(style)),
             help,
         );
 
         if let Some((prompt, text)) = &self.input {
             let title = match prompt {
-                Prompt::NewSet => " Name for the new backup set ",
-                Prompt::Filter => {
-                    " Show only names containing (arrows or Enter: use the list, Esc: clear) "
+                Prompt::NewSet => " Name for the new backup set ".to_string(),
+                Prompt::RenameSet(n) => format!(" New name for set \"{n}\" "),
+                Prompt::DeleteSet(n) => format!(" Type yes to delete set \"{n}\" (its restore points stay) "),
+                Prompt::Filter | Prompt::FolderFilter => {
+                    " Show only names containing (arrows or Enter: go to the list, Esc: clear) ".into()
                 }
-                Prompt::Drive => {
-                    " Folder on the drive to back up into (Enter adds it, Esc cancels) "
-                }
-                Prompt::Every(_) => {
-                    " Send automatic backups here at most every how many minutes? (0 = default) "
-                }
-                Prompt::Remove(_) => {
-                    " Type yes to remove this destination (data already stored is left in place) "
-                }
+                Prompt::Drive => " Folder on the drive to back up into ".into(),
+                Prompt::Every(n) => format!(" Minutes between automatic backups to {n} (0 = default) "),
+                Prompt::Quota(n) => format!(" GB that {n} may store on this computer "),
+                Prompt::InLimit(n) => format!(" Fastest {n} may send backups here, in KB/s (0 = unlimited) "),
+                Prompt::Remove(n) => format!(" Type yes to remove {n} (data already stored is left in place) "),
                 Prompt::Setting("hours") | Prompt::Setting("set-hours") => {
-                    " Backup hours, such as 22-7, or 'always' "
+                    " Backup hours, such as 22-7, or 'always' ".into()
                 }
-                Prompt::Setting("pause") => {
-                    " Pause for how many hours? (blank = until resumed, 0 = resume) "
-                }
-                Prompt::Setting(_) => " New value ",
-                Prompt::Join => " Paste the invite, then Enter (Esc cancels) ",
-                Prompt::RestoreTo => " Restore into which folder? Enter to start (Esc cancels) ",
-                Prompt::Date => " Go back to which date? e.g. 2026-11-20 or 2026-11-20 14:30 ",
+                Prompt::Setting("pause") => " Pause for how many hours? (blank = until resumed, 0 = resume) ".into(),
+                Prompt::Setting(_) => " New value ".into(),
+                Prompt::Join => " Paste the invite, then Enter ".into(),
+                Prompt::RestoreTo => " Restore into which folder? ".into(),
+                Prompt::Date => " Go back to which date? e.g. 2026-11-20 or 2026-11-20 14:30 ".into(),
             };
-            let area = if matches!(prompt, Prompt::Filter) {
-                Rect::new(
-                    body.x + 2,
-                    body.y + body.height.saturating_sub(4),
-                    body.width.saturating_sub(40).max(20),
-                    3,
-                )
+            let area = if matches!(prompt, Prompt::Filter | Prompt::FolderFilter) {
+                Rect::new(body.x + 2, body.y + body.height.saturating_sub(4), body.width.saturating_sub(4).min(78), 3)
             } else {
-                centered(f.area(), 80, 5)
+                centered(f.area(), 84, 5)
             };
             f.render_widget(Clear, area);
             f.render_widget(
-                Paragraph::new(format!("{text}_"))
-                    .wrap(Wrap { trim: false })
-                    .block(Block::bordered().title(title)),
+                Paragraph::new(format!("{text}_")).wrap(Wrap { trim: false }).block(Block::bordered().title(title)),
                 area,
             );
         }
         if let Some((list, st)) = &mut self.versions {
             let area = centered(f.area(), 84, (list.len() as u16 + 2).clamp(4, 20));
             f.render_widget(Clear, area);
-            let items: Vec<ListItem> = list
-                .iter()
-                .map(|(_, l)| ListItem::new(l.as_str()))
-                .collect();
+            let items: Vec<ListItem> = list.iter().map(|(_, l)| ListItem::new(l.as_str())).collect();
             let block = Block::bordered().title(" Versions: enter = go to that time, esc = close ");
             f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, st);
         }
         if let Some(lines) = &self.popup {
-            let area = centered(f.area(), 90, (lines.len() as u16 + 4).clamp(6, 20));
+            let area = centered(f.area(), 96, (lines.len() as u16 + 4).clamp(6, 20));
             f.render_widget(Clear, area);
             f.render_widget(
                 Paragraph::new(lines.join("\n"))
@@ -1778,12 +2026,7 @@ impl App {
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width.saturating_sub(2));
     let h = height.min(area.height.saturating_sub(2));
-    Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    )
+    Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
 }
 
 async fn event_loop(
@@ -1791,7 +2034,7 @@ async fn event_loop(
     term: &mut DefaultTerminal,
     mut done_rx: mpsc::UnboundedReceiver<Done>,
     mut progress_rx: mpsc::UnboundedReceiver<String>,
-    mut info_rx: mpsc::UnboundedReceiver<Vec<String>>,
+    mut found_rx: mpsc::UnboundedReceiver<(u64, Vec<Item>)>,
 ) -> Result<()> {
     // Keys are read on their own thread so the screen keeps updating while work runs.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel();
@@ -1802,7 +2045,23 @@ async fn event_loop(
             }
         }
     });
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(150));
+    let (text_tx, mut text_rx) = mpsc::unbounded_channel::<(usize, Vec<String>)>();
+    let (ov_tx, mut ov_rx) = mpsc::unbounded_channel::<Value>();
+    // The home screen stays current by asking the daemon for its overview every few seconds.
+    let ex = app.exec.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Ok(l) = ex.call(Cmd::Overview).await {
+                if let Some(v) = l.first().and_then(|s| serde_json::from_str(s).ok()) {
+                    if ov_tx.send(v).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut tick = tokio::time::interval(Duration::from_millis(150));
     loop {
         term.draw(|f| app.draw(f))?;
         tokio::select! {
@@ -1826,56 +2085,78 @@ async fn event_loop(
             }
             Some(done) = done_rx.recv() => {
                 app.finish(done).await;
+                app.sync();
                 app.kick();
             }
             Some(line) = progress_rx.recv() => app.progress = line,
-            Some(lines) = info_rx.recv() => app.info = lines,
+            Some(v) = ov_rx.recv() => app.ov = v,
+            Some((search, items)) = found_rx.recv() => {
+                // Only the newest search may fill the list.
+                if search == app.folder_search && !app.folder_filter.is_empty() {
+                    app.folders.reset(items);
+                }
+            }
+            Some((page, lines)) = text_rx.recv() => {
+                if page == app.page {
+                    app.text = lines;
+                }
+            }
             _ = tick.tick() => {
                 app.spin += 1;
-                // The Status page keeps itself current while it is on screen.
-                if app.tab == 4 && app.info_loaded && app.info_at.elapsed().as_secs() >= 10 {
-                    app.load_info();
+                // History and Status keep themselves current while on screen.
+                if (app.page == HISTORY || app.page == STATUS) && app.text_at.elapsed() >= Duration::from_secs(5) {
+                    app.load_text(&text_tx);
                 }
             }
         }
     }
 }
 
-pub async fn run(exec: Exec) -> Result<()> {
+pub async fn run(home: PathBuf) -> Result<()> {
+    let (found_tx, found_rx) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = mpsc::unbounded_channel();
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-    let (info_tx, info_rx) = mpsc::unbounded_channel();
     let mut app = App {
-        exec: Arc::new(exec),
+        exec: Arc::new(Exec(home)),
         done_tx,
         progress_tx,
-        info_tx,
         busy: None,
         progress: String::new(),
         spin: 0,
         cfg: Config::new(String::new()),
-        tab: 0,
+        ov: Value::Null,
+        stack: vec![(Kind::Root, 0)],
+        page: BACKUP,
+        in_menu: true,
+        sub: Sub::Sets,
+        set: DEFAULT_SET.into(),
+        sets: ListState::default(),
         root: String::new(),
         hidden: false,
         folders: Tree::default(),
-        friends: ListState::default(),
+        folder_filter: String::new(),
+        folder_search: 0,
+        found_tx,
+        set_dests: ListState::default(),
+        rules: ListState::default(),
+        dests: ListState::default(),
         settings: ListState::default(),
         restore: RestoreView::default(),
+        source: None,
+        rset: None,
+        text: vec![],
+        text_at: Instant::now() - Duration::from_secs(3600),
+        scroll: 0,
         input: None,
         popup: None,
         versions: None,
-        source: None,
-        set: DEFAULT_SET.into(),
-        rset: None,
-        info: vec![],
-        info_loaded: false,
-        info_at: std::time::Instant::now(),
         status: String::new(),
     };
     app.reload().await;
+    app.sync();
     app.set_root(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
     let mut term = ratatui::init();
-    let res = event_loop(&mut app, &mut term, done_rx, progress_rx, info_rx).await;
+    let res = event_loop(&mut app, &mut term, done_rx, progress_rx, found_rx).await;
     ratatui::restore();
     res
 }

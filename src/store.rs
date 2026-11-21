@@ -61,11 +61,7 @@ impl Store {
         if fs::create_dir_all(&root).is_ok() {
             let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
         }
-        Store {
-            root,
-            min_free,
-            usage: Mutex::new(HashMap::new()),
-        }
+        Store { root, min_free, usage: Mutex::new(HashMap::new()) }
     }
 
     fn chunk_path(&self, owner: &str, id: &Id) -> PathBuf {
@@ -80,9 +76,7 @@ impl Store {
     pub fn usage(&self, owner: &str) -> Result<u64> {
         check_owner(owner)?;
         let mut u = self.usage.lock().unwrap();
-        Ok(*u
-            .entry(owner.to_string())
-            .or_insert_with(|| dir_size(&self.root.join(owner))))
+        Ok(*u.entry(owner.to_string()).or_insert_with(|| dir_size(&self.root.join(owner))))
     }
 
     fn adjust(&self, owner: &str, delta: i64) {
@@ -97,9 +91,7 @@ impl Store {
         if self.usage(owner)? - old.min(self.usage(owner)?) + new > quota {
             bail!("storage quota exceeded ({} GB)", quota >> 30);
         }
-        if self.min_free > 0
-            && fs2::available_space(&self.root).is_ok_and(|free| free < self.min_free + new)
-        {
+        if self.min_free > 0 && fs2::available_space(&self.root).is_ok_and(|free| free < self.min_free + new) {
             bail!("this computer is too low on disk space to accept more backups");
         }
         fs::create_dir_all(path.parent().unwrap())?;
@@ -147,11 +139,8 @@ impl Store {
     /// Re-reads everything friends store here and removes chunks that no longer match their checksum.
     pub fn scrub(&self) -> (u64, u64) {
         let (mut checked, mut bad) = (0, 0);
-        for e in walkdir::WalkDir::new(&self.root)
-            .min_depth(4)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.file_type().is_file())
+        for e in
+            walkdir::WalkDir::new(&self.root).min_depth(4).into_iter().flatten().filter(|e| e.file_type().is_file())
         {
             let Ok(buf) = fs::read(e.path()) else {
                 continue;
@@ -191,12 +180,7 @@ impl Store {
     pub fn put_snapshot(&self, owner: &str, id: &str, data: &[u8], quota: u64) -> Result<()> {
         check_snap(id)?;
         let path = self.snap_dir(owner).join(id);
-        if !path.exists()
-            && fs::read_dir(self.snap_dir(owner))
-                .map(|d| d.count())
-                .unwrap_or(0)
-                >= MAX_SNAPSHOTS
-        {
+        if !path.exists() && fs::read_dir(self.snap_dir(owner)).map(|d| d.count()).unwrap_or(0) >= MAX_SNAPSHOTS {
             bail!("too many restore points stored here; prune some first");
         }
         self.write(owner, &path, data, quota)
@@ -261,10 +245,8 @@ mod tests {
     #[test]
     fn chunks_round_trip_and_list() {
         let (s, dir) = store(0);
-        s.put_chunk(OWNER, &[1; 32], b"ciphertext", 1 << 20)
-            .unwrap();
-        s.put_chunk(OWNER, &[1; 32], b"ignored: already stored", 1 << 20)
-            .unwrap();
+        s.put_chunk(OWNER, &[1; 32], b"ciphertext", 1 << 20).unwrap();
+        s.put_chunk(OWNER, &[1; 32], b"ignored: already stored", 1 << 20).unwrap();
         assert_eq!(s.get_chunk(OWNER, &[1; 32]).unwrap(), b"ciphertext");
         assert_eq!(s.list_chunks(OWNER), vec![[1u8; 32]]);
         assert!(s.get_chunk(OWNER, &[2; 32]).is_none());
@@ -285,15 +267,8 @@ mod tests {
             raw[500] ^= 0xff;
             fs::write(&path, raw).unwrap();
         }
-        assert!(
-            s.get_chunk(OWNER, &[3; 32]).is_none(),
-            "a damaged chunk must not be served"
-        );
-        assert_eq!(
-            s.list_chunks(OWNER),
-            vec![[4u8; 32]],
-            "and it is removed so the owner sees it missing"
-        );
+        assert!(s.get_chunk(OWNER, &[3; 32]).is_none(), "a damaged chunk must not be served");
+        assert_eq!(s.list_chunks(OWNER), vec![[4u8; 32]], "and it is removed so the owner sees it missing");
         assert_eq!(s.scrub(), (1, 1));
         assert!(s.list_chunks(OWNER).is_empty());
         fs::remove_dir_all(dir).unwrap();
@@ -305,10 +280,7 @@ mod tests {
         s.put_chunk(OWNER, &[1; 32], b"x", 8192).unwrap();
         s.put_chunk(OWNER, &[2; 32], b"y", 8192).unwrap();
         assert_eq!(s.usage(OWNER).unwrap(), 8192);
-        let err = s
-            .put_chunk(OWNER, &[3; 32], b"z", 8192)
-            .unwrap_err()
-            .to_string();
+        let err = s.put_chunk(OWNER, &[3; 32], b"z", 8192).unwrap_err().to_string();
         assert!(err.contains("quota exceeded"), "{err}");
         s.delete_chunks(OWNER, &[[1; 32]]);
         s.put_chunk(OWNER, &[3; 32], b"z", 8192).unwrap();
@@ -324,18 +296,11 @@ mod tests {
         assert!(s.usage("short").is_err());
         assert!(check_owner(OWNER).is_ok());
         for bad in ["../x", "a/b", "", "zz", &"a".repeat(65)] {
-            assert!(
-                s.put_snapshot(OWNER, bad, b"m", 1 << 20).is_err(),
-                "{bad:?}"
-            );
+            assert!(s.put_snapshot(OWNER, bad, b"m", 1 << 20).is_err(), "{bad:?}");
             assert!(s.delete_snapshot(OWNER, bad).is_err(), "{bad:?}");
         }
-        s.put_snapshot(OWNER, "abc123", b"manifest", 1 << 20)
-            .unwrap();
-        assert_eq!(
-            s.list_snapshots(OWNER),
-            vec![("abc123".to_string(), b"manifest".to_vec())]
-        );
+        s.put_snapshot(OWNER, "abc123", b"manifest", 1 << 20).unwrap();
+        assert_eq!(s.list_snapshots(OWNER), vec![("abc123".to_string(), b"manifest".to_vec())]);
         assert!(s.last_snapshot(OWNER).is_some());
         s.delete_snapshot(OWNER, "abc123").unwrap();
         assert!(s.list_snapshots(OWNER).is_empty());
@@ -345,10 +310,7 @@ mod tests {
     #[test]
     fn low_disk_space_refuses_writes() {
         let (s, dir) = store(u64::MAX / 2);
-        let err = s
-            .put_chunk(OWNER, &[1; 32], b"x", 1 << 30)
-            .unwrap_err()
-            .to_string();
+        let err = s.put_chunk(OWNER, &[1; 32], b"x", 1 << 30).unwrap_err().to_string();
         assert!(err.contains("low on disk space"), "{err}");
         fs::remove_dir_all(dir).unwrap();
     }
