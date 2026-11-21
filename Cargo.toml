@@ -2,6 +2,9 @@
 name = "super-duper-backup"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "Encrypted, deduplicated backups between friends"
+repository = "https://github.com/awick/super-duper-backup"
 
 [dependencies]
 anyhow = "1.0.104"

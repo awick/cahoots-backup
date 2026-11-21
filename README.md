@@ -191,3 +191,7 @@ it with `store_dir`), `cache/`.
   one friend and run `sdb verify` occasionally.
 - On macOS the binary needs Full Disk Access to read Documents, Desktop and
   Downloads when run by launchd.
+
+## License
+
+Copyright Andy Wick. Licensed under the [Apache License, Version 2.0](LICENSE).
