@@ -158,6 +158,12 @@ impl Node {
             out.say("friends:  cannot back up to this computer (sdb accept on to allow it)");
         }
         out.say(format!("recovery kit: {}", crate::recovery::state(&self.home, &c).describe().0));
+        if let Some(c) = crate::recovery::copy_load(&self.home) {
+            out.say(match c.error {
+                Some(e) => format!("              the copy in {} is failing: {e}", c.folder.display()),
+                None => format!("              a copy is kept in {}, last written {}", c.folder.display(), when(c.at)),
+            });
+        }
         out.say("backing up:");
         for b in &c.sets {
             if c.sets.len() > 1 || !b.destinations.is_empty() || b.every_minutes > 0 || !b.hours.is_empty() {
@@ -911,6 +917,36 @@ impl Node {
             (_, Some(true)) => out.say("friends can back up to this computer again"),
             _ => out.say("saved"),
         }
+        Ok(())
+    }
+
+    pub(super) async fn kit_copy_on(&self, pass: Secret, folder: PathBuf, out: &Out) -> Result<()> {
+        let (home, dir) = (self.home.clone(), folder.clone());
+        // Making the key from the passphrase is slow on purpose.
+        tokio::task::spawn_blocking(move || crate::recovery::copy_on(&home, &pass.0, &dir)).await??;
+        out.say(format!(
+            "A copy of the recovery kit is now kept in {} and written again whenever it changes.",
+            folder.display()
+        ));
+        out.say("Recovering takes that file and the passphrase you just chose.");
+        Ok(())
+    }
+
+    pub(super) async fn kit_copy_off(&self, out: &Out) -> Result<()> {
+        if crate::recovery::copy_off(&self.home)? {
+            out.say("the recovery kit is no longer copied; what is in the folder stays there");
+        } else {
+            out.say("no copy was being kept");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn kit_copy_sync(&self, out: &Out) -> Result<()> {
+        let Some(c) = crate::recovery::copy_load(&self.home) else {
+            bail!("no copy is kept anywhere (sdb recovery copy-to FOLDER)");
+        };
+        crate::recovery::copy_sync(&self.home, true)?;
+        out.say(format!("the recovery kit in {} is up to date", c.folder.display()));
         Ok(())
     }
 

@@ -7,7 +7,7 @@
 use crate::{
     config::{BackupSet, Config, Friend, is_builtin_list, mbps, parse_mbps},
     control,
-    node::{CloudAdd, Cmd, SetEdit, Tune},
+    node::{CloudAdd, Cmd, Secret, SetEdit, Tune},
     snapshot::{human, when},
     tui::{Item, Listing, ago, list_dir, name, parse_listing, tilde, until},
 };
@@ -247,10 +247,11 @@ impl Gui {
             }
             "destinations" => self.page = Page::Destinations,
             "settings" => self.page = Page::Settings,
-            "kit" => {
+            "kit" | "kit-copy" => {
                 self.page = Page::Settings;
-                self.fields.insert("kit-pass".into(), "correct horse".into());
-                self.fields.insert("kit-again".into(), "correct horse".into());
+                let key = if show == "kit" { "kit" } else { "kc" };
+                self.fields.insert(format!("{key}-pass"), "correct horse".into());
+                self.fields.insert(format!("{key}-again"), String::new());
             }
             "history" | "status" => {
                 self.page = if show == "history" { Page::History } else { Page::Status };
@@ -533,8 +534,17 @@ impl Gui {
             self.edit = None;
         }
         let ctx = ui.ctx().clone();
-        for w in self.ov["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str()) {
-            ui.colored_label(RED, format!("! {w}"));
+        let warnings: Vec<String> =
+            self.ov["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str()).map(String::from).collect();
+        for w in warnings {
+            // What a terminal would be told to type is, in a window, a place to go.
+            let text = w.split_once(" (sdb ").map_or(w.as_str(), |(text, _)| text);
+            ui.horizontal(|ui| {
+                ui.colored_label(RED, format!("! {text}"));
+                if w.contains("recovery kit") && ui.link("Fix it in Settings").clicked() {
+                    self.page = Page::Settings;
+                }
+            });
         }
         if let Some(h) = self.ov["held"].as_str() {
             ui.colored_label(YELLOW, format!("Automatic backups are held: {h}"));
@@ -1763,6 +1773,7 @@ impl Gui {
                 if open {
                     self.kit_rows(ui);
                 }
+                self.kit_copy_rows(ui);
             });
             save |= save_button(ui, &v, &["name", "limit", "incoming"]);
         });
@@ -1889,33 +1900,53 @@ impl Gui {
         self.exclude_lists(ui);
     }
 
-    /// The passphrase, typed twice, and the button that writes the recovery kit to a file.
-    fn kit_rows(&mut self, ui: &mut egui::Ui) {
-        let mut pass = self.fields.get("kit-pass").cloned().unwrap_or_default();
-        let mut again = self.fields.get("kit-again").cloned().unwrap_or_default();
+    /// A new passphrase, typed twice, with a count of what has been typed, and the button that
+    /// goes ahead with it. Returns the passphrase when that button is clicked.
+    fn passphrase_rows(&mut self, ui: &mut egui::Ui, key: &str, button: &str, note: &str) -> Option<String> {
+        let (first, second) = (format!("{key}-pass"), format!("{key}-again"));
+        let mut pass = self.fields.get(&first).cloned().unwrap_or_default();
+        let mut again = self.fields.get(&second).cloned().unwrap_or_default();
         ui.weak("Passphrase");
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut pass).password(true).desired_width(200.0));
-            ui.weak("at least 8 characters; recovering takes the file and this passphrase");
+            let (n, min) = (pass.chars().count(), crate::recovery::MIN_PASSPHRASE);
+            if n < min {
+                ui.colored_label(YELLOW, format!("{n} of at least {min} characters"));
+            } else {
+                ui.colored_label(GREEN, format!("{n} characters"));
+            }
+            ui.weak("a sentence you will remember works well; only its length is checked");
         });
         ui.end_row();
         ui.weak("Again");
-        let mut write = false;
+        let mut go = false;
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut again).password(true).desired_width(200.0));
-            let ok = pass.len() >= 8 && pass == again;
-            write = ui.add_enabled(ok, egui::Button::new("Save the kit as...")).clicked();
+            let ok = crate::recovery::check_passphrase(&pass).is_ok() && pass == again;
+            go = ui.add_enabled(ok, egui::Button::new(button)).clicked();
             if !again.is_empty() && pass != again {
                 ui.colored_label(YELLOW, "the two do not match");
             } else {
-                ui.weak("keep the file somewhere other than this computer");
+                ui.weak(note);
             }
         });
         ui.end_row();
-        let picked = write.then(|| {
-            rfd::FileDialog::new().set_title("Save the recovery kit").set_file_name("sdb-recovery-kit.json").save_file()
-        });
-        if let Some(Some(file)) = picked {
+        self.fields.insert(first, pass.clone());
+        self.fields.insert(second, again);
+        go.then_some(pass)
+    }
+
+    /// Asks for a passphrase and where to save, and writes the recovery kit there.
+    fn kit_rows(&mut self, ui: &mut egui::Ui) {
+        let note = "keep the file somewhere other than this computer";
+        let Some(pass) = self.passphrase_rows(ui, "kit", "Save the kit as...", note) else { return };
+        let folder = crate::recovery::default_folder().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        let picked = rfd::FileDialog::new()
+            .set_title("Save the recovery kit")
+            .set_directory(folder.unwrap_or_else(|| PathBuf::from("/")))
+            .set_file_name(crate::recovery::file_name(&self.cfg.name))
+            .save_file();
+        if let Some(file) = picked {
             self.status = match crate::recovery::export(&self.home, &pass, &file) {
                 Ok(()) => format!(
                     "Recovery kit written to {}. Keep it and its passphrase somewhere other than this computer.",
@@ -1926,10 +1957,71 @@ impl Gui {
             self.fields.remove("kit-pass");
             self.fields.remove("kit-again");
             self.last_poll = Instant::now() - Duration::from_secs(10);
-            return;
         }
-        self.fields.insert("kit-pass".into(), pass);
-        self.fields.insert("kit-again".into(), again);
+    }
+
+    /// The optional copy of the recovery kit in a folder, such as one a cloud drive syncs:
+    /// where it is, and the buttons to start it, write it again or stop it.
+    fn kit_copy_rows(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let c = self.ov["kit_copy"].clone();
+        let open = self.fields.contains_key("kc-pass");
+        ui.weak("Kept in");
+        ui.horizontal(|ui| {
+            if let Some(folder) = c["folder"].as_str() {
+                // Short enough to leave room for the buttons; the whole path shows on hover.
+                let home = std::env::var("HOME").unwrap_or_default();
+                let mut short = match folder.strip_prefix(&home) {
+                    Some(rest) if !home.is_empty() => format!("~{rest}"),
+                    _ => folder.to_string(),
+                };
+                if short.chars().count() > 56 {
+                    let tail: String = short.chars().rev().take(52).collect::<Vec<_>>().into_iter().rev().collect();
+                    short = format!("...{tail}");
+                }
+                let said = match c["error"].as_str() {
+                    Some(e) => ui.colored_label(YELLOW, format!("{short}, but the copy is failing: {e}")),
+                    None => ui.colored_label(GREEN, format!("{short} · last written {}", ago(c["at"].as_i64()))),
+                };
+                said.on_hover_text(folder);
+                if ui.button("Write now").clicked() {
+                    self.save(&ctx, Cmd::KitCopySync);
+                }
+                if self.confirm(ui, "kit-copy-off", "Stop", "What is in the folder stays there") {
+                    self.save(&ctx, Cmd::KitCopyOff);
+                }
+            } else {
+                ui.weak(if cfg!(target_os = "macos") {
+                    "optional: a folder that syncs, such as Documents with iCloud Drive; sdb keeps the kit there up to date"
+                } else {
+                    "optional: a folder that a cloud drive syncs; sdb keeps the kit there up to date"
+                });
+                if ui.button(if open { "Cancel" } else { "Keep a copy..." }).clicked() {
+                    for k in ["kc-pass", "kc-again"] {
+                        if open {
+                            self.fields.remove(k);
+                        } else {
+                            self.fields.insert(k.into(), String::new());
+                        }
+                    }
+                }
+            }
+        });
+        ui.end_row();
+        if open && c["folder"].is_null() {
+            let note = "recovering takes the file in that folder and this passphrase";
+            let Some(pass) = self.passphrase_rows(ui, "kc", "Choose the folder...", note) else { return };
+            let mut dialog = rfd::FileDialog::new().set_title("Keep a copy of the recovery kit in");
+            if let Some(docs) = crate::recovery::default_folder() {
+                dialog = dialog.set_directory(docs);
+            }
+            let picked = dialog.pick_folder();
+            if let Some(folder) = picked {
+                self.fields.remove("kc-pass");
+                self.fields.remove("kc-again");
+                self.save(&ctx, Cmd::KitCopyOn { passphrase: Secret(pass), folder });
+            }
+        }
     }
 
     /// The exclusion lists: the built-in ones to read and copy, your own to change.

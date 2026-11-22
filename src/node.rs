@@ -89,6 +89,16 @@ pub struct CloudAdd {
     pub ca_pem: Option<String>,
 }
 
+/// Something typed in secret, such as a passphrase, on its way to the daemon.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 impl std::fmt::Debug for CloudAdd {
     /// The secret key stays out of anything that prints a command.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,6 +227,14 @@ pub enum Cmd {
     /// Ask the daemon to exit.
     Stop,
     Tune(Tune),
+    /// Keep a copy of the recovery kit in a folder, written again whenever it changes.
+    KitCopyOn {
+        passphrase: Secret,
+        folder: PathBuf,
+    },
+    KitCopyOff,
+    /// Write the copy now.
+    KitCopySync,
     DriveAdd {
         name: String,
         path: PathBuf,
@@ -1810,6 +1828,7 @@ impl Node {
             })
             .collect();
         let kit = crate::recovery::state(&self.home, &c).describe();
+        let copy = crate::recovery::copy_load(&self.home);
         json!({
             "name": c.name,
             "id": self.id(),
@@ -1817,6 +1836,12 @@ impl Node {
             "held": c.held(),
             "limit": c.upload_kbps,
             "kit": { "text": kit.0, "act": kit.1 },
+            "kit_copy": {
+                "on": copy.is_some(),
+                "folder": copy.as_ref().map(|c| c.folder.display().to_string()),
+                "at": copy.as_ref().map(|c| c.at),
+                "error": copy.as_ref().and_then(|c| c.error.clone()),
+            },
             "service": crate::service::installed(),
             "version": net::VERSION,
             "turned_away": self.guard.rejected.load(std::sync::atomic::Ordering::Relaxed),
@@ -1873,14 +1898,19 @@ impl Node {
         if !c.all_paths().is_empty() && c.friends.iter().any(|f| f.backup_to) {
             match crate::recovery::state(&self.home, &c) {
                 crate::recovery::Kit::Never => w.push(
-                    "no recovery kit yet: without one, losing this computer loses your backups (sdb recovery export FILE)"
+                    "no recovery kit yet: without one, losing this computer loses your backups (sdb recovery export)"
                         .into(),
                 ),
                 crate::recovery::Kit::Stale(_) => w.push(
-                    "the recovery kit is older than your newest friend or drive: export it again (sdb recovery export FILE)"
+                    "the recovery kit is older than your newest friend or drive: export it again (sdb recovery export)"
                         .into(),
                 ),
                 crate::recovery::Kit::Current(_) => {}
+            }
+        }
+        if let Some(c) = crate::recovery::copy_load(&self.home) {
+            if let Some(e) = c.error {
+                w.push(format!("the recovery kit could not be copied to {}: {e}", c.folder.display()));
             }
         }
         if c.warn_after_days == 0 {
@@ -1963,6 +1993,9 @@ impl Node {
                 self.edit_exclude_pattern(list, pattern, remove, out).await
             }
             Cmd::Tune(t) => self.tune(t, out).await,
+            Cmd::KitCopyOn { passphrase, folder } => self.kit_copy_on(passphrase, folder, out).await,
+            Cmd::KitCopyOff => self.kit_copy_off(out).await,
+            Cmd::KitCopySync => self.kit_copy_sync(out).await,
             Cmd::Every { name, minutes } => self.set_pace(name, minutes, out).await,
             Cmd::DriveAdd { name, path } => self.add_drive(name, path, out).await,
             Cmd::CloudAdd(c) => self.add_cloud(c, out).await,

@@ -35,7 +35,7 @@ pub async fn run(node: Arc<Node>, out: Out) {
     let mut touched: Option<HashSet<String>> = None;
     let mut refill = true;
     let mut last_scan = Instant::now();
-    let (started, mut last_jobs) = (Instant::now(), Instant::now());
+    let (started, mut last_jobs, mut last_kit) = (Instant::now(), Instant::now(), Instant::now());
     let mut last_alert = Instant::now() - Duration::from_secs(3000);
     let mut last_notice = Instant::now();
     let mut last_touch = Instant::now() - Duration::from_secs(280);
@@ -202,6 +202,13 @@ pub async fn run(node: Arc<Node>, out: Out) {
             // disk, so restarting the daemon does not start the wait over. Neither runs in the
             // first minutes after a start, while the network and the clock may still be settling.
             let wall = chrono::Utc::now().timestamp();
+            if last_kit.elapsed() > Duration::from_secs(600) {
+                last_kit = Instant::now();
+                // Only says so when it fails; the warnings carry it from then on.
+                if let Err(e) = crate::recovery::copy_sync(&node.home, false) {
+                    out.say(format!("recovery kit: {e:#}"));
+                }
+            }
             if started.elapsed() > SETTLE && last_jobs.elapsed() > Duration::from_secs(60) {
                 last_jobs = Instant::now();
                 if node.job_last("check").is_none() {

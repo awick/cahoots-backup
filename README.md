@@ -58,11 +58,12 @@ sdb add ~/Documents ~/Pictures
 sdb invite                         # prints `sdb join sdb1...` to send to a friend
 sdb join sdb1...                   # what the friend runs (or you, with their invite)
 sdb service install                # run the daemon at login (launchd / systemd)
-sdb recovery export ~/sdb-kit.json # keep this file OFF this computer: it is how you recover
+sdb recovery export                # writes NAME.sdb-recovery-kit; keep it OFF this computer
 ```
 
 One invite pairs both directions. The daemon watches your folders and creates a
-restore point shortly after files stop changing.
+restore point shortly after files stop changing. Every command is listed under
+[Commands](#commands), further down.
 
 ## Recovering on a new computer
 
@@ -75,18 +76,45 @@ restore point is stored, encrypted, at the destinations along with the data.
 other than that computer (a password manager, a USB stick, a friend):
 
 ```bash
-sdb recovery export ~/sdb-recovery-kit.json
+sdb recovery export
 ```
+
+That writes `NAME.sdb-recovery-kit` in the folder you are in, NAME being this
+computer's name; `sdb recovery export FILE` puts it elsewhere.
 
 In the GUI it is Settings, Essentials, Recovery kit, Export. Export it again
 after adding a friend, a drive or cloud storage, since a kit only knows the
 destinations that existed when it was written; `sdb status` and Settings say
 when it is out of date.
 
+The passphrase has to be at least 16 characters, and length is the only rule: a
+sentence you will remember works well.
+
+**A copy that keeps itself up to date (optional).** sdb can keep the kit in a
+folder for you and write it again whenever your settings change. Point it at a
+folder that a cloud drive syncs (iCloud Drive, Google Drive, Dropbox, OneDrive)
+and the kit is always off this computer and never out of date:
+
+```bash
+sdb recovery copy-to ~/Dropbox
+```
+
+It asks for the kit's passphrase once. On a Mac the folder can be left out, and
+it is then Documents, which iCloud Drive carries off the computer when "Desktop
+& Documents Folders" is switched on in its settings. In the GUI it is Settings,
+Essentials, Kept in. The file is `NAME.sdb-recovery-kit`, and the kit it
+replaced is kept next to it with `.before` on the end. Two computers of the
+same name can share a folder: the second adds the start of its id to the name
+rather than writing over the first. `sdb recovery copy-to --now` writes it again
+and `--off` stops. To recover, fetch that file and import it like any other
+kit. Whoever can read the folder gets the sealed kit, so the passphrase is what
+protects it; sdb needs no account or sign-in for this, and nothing passes
+through a server of this project's.
+
 **When it happens**, on the new computer:
 
 ```bash
-sdb recovery import sdb-recovery-kit.json    # asks for the passphrase
+sdb recovery import andy.sdb-recovery-kit    # asks for the passphrase
 sdb status                                   # are your destinations reachable?
 sdb snapshots                                # the restore points, and the set each belongs to
 sdb restore latest --set default --in-place  # put that set's files back where they were
@@ -106,51 +134,6 @@ sdb service install                          # carry on backing up from here
 - Do not run the old computer and the new one at the same time.
 - Without the kit, or without its passphrase, the backups cannot be decrypted
   by anyone.
-
-## Everyday commands
-
-| Command | What it does |
-| --- | --- |
-| `sdb status` | folders, destinations, usage, how you are reachable |
-| `sdb backup [--tag NAME]` | restore point now; tagged ones are kept until `sdb forget` |
-| `sdb snapshots` | list restore points |
-| `sdb history FILE` | every version of one file |
-| `sdb diff A B` / `sdb ls SNAP [PATH]` | what changed / what is inside |
-| `sdb restore SNAP [PATHS] --to DIR` | SNAP is an id, a tag, `latest`, or a date such as `2026-11-20` or `"2026-11-20 14:30"`; `~/Documents/a.txt` lands at `DIR/Documents/a.txt`; `--from NAME` uses one friend or drive only; `--set NAME` makes `latest` that backup set's newest |
-| `sdb keep --days 365 --versions 10` | maximum age and versions per file |
-| `sdb keep --versions 5 --pattern '**/*.iso'` | version limit for matching files only |
-| `sdb prune [--dry-run]` | apply the keep rules now (the daemon does it daily) |
-| `sdb prune --apply-exclusions [--set NAME] [--dry-run]` | also take out of older restore points what the exclusion lists and skipped folders now leave out |
-| `sdb add PATH --set NAME` | put a folder in a backup set (created if new) |
-| `sdb set NAME --to usb,barney --every 15 --hours 22-7 --versions 5 --days 90` | where a set goes, how often, when, and its own history rules |
-| `sdb sets` / `sdb backup --set NAME` | list sets / back up one set now |
-| `sdb drive NAME PATH` | also back up to an external drive or folder (encrypted the same way; skipped while unplugged) |
-| `sdb cloud NAME --endpoint URL --bucket B --access-key K` | also back up to cloud storage: any S3-compatible bucket (Amazon S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO); the secret key is asked for, never typed on the command line; `--ca-file FILE` is for storage with a certificate of its own |
-| `sdb destination keep NAME --days 30 --last 5` | how much history one destination keeps, instead of each set's rules (`--default` goes back) |
-| `sdb every MINUTES [NAME]` | how often automatic backups go to one destination (friends default to 60 minutes, a new drive to 15) |
-| `sdb name NAME` | give this computer another name (friends you already have keep the name they know) |
-| `sdb limit MBPS` | cap the speed of your backups going out, to friends and cloud storage, in MB/s such as 0.5 or 20 (0 = unlimited) |
-| `sdb limit --incoming MBPS` | cap what all your friends together send to your computer (0 = unlimited) |
-| `sdb accept off` / `sdb accept on` | whether friends may back up to your computer; off makes it one that only backs up to its friends |
-| `sdb default-quota GB` | what a friend you pair with from now on may store on your computer (100 unless you change it) |
-| `sdb keep-free GB` | friends' backups are refused while your disk has less free than this (default 5, 0 = no check) |
-| `sdb schedule 22-7` / `sdb schedule always` | hours of the day automatic backups may run |
-| `sdb pause [HOURS]` / `sdb resume` | hold automatic backups |
-| `sdb warn-after DAYS` | warn when a backup, yours or a friend's to you, is this stale (default 3) |
-| `sdb destinations` | list friends and drives |
-| `sdb destination quota NAME GB` | how much a friend may store on your computer; for cloud storage, the most you keep there (0 = no cap) |
-| `sdb destination limit NAME MBPS` | fastest one friend may send backups to your computer, in MB/s (0 = unlimited) |
-| `sdb exclude lists` | the exclusion lists, their patterns and which sets use them |
-| `sdb set NAME --exclude Developer` | the exclusion list a set uses (`Standard` unless you choose) |
-| `sdb exclude new NAME [--from LIST]` / `sdb exclude add LIST PATTERN` / `sdb exclude rm LIST PATTERN` / `sdb exclude delete LIST` | make and change lists of your own |
-| `sdb skip PATH [--remove]` | leave one folder or file out of the set that backs it up |
-| `sdb set NAME --rename NEW` | rename a backup set; its restore points stay with it |
-| `sdb destination backup-to NAME false` | stop using a destination |
-| `sdb destination clean NAME [--dry-run]` | after taking a destination off a set: delete that set's restore points there and the chunks only they used |
-| `sdb verify --set NAME` | the same checks for one backup set (also on each set in the TUI and GUI) |
-| `sdb verify [--full]` | check friends still hold your data and it decrypts; repairs damage from another friend |
-| `sdb verify --local` | fingerprint your unmodified files against the last backup to catch silent disk corruption |
-| `sdb scrub` | check the data friends store on your computer for disk damage |
 
 ## The TUI
 
@@ -204,6 +187,22 @@ docker run -d --name sdb --restart unless-stopped --network host \
   ghcr.io/awick/super-duper-backup
 ```
 
+Or in a `docker-compose.yml`:
+
+```yaml
+services:
+  sdb:
+    image: ghcr.io/awick/super-duper-backup:latest
+    container_name: sdb
+    network_mode: host
+    environment:
+      - SDB_NAME=myserver
+    volumes:
+      - /srv/sdb/config:/config
+      - /bigdisk/sdb:/backups
+    restart: unless-stopped
+```
+
 The first start sets the node up. It keeps two folders:
 
 | In the container | What is there |
@@ -227,7 +226,7 @@ docker exec -it sdb sdb tui                       # the interface in the termina
 To back up folders of the machine itself, mount them and add them:
 `-v /home/me/photos:/backup/photos:ro`, then
 `docker exec sdb sdb add /backup/photos`. Keep the recovery kit outside the
-container: `docker exec -it sdb sdb recovery export /config/kit.json`, then
+container: `docker exec -it sdb sdb recovery export /config/NAME.sdb-recovery-kit`, then
 move that file somewhere else.
 
 `--network host` lets friends reach the node directly and lets it ask the
@@ -239,7 +238,14 @@ works either way, since nodes fall back to the relay, only more slowly.
 need a release that speaks the same protocol version, so update both ends
 together: `docker pull`, then remove and start the container again; the node
 lives in the two folders, not in the container. To build the image yourself, run
-`docker build -t sdb .` in a checkout.
+`docker build -t sdb .` in a checkout, or in a compose file give the checkout
+as `build:` next to `image: sdb`.
+
+A node that already runs on the machine can move into the container and stay
+the same node to its friends: stop it (`sdb service uninstall`, `sdb stop`),
+copy `~/.super-duper-backup` into the folder mounted at `/config`, and set
+`store_dir = "/backups"` in its `config.toml`, mounting the folder that held
+friends' data there.
 
 ## How it works
 
@@ -385,7 +391,8 @@ of guessing.
 
 **The recovery kit.** `sdb recovery export` writes your identity, master key,
 settings and friend list into one file, encrypted with a key made from your
-passphrase (Argon2id, 64 MiB of memory, with a random salt). The master key
+passphrase of 16 characters or more (Argon2id, 64 MiB of memory, with a random
+salt). The master key
 itself is 256 random bits, not made from the passphrase, so the data at your
 friends cannot be guessed open; the passphrase only guards the kit file. See
 [Recovering on a new computer](#recovering-on-a-new-computer).
@@ -407,6 +414,53 @@ Everything lives in `~/.super-duper-backup` (override with `SDB_HOME`):
   one friend and run `sdb verify` occasionally.
 - On macOS the binary needs Full Disk Access to read Documents, Desktop and
   Downloads when run by launchd.
+
+## Commands
+
+Everything the TUI and GUI do, and a few things only the command line does.
+
+| Command | What it does |
+| --- | --- |
+| `sdb status` | folders, destinations, usage, how you are reachable |
+| `sdb backup [--tag NAME]` | restore point now; tagged ones are kept until `sdb forget` |
+| `sdb snapshots` | list restore points |
+| `sdb history FILE` | every version of one file |
+| `sdb diff A B` / `sdb ls SNAP [PATH]` | what changed / what is inside |
+| `sdb restore SNAP [PATHS] --to DIR` | SNAP is an id, a tag, `latest`, or a date such as `2026-11-20` or `"2026-11-20 14:30"`; `~/Documents/a.txt` lands at `DIR/Documents/a.txt`; `--from NAME` uses one friend or drive only; `--set NAME` makes `latest` that backup set's newest |
+| `sdb keep --days 365 --versions 10` | maximum age and versions per file |
+| `sdb keep --versions 5 --pattern '**/*.iso'` | version limit for matching files only |
+| `sdb prune [--dry-run]` | apply the keep rules now (the daemon does it daily) |
+| `sdb prune --apply-exclusions [--set NAME] [--dry-run]` | also take out of older restore points what the exclusion lists and skipped folders now leave out |
+| `sdb add PATH --set NAME` | put a folder in a backup set (created if new) |
+| `sdb set NAME --to usb,barney --every 15 --hours 22-7 --versions 5 --days 90` | where a set goes, how often, when, and its own history rules |
+| `sdb sets` / `sdb backup --set NAME` | list sets / back up one set now |
+| `sdb drive NAME PATH` | also back up to an external drive or folder (encrypted the same way; skipped while unplugged) |
+| `sdb cloud NAME --endpoint URL --bucket B --access-key K` | also back up to cloud storage: any S3-compatible bucket (Amazon S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO); the secret key is asked for, never typed on the command line; `--ca-file FILE` is for storage with a certificate of its own |
+| `sdb destination keep NAME --days 30 --last 5` | how much history one destination keeps, instead of each set's rules (`--default` goes back) |
+| `sdb every MINUTES [NAME]` | how often automatic backups go to one destination (friends default to 60 minutes, a new drive to 15) |
+| `sdb name NAME` | give this computer another name (friends you already have keep the name they know) |
+| `sdb limit MBPS` | cap the speed of your backups going out, to friends and cloud storage, in MB/s such as 0.5 or 20 (0 = unlimited) |
+| `sdb limit --incoming MBPS` | cap what all your friends together send to your computer (0 = unlimited) |
+| `sdb accept off` / `sdb accept on` | whether friends may back up to your computer; off makes it one that only backs up to its friends |
+| `sdb default-quota GB` | what a friend you pair with from now on may store on your computer (100 unless you change it) |
+| `sdb keep-free GB` | friends' backups are refused while your disk has less free than this (default 5, 0 = no check) |
+| `sdb schedule 22-7` / `sdb schedule always` | hours of the day automatic backups may run |
+| `sdb pause [HOURS]` / `sdb resume` | hold automatic backups |
+| `sdb warn-after DAYS` | warn when a backup, yours or a friend's to you, is this stale (default 3) |
+| `sdb destinations` | list friends and drives |
+| `sdb destination quota NAME GB` | how much a friend may store on your computer; for cloud storage, the most you keep there (0 = no cap) |
+| `sdb destination limit NAME MBPS` | fastest one friend may send backups to your computer, in MB/s (0 = unlimited) |
+| `sdb exclude lists` | the exclusion lists, their patterns and which sets use them |
+| `sdb set NAME --exclude Developer` | the exclusion list a set uses (`Standard` unless you choose) |
+| `sdb exclude new NAME [--from LIST]` / `sdb exclude add LIST PATTERN` / `sdb exclude rm LIST PATTERN` / `sdb exclude delete LIST` | make and change lists of your own |
+| `sdb skip PATH [--remove]` | leave one folder or file out of the set that backs it up |
+| `sdb set NAME --rename NEW` | rename a backup set; its restore points stay with it |
+| `sdb destination backup-to NAME false` | stop using a destination |
+| `sdb destination clean NAME [--dry-run]` | after taking a destination off a set: delete that set's restore points there and the chunks only they used |
+| `sdb verify --set NAME` | the same checks for one backup set (also on each set in the TUI and GUI) |
+| `sdb verify [--full]` | check friends still hold your data and it decrypts; repairs damage from another friend |
+| `sdb verify --local` | fingerprint your unmodified files against the last backup to catch silent disk corruption |
+| `sdb scrub` | check the data friends store on your computer for disk damage |
 
 ## Development
 

@@ -83,9 +83,13 @@ struct Kit {
     created: String,
     salt: String,
     data: String,
+    /// Whose kit this is, in the clear, so one computer does not write over another's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    node: String,
 }
 
-fn kit_key(pass: &str, salt: &[u8]) -> Result<[u8; 32]> {
+/// The key a passphrase and salt make for a recovery kit.
+pub fn kit_key(pass: &str, salt: &[u8]) -> Result<[u8; 32]> {
     let params = argon2::Params::new(64 * 1024, 3, 1, Some(32)).map_err(|e| anyhow!("{e}"))?;
     let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut key = [0u8; 32];
@@ -93,14 +97,25 @@ fn kit_key(pass: &str, salt: &[u8]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-pub fn kit_seal(pass: &str, plain: &[u8]) -> Result<String> {
+pub fn kit_seal(pass: &str, plain: &[u8], node: &str) -> Result<String> {
     let salt: [u8; 16] = rand::random();
-    let data = encrypt(&cipher(&kit_key(pass, &salt)?), b"sdb-recovery-kit", plain)?;
+    kit_seal_key(&kit_key(pass, &salt)?, &salt, plain, node)
+}
+
+/// The node a kit says it belongs to; None for anything that is not a kit or does not say.
+pub fn kit_node(kit: &str) -> Option<String> {
+    serde_json::from_str::<Kit>(kit).ok().map(|k| k.node).filter(|n| !n.is_empty())
+}
+
+/// Seals a kit with a key made earlier from the passphrase and this salt.
+pub fn kit_seal_key(key: &[u8; 32], salt: &[u8; 16], plain: &[u8], node: &str) -> Result<String> {
+    let data = encrypt(&cipher(key), b"sdb-recovery-kit", plain)?;
     Ok(serde_json::to_string_pretty(&Kit {
         format: "super-duper-backup recovery kit v1".into(),
         created: chrono::Utc::now().to_rfc3339(),
         salt: hex::encode(salt),
         data: hex::encode(data),
+        node: node.to_string(),
     })?)
 }
 
@@ -154,7 +169,9 @@ mod tests {
 
     #[test]
     fn recovery_kit_needs_the_passphrase() {
-        let kit = kit_seal("correct horse", b"secret").unwrap();
+        let kit = kit_seal("correct horse", b"secret", "abc").unwrap();
+        assert_eq!(kit_node(&kit).as_deref(), Some("abc"));
+        assert_eq!(kit_node("not json"), None);
         assert_eq!(kit_open("correct horse", &kit).unwrap(), b"secret");
         assert!(kit_open("wrong", &kit).is_err());
         assert!(kit_open("correct horse", "not json").is_err());

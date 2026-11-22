@@ -157,11 +157,14 @@ a backup --set default | grep -q "created on .*bob" || fail "bob did not get the
 
 step "the recovery kit, and knowing whether there is one"
 a status | grep -q "recovery kit: never exported" || fail "a kit that was never written should say so"
-SDB_PASSPHRASE=correct-horse a recovery export "$T/kit.json" >/dev/null || fail "recovery export"
+SDB_PASSPHRASE=correct-horse a recovery export "$T/kit.json" >/dev/null 2>&1 && fail "a short passphrase was accepted"
+SDB_PASSPHRASE="my horse eats batteries" a recovery export "$T/kit.json" >/dev/null || fail "recovery export"
+(mkdir "$T/cwd" && cd "$T/cwd" && SDB_PASSPHRASE="my horse eats batteries" a recovery export >/dev/null) || fail "export with no file named"
+[ -f "$T/cwd/alice.sdb-recovery-kit" ] || fail "the kit was not named for the computer"
 a status | grep -q "recovery kit: exported .* up to date" || fail "status does not know the kit"
 SDB_PASSPHRASE=wrong-horse-9 SDB_HOME=$T/again "$SDB" recovery import "$T/kit.json" >/dev/null 2>&1 &&
     fail "a wrong passphrase opened the kit"
-SDB_PASSPHRASE=correct-horse SDB_HOME=$T/again "$SDB" recovery import "$T/kit.json" | grep -q 'Recovered "alice"' ||
+SDB_PASSPHRASE="my horse eats batteries" SDB_HOME=$T/again "$SDB" recovery import "$T/kit.json" | grep -q 'Recovered "alice"' ||
     fail "recovery import"
 [ -f "$T/again/identity.key" ] || fail "the recovered folder has no identity"
 # The old computer is gone; the new one gets the files back from the friend alone.
@@ -170,6 +173,43 @@ r restore latest --set default --to recovered --from bob >/dev/null || fail "res
 diff -r recovered/data data || fail "the recovered computer restored something else"
 r restore latest --set nosuchset --to recovered2 >/dev/null 2>&1 && fail "restore from a set that does not exist"
 r stop >/dev/null
+
+step "a copy of the kit kept up to date in a folder"
+mkdir synced
+SDB_PASSPHRASE=too-short a recovery copy-to synced >/dev/null 2>&1 && fail "a short passphrase was accepted for the copy"
+SDB_PASSPHRASE="my horse eats batteries" a recovery copy-to synced >/dev/null || fail "starting the copy"
+KIT=synced/alice.sdb-recovery-kit
+[ -f "$KIT" ] || fail "the copy is not named for the computer: $(ls synced)"
+grep -q '"data"' "$KIT" || fail "the copy is not a kit"
+grep -q "master" "$KIT" && fail "the copy is not sealed"
+a status | grep -q "a copy is kept in .*synced" || fail "status does not mention the copy"
+a name alice2 >/dev/null
+a recovery copy-to --now >/dev/null || fail "writing the copy again"
+[ -f synced/alice2.sdb-recovery-kit ] || fail "the copy did not follow the new name"
+[ ! -e "$KIT" ] || fail "the copy under the old name was left behind"
+a name alice >/dev/null
+a recovery copy-to --now >/dev/null
+a recovery copy-to --now >/dev/null
+[ "$(ls synced | wc -l | tr -d ' ')" = 2 ] || fail "expected the kit and the one before it, found: $(ls synced | tr '\n' ' ')"
+[ -f "$KIT.before" ] || fail "the kit before this one was not kept"
+SDB_PASSPHRASE="my horse eats batteries" SDB_HOME=$T/fromcopy "$SDB" recovery import "$KIT" | grep -q 'Recovered "alice"' ||
+    fail "recovering from the copy"
+# Bob, renamed to alice, shares the folder: his kit must not replace hers.
+b name alice >/dev/null
+SDB_PASSPHRASE="my horse eats batteries" b recovery copy-to synced >/dev/null || fail "a second computer of the same name"
+ls synced/alice-*.sdb-recovery-kit >/dev/null 2>&1 || fail "the second computer's kit has no name of its own: $(ls synced)"
+SDB_PASSPHRASE="my horse eats batteries" SDB_HOME=$T/fromcopy2 "$SDB" recovery import "$KIT" >/dev/null || fail "her kit was replaced"
+cmp -s "$T/fromcopy2/identity.key" "$T/alice/identity.key" || fail "her kit is no longer hers"
+b recovery copy-to --off >/dev/null
+rm -f synced/alice-*.sdb-recovery-kit*
+b name bob >/dev/null
+rmdir_test=$T/synced.gone
+mv synced "$rmdir_test"
+a recovery copy-to --now >/dev/null 2>&1 && fail "a missing folder went unnoticed"
+a status | grep -q "WARNING.*could not be copied" || fail "no warning about the failing copy"
+mv "$rmdir_test" synced
+a recovery copy-to --off | grep -q "no longer copied" || fail "stopping the copy"
+a status | grep -q "copy is kept in" && fail "status still mentions the copy"
 
 step "space for new friends and free space to keep"
 b default-quota 250 >/dev/null

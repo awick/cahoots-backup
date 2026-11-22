@@ -26,7 +26,7 @@ mod watch;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::{Config, Identity};
-use node::{CloudAdd, Cmd, Node, Out, SetEdit, Tune};
+use node::{CloudAdd, Cmd, Node, Out, Secret, SetEdit, Tune};
 use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
 
@@ -363,8 +363,23 @@ enum ExcludeCmd {
 
 #[derive(Subcommand)]
 enum RecoveryCmd {
-    Export { file: PathBuf },
+    /// Write the kit to a file (NAME.sdb-recovery-kit here unless you name one); it asks for
+    /// a passphrase
+    Export { file: Option<PathBuf> },
+    /// Set this computer up from a kit file; it asks for the kit's passphrase
     Import { file: PathBuf },
+    /// Keep a copy of the kit in a folder, written again whenever it changes: one that a
+    /// cloud drive syncs is the idea (on a Mac, Documents unless you name another). It asks
+    /// for the kit's passphrase once
+    CopyTo {
+        folder: Option<PathBuf>,
+        /// Stop keeping the copy; what is in the folder stays
+        #[arg(long, conflicts_with_all = ["folder", "now"])]
+        off: bool,
+        /// Write the copy now
+        #[arg(long, conflicts_with = "folder")]
+        now: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -373,19 +388,28 @@ enum ServiceCmd {
     Uninstall,
 }
 
-fn passphrase(confirm: bool) -> Result<String> {
+/// Asks for the kit's passphrase. A new one has to be long enough and is typed twice; one
+/// for a kit that exists is taken as it is, since older kits allowed shorter ones.
+fn passphrase(new: bool) -> Result<String> {
     if let Ok(p) = std::env::var("SDB_PASSPHRASE") {
-        if p.len() < 8 {
-            bail!("use at least 8 characters");
+        if new {
+            recovery::check_passphrase(&p)?;
         }
         return Ok(p);
     }
-    let p = rpassword::prompt_password("Recovery passphrase: ")?;
-    if confirm && p != rpassword::prompt_password("Again: ")? {
-        bail!("passphrases do not match");
+    if new {
+        eprintln!(
+            "Choose a passphrase of at least {} characters. A sentence you will remember works well;",
+            recovery::MIN_PASSPHRASE
+        );
+        eprintln!("any characters will do, and only its length is checked.");
     }
-    if p.len() < 8 {
-        bail!("use at least 8 characters");
+    let p = rpassword::prompt_password("Recovery passphrase: ")?;
+    if new {
+        recovery::check_passphrase(&p)?;
+        if p != rpassword::prompt_password("Again: ")? {
+            bail!("passphrases do not match");
+        }
     }
     Ok(p)
 }
@@ -585,6 +609,10 @@ async fn real_main() -> Result<()> {
             };
         }
         C::Recovery { cmd: RecoveryCmd::Export { file } } => {
+            let file = match file {
+                Some(f) => f,
+                None => PathBuf::from(recovery::file_name(&Config::load(&home)?.name)),
+            };
             recovery::export(&home, &passphrase(true)?, &file)?;
             println!(
                 "Wrote {}. With it and the passphrase you can restore everything on a new computer.",
@@ -592,6 +620,19 @@ async fn real_main() -> Result<()> {
             );
             println!("Export again after adding friends so the kit knows how to reach them.");
             return Ok(());
+        }
+        C::Recovery { cmd: RecoveryCmd::CopyTo { off: true, .. } } => Cmd::KitCopyOff,
+        C::Recovery { cmd: RecoveryCmd::CopyTo { now: true, .. } } => Cmd::KitCopySync,
+        C::Recovery { cmd: RecoveryCmd::CopyTo { folder, .. } } => {
+            let Some(folder) = folder.or_else(recovery::default_folder) else {
+                bail!("name the folder to keep the copy in, or --now to write it again, or --off to stop")
+            };
+            let folder = fs::canonicalize(&folder).with_context(|| folder.display().to_string())?;
+            println!(
+                "The kit will be kept as {}",
+                folder.join(recovery::file_name(&Config::load(&home)?.name)).display()
+            );
+            Cmd::KitCopyOn { passphrase: Secret(passphrase(true)?), folder }
         }
         C::Recovery { cmd: RecoveryCmd::Import { file } } => {
             let config = recovery::import(&home, &passphrase(false)?, &file)?;

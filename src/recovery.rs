@@ -9,7 +9,11 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Serialize, Deserialize)]
 struct KitData {
@@ -37,9 +41,13 @@ pub enum Kit {
     Stale(i64),
 }
 
+/// Fewest characters the passphrase of a new kit may have. Length is the only rule.
+pub const MIN_PASSPHRASE: usize = 16;
+
 pub fn check_passphrase(p: &str) -> Result<()> {
-    if p.len() < 8 {
-        bail!("use at least 8 characters");
+    let n = p.chars().count();
+    if n < MIN_PASSPHRASE {
+        bail!("that is {n} characters; use at least {MIN_PASSPHRASE}. A sentence you will remember works well");
     }
     Ok(())
 }
@@ -49,8 +57,23 @@ pub(crate) fn mark(home: &Path, cfg: &Config) -> Result<()> {
     config::write_private(&home.join(MARKER), &serde_json::to_vec(&m)?)
 }
 
-pub fn export(home: &Path, passphrase: &str, file: &Path) -> Result<()> {
-    check_passphrase(passphrase)?;
+/// The file a computer's kit goes in unless another is named: NAME.sdb-recovery-kit.
+pub fn file_name(name: &str) -> String {
+    let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect();
+    format!("{}.{EXT}", if safe.is_empty() { "sdb" } else { &safe })
+}
+
+pub const EXT: &str = "sdb-recovery-kit";
+
+/// Where a kit is offered to be kept: on a Mac the Documents folder, which iCloud Drive
+/// carries off the computer when it is set to.
+pub fn default_folder() -> Option<PathBuf> {
+    let docs = PathBuf::from(std::env::var_os("HOME")?).join("Documents");
+    (cfg!(target_os = "macos") && docs.is_dir()).then_some(docs)
+}
+
+/// Everything a kit holds, before it is sealed, the settings among it, and whose it is.
+pub fn plain(home: &Path) -> Result<(Vec<u8>, Config, String)> {
     let mut config = Config::load(home)?;
     config.invites.clear();
     let forgotten = match fs::read(home.join("forgotten.json")) {
@@ -59,18 +82,29 @@ pub fn export(home: &Path, passphrase: &str, file: &Path) -> Result<()> {
         Err(e) => return Err(e).context("forgotten.json"),
     };
     let data = KitData { identity: Identity::load(home)?, config, forgotten };
-    let kit = crypto::kit_seal(passphrase, &serde_json::to_vec(&data)?)?;
-    config::write_private(file, kit.as_bytes()).with_context(|| file.display().to_string())?;
-    mark(home, &data.config)
+    let node = iroh::SecretKey::from_bytes(&Identity::bytes(&data.identity.secret)?).public().to_string();
+    Ok((serde_json::to_vec(&data)?, data.config, node))
 }
 
-/// Sets up an empty folder from a kit; returns the settings it held.
+pub fn export(home: &Path, passphrase: &str, file: &Path) -> Result<()> {
+    check_passphrase(passphrase)?;
+    let (plain, config, node) = plain(home)?;
+    let kit = crypto::kit_seal(passphrase, &plain, &node)?;
+    config::write_private(file, kit.as_bytes()).with_context(|| file.display().to_string())?;
+    mark(home, &config)
+}
+
+/// Sets up an empty folder from a kit file; returns the settings it held.
 pub fn import(home: &Path, passphrase: &str, file: &Path) -> Result<Config> {
+    let kit = fs::read_to_string(file).with_context(|| file.display().to_string())?;
+    import_kit(home, passphrase, &kit)
+}
+
+pub fn import_kit(home: &Path, passphrase: &str, kit: &str) -> Result<Config> {
     if home.join("identity.key").exists() {
         bail!("{} is already set up; move it away first", home.display());
     }
-    let kit = fs::read_to_string(file).with_context(|| file.display().to_string())?;
-    let data: KitData = serde_json::from_slice(&crypto::kit_open(passphrase, &kit)?)?;
+    let data: KitData = serde_json::from_slice(&crypto::kit_open(passphrase, kit)?)?;
     fs::create_dir_all(home)?;
     fs::set_permissions(home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     data.identity.save(home)?;
@@ -104,4 +138,116 @@ impl Kit {
             Kit::Current(t) => (format!("exported {}, up to date", day(t).unwrap_or_default()), false),
         }
     }
+}
+
+/// A copy of the kit kept in a folder of the user's choosing, such as one a cloud drive
+/// syncs, and written again whenever the kit changes. Held beside the config.
+#[derive(Serialize, Deserialize)]
+pub struct Copy {
+    pub folder: PathBuf,
+    /// The key the passphrase made, so later kits can be sealed without asking for it again.
+    /// It sits beside the master key it protects, so it gives away nothing more than that file.
+    salt: String,
+    key: String,
+    /// Name of the kit's file in the folder.
+    #[serde(default)]
+    file: String,
+    /// Fingerprint of the kit last written.
+    #[serde(default)]
+    hash: String,
+    #[serde(default)]
+    pub at: i64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+const COPY: &str = "recovery-copy.json";
+
+pub fn copy_load(home: &Path) -> Option<Copy> {
+    fs::read(home.join(COPY)).ok().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+fn copy_save(home: &Path, c: &Copy) -> Result<()> {
+    config::write_private(&home.join(COPY), &serde_json::to_vec(c)?)
+}
+
+/// Starts keeping a copy in `folder` and writes the first one. Slow on purpose: it makes
+/// the key from the passphrase.
+pub fn copy_on(home: &Path, passphrase: &str, folder: &Path) -> Result<()> {
+    check_passphrase(passphrase)?;
+    if !folder.is_dir() {
+        bail!("{} is not a folder", folder.display());
+    }
+    let salt: [u8; 16] = rand::random();
+    let key = crypto::kit_key(passphrase, &salt)?;
+    let copy = Copy {
+        folder: folder.to_path_buf(),
+        salt: hex::encode(salt),
+        key: hex::encode(key),
+        file: String::new(),
+        hash: String::new(),
+        at: 0,
+        error: None,
+    };
+    copy_save(home, &copy)?;
+    copy_sync(home, true).map(|_| ())
+}
+
+/// Stops keeping the copy. What is in the folder stays there.
+pub fn copy_off(home: &Path) -> Result<bool> {
+    match fs::remove_file(home.join(COPY)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Writes the kit to the folder if it changed since the last copy. Returns whether it did.
+pub fn copy_sync(home: &Path, force: bool) -> Result<bool> {
+    let Some(mut copy) = copy_load(home) else { return Ok(false) };
+    let res = copy_write(home, force, &mut copy);
+    copy.error = res.as_ref().err().map(|e| format!("{e:#}"));
+    copy_save(home, &copy)?;
+    res
+}
+
+/// The kit this one replaced.
+fn before(file: &str) -> String {
+    format!("{file}.before")
+}
+
+fn copy_write(home: &Path, force: bool, copy: &mut Copy) -> Result<bool> {
+    let (plain, cfg, node) = plain(home)?;
+    let hash = blake3::hash(&plain).to_hex().to_string();
+    // Named for the computer. Where another computer of the same name already keeps its kit
+    // in this folder, the start of this one's id goes in the name rather than writing over it.
+    let mut file = file_name(&cfg.name);
+    let theirs = fs::read_to_string(copy.folder.join(&file)).ok().and_then(|k| crypto::kit_node(&k));
+    if theirs.is_some_and(|n| n != node) {
+        file = file_name(&format!("{}-{}", cfg.name, &node[..node.len().min(8)]));
+    }
+    let path = copy.folder.join(&file);
+    if !force && hash == copy.hash && file == copy.file && path.exists() {
+        return Ok(false);
+    }
+    if !copy.folder.is_dir() {
+        bail!("{} is not there", copy.folder.display());
+    }
+    let unhex = |s: &str| hex::decode(s).ok();
+    let key: [u8; 32] = unhex(&copy.key).and_then(|k| k.try_into().ok()).context(COPY)?;
+    let salt: [u8; 16] = unhex(&copy.salt).and_then(|k| k.try_into().ok()).context(COPY)?;
+    let kit = crypto::kit_seal_key(&key, &salt, &plain, &node)?;
+    // The one before stays, in case this copy is the bad one.
+    if path.exists() {
+        fs::rename(&path, copy.folder.join(before(&file))).with_context(|| path.display().to_string())?;
+    }
+    config::write_private(&path, kit.as_bytes()).with_context(|| path.display().to_string())?;
+    if !copy.file.is_empty() && copy.file != file {
+        // The computer was renamed: its kit under the old name would only mislead.
+        let _ = fs::remove_file(copy.folder.join(&copy.file));
+        let _ = fs::remove_file(copy.folder.join(before(&copy.file)));
+    }
+    (copy.file, copy.hash, copy.at) = (file, hash, chrono::Utc::now().timestamp());
+    mark(home, &cfg)?;
+    Ok(true)
 }

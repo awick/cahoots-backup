@@ -1299,8 +1299,13 @@ impl App {
                     "The kit is this computer's identity, key and settings in one passphrase-protected file.".into(),
                     "With it and the passphrase you can restore everything on a new computer.".into(),
                     String::new(),
-                    "To write it, quit and run:  sdb recovery export ~/sdb-recovery-kit.json".into(),
+                    "To write it, quit and run:  sdb recovery export".into(),
                     "Then keep the file somewhere other than this computer.".into(),
+                    String::new(),
+                    match self.ov["kit_copy"]["folder"].as_str() {
+                        Some(f) => format!("A copy is also kept in {f}, and written again when it changes."),
+                        None => "sdb can also keep a copy in a folder that syncs:  sdb recovery copy-to FOLDER".into(),
+                    },
                 ]);
             }
             Act::ServiceInfo => {
