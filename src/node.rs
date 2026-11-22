@@ -29,6 +29,13 @@ use tokio::sync::{Notify, mpsc};
 
 mod commands;
 
+/// Most missing chunks a sampled verify copies back to one destination by itself.
+const MAX_SAMPLED_REPAIR: usize = 256;
+/// Most unneeded chunk ids one clean-up takes in from a destination (32 MiB of ids).
+const MAX_DEAD: usize = 1 << 20;
+/// Most listed chunks outside this node's latest indexes it remembers as already stored.
+const KNOWN_OTHERS: usize = 1 << 20;
+
 #[derive(Clone)]
 pub struct Out(pub mpsc::UnboundedSender<String>);
 
@@ -472,6 +479,23 @@ fn dialable(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
     addrs.iter().filter(|a| a.port() != 0 && (offline || net::public_ip(a.ip()))).take(8).copied().collect()
 }
 
+/// A drive's marker. Neither the folder nor the marker is opened through a link, a pipe cannot
+/// block the open, and type and size come from the open file, so only a small regular file is read.
+fn read_mark(dir: &Path) -> Option<String> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+    use std::io::Read;
+    let d = open(dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()).ok()?;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = openat(&d, "sdb-drive-id", flags, Mode::empty()).ok()?;
+    let st = fstat(&fd).ok()?;
+    if !FileType::from_raw_mode(st.st_mode).is_file() || st.st_size > 128 {
+        return None;
+    }
+    let mut s = String::new();
+    fs::File::from(fd).take(128).read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
 fn sig(chunks: &[Id], size: u64) -> u64 {
     let mut h = blake3::Hasher::new();
     h.update(&size.to_le_bytes());
@@ -580,39 +604,48 @@ impl Node {
     }
 
     /// Makes sure the disk at a drive's path is the one that was added, marking it on first use.
+    /// The marker is read without holding the drives lock, so a slow or hostile disk holds up only its own probe.
     fn check_drive(&self, f: &Friend, dir: &Path) -> Result<()> {
+        let key = || self.cfg.lock().unwrap().friends.iter().find(|x| x.id == f.id).and_then(|x| x.drive_key.clone());
+        let k = match key() {
+            Some(k) => k,
+            None => {
+                // Marking happens once: a second probe waits, then checks the key the first one wrote.
+                let _one = self.drives.lock().unwrap();
+                match key() {
+                    Some(k) => k,
+                    None => return self.mark_drive(f, dir),
+                }
+            }
+        };
+        if read_mark(dir).is_some_and(|d| d.trim() == k) {
+            return Ok(());
+        }
+        bail!(
+            "{}: the disk at {} is not the one that was added; to use this one run `sdb drive {} {}`",
+            f.name,
+            dir.display(),
+            f.name,
+            f.path.as_deref().unwrap_or(dir).display()
+        )
+    }
+
+    fn mark_drive(&self, f: &Friend, dir: &Path) -> Result<()> {
         use std::io::Write;
         let mark = dir.join("sdb-drive-id");
-        let key = self.cfg.lock().unwrap().friends.iter().find(|x| x.id == f.id).and_then(|x| x.drive_key.clone());
-        let found = fs::symlink_metadata(&mark)
-            .ok()
-            .filter(|m| m.is_file() && m.len() <= 128)
-            .and_then(|_| fs::read_to_string(&mark).ok());
-        match (key, found) {
-            (Some(k), Some(d)) if d.trim() == k => Ok(()),
-            (Some(_), _) => bail!(
-                "{}: the disk at {} is not the one that was added; to use this one run `sdb drive {} {}`",
-                f.name,
-                dir.display(),
-                f.name,
-                f.path.as_deref().unwrap_or(dir).display()
-            ),
-            (None, _) => {
-                let key = hex::encode(rand::random::<[u8; 16]>());
-                let _ = fs::remove_file(&mark);
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&mark)
-                    .and_then(|mut m| m.write_all(key.as_bytes()))
-                    .with_context(|| mark.display().to_string())?;
-                self.update(|c| {
-                    if let Some(x) = c.friends.iter_mut().find(|x| x.id == f.id) {
-                        x.drive_key = Some(key);
-                    }
-                })
+        let key = hex::encode(rand::random::<[u8; 16]>());
+        let _ = fs::remove_file(&mark);
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&mark)
+            .and_then(|mut m| m.write_all(key.as_bytes()))
+            .with_context(|| mark.display().to_string())?;
+        self.update(|c| {
+            if let Some(x) = c.friends.iter_mut().find(|x| x.id == f.id) {
+                x.drive_key = Some(key);
             }
-        }
+        })
     }
 
     /// Closes every open invite; used when someone keeps guessing at them.
@@ -650,10 +683,9 @@ impl Node {
                 Ok(_) => bail!("{}: {} is a link or a file, refusing to use it", f.name, dir.display()),
                 Err(_) => bail!("{}: drive is not connected ({} not found)", f.name, dir.display()),
             }
-            let mut drives = self.drives.lock().unwrap();
             self.check_drive(f, &dir)?;
-            let store = drives.entry(dir.clone()).or_insert_with(|| Arc::new(Store::new(dir, 0))).clone();
-            drop(drives);
+            let store =
+                self.drives.lock().unwrap().entry(dir.clone()).or_insert_with(|| Arc::new(Store::new(dir, 0))).clone();
             return Ok(Peer { friend: f.clone(), link: Link::Drive(store, self.id()) });
         }
         if let Some(c) = &f.cloud {
@@ -698,7 +730,9 @@ impl Node {
         Ok(Peer { friend: f.clone(), link: Link::Remote(conn) })
     }
 
-    /// The set of chunks a friend holds for us, refreshed from them at least daily.
+    /// The chunks a destination holds for us that this node's latest indexes use, and a bounded
+    /// number of others, refreshed at least daily. A destination so cannot make this node hold
+    /// more by listing ids it never stored, and a chunk left out is at worst sent again.
     pub async fn known(&self, peer: &Peer, refresh: bool) -> Result<Arc<HashSet<Id>>> {
         if !refresh {
             if let Some((at, set)) = self.known.lock().await.get(&peer.friend.id) {
@@ -707,7 +741,19 @@ impl Node {
                 }
             }
         }
-        let set = Arc::new(peer.list_chunks().await?);
+        let mut ours = HashSet::new();
+        for b in self.cfg().sets {
+            for e in self.load_last_index(&b.name) {
+                if let Kind::File { chunks, .. } = e.kind {
+                    ours.extend(chunks);
+                }
+            }
+        }
+        // Also some others, so the chunks an interrupted backup already sent are not sent again.
+        let l = peer.list_chunks(Arc::new(ours), KNOWN_OTHERS).await?;
+        let mut set = l.have;
+        set.extend(l.other);
+        let set = Arc::new(set);
         self.known.lock().await.insert(peer.friend.id.clone(), (Instant::now(), set.clone()));
         Ok(set)
     }
@@ -978,7 +1024,10 @@ impl Node {
 
     /// Deletes every chunk a friend holds for us that no remaining restore point uses.
     /// The chunks a destination holds, and those among them that none of `snaps` needs.
-    async fn unneeded(&self, peer: &Peer, snaps: &[&Snap], uses: &mut Uses) -> Result<(HashSet<Id>, Vec<Id>)> {
+    /// Also returns how many ids the destination listed. At most MAX_DEAD unneeded ones come back
+    /// at a time, so a destination listing ids it never stored cannot swell this node's memory;
+    /// the rest go on a later run.
+    async fn unneeded(&self, peer: &Peer, snaps: &[&Snap], uses: &mut Uses) -> Result<(HashSet<Id>, Vec<Id>, u64)> {
         let mut live: HashSet<Id> = HashSet::new();
         for s in snaps {
             let Some((_, idx)) = s.peers.iter().find(|(f, _)| f.id == peer.friend.id) else {
@@ -991,15 +1040,14 @@ impl Node {
             }
             uses.add_to(&s.id, &mut live);
         }
-        let have = peer.list_chunks().await?;
-        let dead = have.difference(&live).copied().collect();
-        Ok((have, dead))
+        let l = peer.list_chunks(Arc::new(live), MAX_DEAD).await?;
+        Ok((l.have, l.other, l.count))
     }
 
     /// Deletes the chunks a destination holds that none of `snaps` needs. Returns how many
     /// went and how many bytes that freed there, by the destination's own count.
     async fn gc(&self, peer: &Peer, snaps: &[&Snap], uses: &mut Uses) -> Result<(u64, u64)> {
-        let (have, dead) = self.unneeded(peer, snaps, uses).await?;
+        let (have, dead, _) = self.unneeded(peer, snaps, uses).await?;
         if dead.is_empty() {
             self.known.lock().await.insert(peer.friend.id.clone(), (Instant::now(), Arc::new(have)));
             return Ok((0, 0));
@@ -1383,21 +1431,21 @@ impl Node {
         if dry_run {
             // Nothing is deleted, but each destination can say how much it holds that would go.
             for p in &peers {
-                let Ok((have, dead)) = self.unneeded(p, &all, &mut uses).await else {
+                let Ok((_, dead, listed)) = self.unneeded(p, &all, &mut uses).await else {
                     out.say(format!("  {}: could not work out what would be freed there", p.friend.name));
                     continue;
                 };
                 // A chunk of a file being taken out is about that file's size divided by its
                 // chunks; for any other, the destination's average has to do.
                 let used = p.usage().await.map_or(0, |u| u.0);
-                let average = used / have.len().max(1) as u64;
+                let average = used / listed.max(1);
                 let space: u64 = dead.iter().map(|id| sizes.get(id).copied().unwrap_or(average)).sum();
                 out.say(format!(
                     "  {}: would free roughly {} ({} of the {} chunks it holds)",
                     p.friend.name,
                     human(space.min(used)),
                     dead.len(),
-                    have.len()
+                    listed
                 ));
             }
             out.say(format!("dry run: {removed} restore points and {thinned} old file versions would be removed"));
@@ -1534,7 +1582,6 @@ impl Node {
         set: Option<&str>,
         out: &Out,
     ) -> Result<(u64, u64)> {
-        let have = self.known(p, true).await?;
         let mut refs: HashSet<Id> = HashSet::new();
         let mut count = 0;
         let mine = |s: &&Snap| set.is_none_or(|n| s.m.set == n) && s.peers.iter().any(|(f, _)| f.id == p.friend.id);
@@ -1547,8 +1594,35 @@ impl Node {
                 }
             }
         }
+        // Only what these restore points use is kept from the listing.
+        let refs = Arc::new(refs);
+        let listing = p.list_chunks(refs.clone(), 0).await?;
+        let (have, listed) = (Arc::new(listing.have), listing.count);
+        // A check of one set saw only that set's chunks: it adds to what is known rather than
+        // replacing it, or the other sets' next backups would send everything again.
+        let mut known = self.known.lock().await;
+        match (set, known.get(&p.friend.id)) {
+            (None, _) => drop(known.insert(p.friend.id.clone(), (Instant::now(), have.clone()))),
+            (Some(_), Some((at, old))) => {
+                let (at, mut all) = (*at, (**old).clone());
+                all.extend(have.iter().copied());
+                known.insert(p.friend.id.clone(), (at, Arc::new(all)));
+            }
+            (Some(_), None) => {}
+        }
+        drop(known);
         let mut bad: Vec<Id> = refs.iter().filter(|i| !have.contains(*i)).copied().collect();
-        let mut ids: Vec<Id> = refs.into_iter().filter(|i| have.contains(i)).collect();
+        // A destination that suddenly lists far less than it should is more likely broken or
+        // misbehaving than damaged; sending it all again, perhaps out of paid storage, waits for the user.
+        if !full && bad.len() > MAX_SAMPLED_REPAIR {
+            bail!(
+                "lists {} chunks, but {} of the {} it should hold are missing; nothing was copied. If it really lost them, `sdb verify --full` copies them back from another destination",
+                listed,
+                bad.len(),
+                refs.len()
+            );
+        }
+        let mut ids: Vec<Id> = refs.iter().filter(|i| have.contains(*i)).copied().collect();
         if !full {
             use rand::seq::SliceRandom;
             ids.shuffle(&mut rand::rng());
@@ -1596,7 +1670,7 @@ impl Node {
         out.say(format!(
             "{}: {count} restore points, {} chunks listed, {} chunks ({}) downloaded and checked{}",
             p.friend.name,
-            have.len(),
+            listed,
             ids.len(),
             human(read),
             if full { "" } else { " (sample; use --full for everything)" }
@@ -2067,5 +2141,27 @@ mod tests {
         assert_eq!(clean("ok\n\u{1}OK"), "ok??OK");
         assert_eq!(clean("\u{1b}]0;title\u{7}fine"), "?]0;title?fine");
         assert_eq!(clean("plain text, ünïcode"), "plain text, ünïcode");
+    }
+
+    #[test]
+    fn a_drive_marker_is_only_a_small_regular_file() {
+        let dir = std::env::temp_dir().join(format!("sdb-mark-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mark = dir.join("sdb-drive-id");
+        assert_eq!(read_mark(&dir), None);
+        fs::write(&mark, "abc").unwrap();
+        assert_eq!(read_mark(&dir).as_deref(), Some("abc"));
+        fs::write(&mark, [b'a'; 129]).unwrap();
+        assert_eq!(read_mark(&dir), None, "too big");
+        fs::remove_file(&mark).unwrap();
+        fs::write(dir.join("real"), "abc").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), &mark).unwrap();
+        assert_eq!(read_mark(&dir), None, "a link");
+        fs::remove_file(&mark).unwrap();
+        // A pipe with no writer would block a plain open forever.
+        assert!(std::process::Command::new("mkfifo").arg(&mark).status().unwrap().success());
+        assert_eq!(read_mark(&dir), None, "a pipe");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

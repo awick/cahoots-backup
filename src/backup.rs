@@ -11,12 +11,16 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use fastcdc::v2020::{FastCDC, StreamCDC};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use rustix::fs::{CWD, FileType, OFlags};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
     fs,
     io::{Read, Seek},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::{ffi::OsStrExt, fs::MetadataExt},
+    },
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -33,8 +37,14 @@ pub const MAX_CHUNK: usize = 4 << 20;
 const BATCH_BYTES: usize = 8 << 20;
 /// Holes are skipped in whole zero chunks rather than read, so a sparse disk image costs
 /// what it stores, not what it claims. Most empty space one file may claim: far beyond
-/// any real disk image, but an exabyte "file" would fill the index with zero chunks.
-const MAX_HOLES: u64 = 4 << 40;
+/// any real disk image, but each 4 MiB of it still adds an id to the index.
+const MAX_HOLES: u64 = 2 << 40;
+/// Chunk ids one restore point may hold that cost no disk: zero chunks standing for holes,
+/// and the chunk lists of further hard links to a file already listed. Past this (32 MiB of
+/// index, 4 TiB of holes) files are left out, and said to be, rather than let a few
+/// `truncate` or `ln` calls grow every index without bound. Files unchanged since the last
+/// restore point are counted first, so new ones cannot push them out.
+const RUN_FREE_IDS: u64 = 1 << 20;
 /// Most empty space read as zeros in one file: holes too small to skip, and every hole
 /// on a filesystem that cannot say where they are.
 const MAX_ZEROS_READ: u64 = 16 << 30;
@@ -98,7 +108,8 @@ struct Scan {
     bytes: u64,
     new_bytes: u64,
     skipped: u64,
-    /// Sparse files refused outright: data the user expects backed up but that is not.
+    /// Files refused outright (sparse, or past RUN_FREE_IDS): data the user expects backed up
+    /// but that is not.
     refused: u64,
     /// Changed files left for the next run.
     deferred: u64,
@@ -179,37 +190,37 @@ fn scan(
     let mut res =
         Scan { entries: vec![], index: vec![], files: 0, bytes: 0, new_bytes: 0, skipped: 0, refused: 0, deferred: 0 };
     let mut entries: Vec<Option<Entry>> = vec![];
-    // Changed files (entry, device, inode) are read after the walk, longest waiting first.
-    let mut todo: Vec<(usize, u64, u64)> = vec![];
-    for root in &roots {
-        let walk = walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|e| !ex.is_excluded(e.path()));
-        for e in walk {
-            let (e, md) = match e.and_then(|e| e.metadata().map(|m| (e, m))) {
-                Ok(x) => x,
-                Err(err) => {
-                    out.say(format!("  skipped: {err}"));
-                    res.skipped += 1;
-                    continue;
-                }
-            };
-            let path = e.path().as_os_str().as_bytes().to_vec();
-            let mtime = md.mtime() * 1_000_000_000 + md.mtime_nsec();
-            let ft = md.file_type();
-            let kind = if ft.is_dir() {
-                Kind::Dir
-            } else if ft.is_symlink() {
-                match fs::read_link(e.path()) {
-                    Ok(t) => Kind::Symlink(t.as_os_str().as_bytes().to_vec()),
-                    Err(_) => continue,
-                }
-            } else if ft.is_file() {
+    let mut free = Free::new(RUN_FREE_IDS, sc.keys.chunk_id(&vec![0; MAX_CHUNK]));
+    // The chunks of each file with more than one name, so a further link is not read again.
+    let mut linked: HashMap<(u64, u64), (u64, Vec<Id>)> = HashMap::new();
+    let refuse = |res: &mut Scan, path: &[u8]| {
+        out.say(format!("  NOT BACKED UP {}: {FREE_FULL}", Path::new(OsStr::from_bytes(path)).display()));
+        res.refused += 1;
+    };
+    // Changed files (entry, device, inode, more than one name) are read after the walk, longest
+    // waiting first.
+    let mut todo: Vec<(usize, u64, u64, bool)> = vec![];
+    for f in Walk::new(&roots, &ex) {
+        let f = match f {
+            Ok(f) => f,
+            Err(err) => {
+                out.say(format!("  skipped: {err}"));
+                res.skipped += 1;
+                continue;
+            }
+        };
+        let (md, path) = (&f.md, f.path.as_os_str().as_bytes().to_vec());
+        let kind = match f.ft {
+            FileType::Directory => Kind::Dir,
+            FileType::Symlink => match f.link {
+                Some(t) => Kind::Symlink(t),
+                None => continue,
+            },
+            FileType::RegularFile => {
+                let link = (md.nlink > 1).then_some((md.dev, md.ino));
                 let reuse = prev.get(&path).and_then(|p| match &p.kind {
                     Kind::File { size, chunks }
-                        if *size == md.size() && p.mtime == mtime && p.ino == md.ino() && sc.have(chunks) =>
+                        if *size == md.size && p.mtime == md.mtime && p.ino == md.ino && sc.have(chunks) =>
                     {
                         Some(chunks.clone())
                     }
@@ -217,28 +228,26 @@ fn scan(
                 });
                 match reuse {
                     Some(chunks) => {
+                        if !free.take(link, &chunks) {
+                            refuse(&mut res, &path);
+                            continue;
+                        }
+                        if let Some(l) = link {
+                            linked.insert(l, (md.size, chunks.clone()));
+                        }
                         res.files += 1;
-                        res.bytes += md.size();
-                        Kind::File { size: md.size(), chunks }
+                        res.bytes += md.size;
+                        Kind::File { size: md.size, chunks }
                     }
                     None => {
-                        todo.push((entries.len(), md.dev(), md.ino()));
+                        todo.push((entries.len(), md.dev, md.ino, link.is_some()));
                         Kind::File { size: 0, chunks: vec![] }
                     }
                 }
-            } else {
-                continue;
-            };
-            entries.push(Some(Entry {
-                path,
-                mode: md.mode(),
-                uid: md.uid(),
-                gid: md.gid(),
-                mtime,
-                ino: md.ino(),
-                kind,
-            }));
-        }
+            }
+            _ => continue,
+        };
+        entries.push(Some(Entry { path, mode: md.mode, uid: md.uid, gid: md.gid, mtime: md.mtime, ino: md.ino, kind }));
     }
 
     let waiting = DEFERRED.lock().unwrap().get(&set).cloned().unwrap_or_default();
@@ -247,8 +256,22 @@ fn scan(
     let began = Instant::now();
     let (mut started, mut holes) = (false, 0u64);
     let mut left = HashMap::new();
-    for (i, dev, ino) in todo {
-        let key = path_of(i, &entries);
+    for (i, dev, ino, many) in todo {
+        let (key, link) = (path_of(i, &entries), many.then_some((dev, ino)));
+        // Another name of a file already read this run: the same chunks, without reading it again.
+        if let Some((size, chunks)) = link.and_then(|l| linked.get(&l)) {
+            if free.take(link, chunks) {
+                res.files += 1;
+                res.bytes += size;
+                if let Some(e) = entries[i].as_mut() {
+                    e.kind = Kind::File { size: *size, chunks: chunks.clone() };
+                }
+            } else {
+                entries[i] = None;
+                refuse(&mut res, &key);
+            }
+            continue;
+        }
         // At least one file per run, so the longest waiting always gets its turn.
         if started && (began.elapsed() > RUN_TIME || holes > RUN_HOLES) {
             // Out of time: keep what the last restore point had and come back to it.
@@ -256,9 +279,16 @@ fn scan(
             res.deferred += 1;
             entries[i] =
                 prev.get(&key).filter(|p| matches!(&p.kind, Kind::File { chunks, .. } if sc.have(chunks))).cloned();
-            if let Some(e) = &entries[i] {
-                res.files += 1;
-                res.bytes += e.size();
+            match entries[i].as_ref().map(|e| (e.size(), &e.kind)) {
+                Some((size, Kind::File { chunks, .. })) if free.take(link, chunks) => {
+                    res.files += 1;
+                    res.bytes += size;
+                }
+                Some(_) => {
+                    entries[i] = None;
+                    refuse(&mut res, &key);
+                }
+                None => {}
             }
             continue;
         }
@@ -267,6 +297,14 @@ fn scan(
         match read_file(path, dev, ino, &mut sc) {
             Ok((size, chunks, skipped)) => {
                 holes += skipped;
+                if let Some(l) = link {
+                    linked.insert(l, (size, chunks.clone()));
+                }
+                if !free.take(link, &chunks) {
+                    entries[i] = None;
+                    refuse(&mut res, &key);
+                    continue;
+                }
                 res.files += 1;
                 res.bytes += size;
                 if let Some(e) = entries[i].as_mut() {
@@ -297,6 +335,170 @@ fn scan(
     }
     res.new_bytes = sc.new_bytes;
     Ok(res)
+}
+
+const FREE_FULL: &str = "this set already has as many sparse files and extra hard links as one restore point holds";
+
+/// Counts the index ids a run lets in that cost no disk (see RUN_FREE_IDS).
+struct Free {
+    left: u64,
+    zero: Id,
+    /// Files with more than one name, as (device, inode), that one name already paid for.
+    listed: HashSet<(u64, u64)>,
+}
+
+impl Free {
+    fn new(left: u64, zero: Id) -> Self {
+        Free { left, zero, listed: HashSet::new() }
+    }
+
+    /// Whether one more file fits. Its first name costs its zero chunks, any further name of the
+    /// same file (`link`) its whole chunk list.
+    fn take(&mut self, link: Option<(u64, u64)>, chunks: &[Id]) -> bool {
+        let again = link.is_some_and(|l| self.listed.contains(&l));
+        let cost = if again { chunks.len() } else { chunks.iter().filter(|c| **c == self.zero).count() } as u64;
+        if cost > self.left {
+            return false;
+        }
+        self.left -= cost;
+        if let Some(l) = link {
+            self.listed.insert(l);
+        }
+        true
+    }
+}
+
+/// What the walk keeps of a stat, as std's MetadataExt gives it.
+struct Meta {
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: i64,
+    size: u64,
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn meta(st: &rustix::fs::Stat) -> Meta {
+    Meta {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        nlink: st.st_nlink as u64,
+        mode: st.st_mode as u32,
+        uid: st.st_uid as u32,
+        gid: st.st_gid as u32,
+        mtime: st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
+        size: st.st_size as u64,
+    }
+}
+
+/// One thing the walk found. `into` is the folder to go into, as (device, inode).
+struct Found {
+    path: PathBuf,
+    ft: FileType,
+    md: Meta,
+    link: Option<Vec<u8>>,
+    into: Option<(u64, u64)>,
+}
+
+/// Looks at `name` in the open folder `dir`, without following it if it is a link (but into a
+/// root given as a link to a folder, as the user named it).
+fn found<P: rustix::path::Arg + Copy>(dir: BorrowedFd<'_>, name: P, path: PathBuf, root: bool) -> Result<Found> {
+    use rustix::fs::{AtFlags, statat};
+    let st = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    let (ft, md) = (FileType::from_raw_mode(st.st_mode), meta(&st));
+    if ft == FileType::Symlink && root {
+        // A root named through a link is the folder it names, recorded as that folder: restore
+        // then makes a folder there and puts what it holds inside, not a link it cannot enter.
+        if let Some(t) = statat(dir, name, AtFlags::empty())
+            .ok()
+            .filter(|s| FileType::from_raw_mode(s.st_mode) == FileType::Directory)
+        {
+            let md = meta(&t);
+            return Ok(Found { path, ft: FileType::Directory, into: Some((md.dev, md.ino)), md, link: None });
+        }
+    }
+    let link = match ft {
+        FileType::Symlink => rustix::fs::readlinkat(dir, name, vec![]).ok().map(|t| t.into_bytes()),
+        _ => None,
+    };
+    let into = match ft {
+        FileType::Directory => Some((md.dev, md.ino)),
+        _ => None,
+    };
+    Ok(Found { path, ft, md, link, into })
+}
+
+/// Walks the roots in name order, leaving out what `ex` excludes and never following a link
+/// below a root. Each folder is opened without following a link and checked to be the very one
+/// its parent listed, and what it holds is looked at relative to that open folder, so a folder
+/// swapped for a link mid-walk is never entered. One folder is open at a time.
+struct Walk<'a> {
+    ex: &'a Excludes,
+    stack: Vec<std::vec::IntoIter<Result<Found>>>,
+}
+
+impl<'a> Walk<'a> {
+    fn new(roots: &[PathBuf], ex: &'a Excludes) -> Self {
+        let top: Vec<_> =
+            roots.iter().filter(|r| !ex.is_excluded(r)).map(|r| found(CWD, r.as_path(), r.clone(), true)).collect();
+        Walk { ex, stack: vec![top.into_iter()] }
+    }
+
+    fn list(&self, path: &Path, (dev, ino): (u64, u64), root: bool) -> Result<Vec<Result<Found>>> {
+        let mut flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        if !root {
+            flags |= OFlags::NOFOLLOW;
+        }
+        let fd = rustix::fs::open(path, flags, rustix::fs::Mode::empty())?;
+        let md = meta(&rustix::fs::fstat(&fd)?);
+        if (md.dev, md.ino) != (dev, ino) {
+            bail!("it was replaced while being backed up");
+        }
+        let mut names = vec![];
+        for d in rustix::fs::Dir::read_from(&fd)? {
+            let name = d?.file_name().to_owned();
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names
+            .iter()
+            .filter_map(|n| {
+                let p = path.join(OsStr::from_bytes(n.to_bytes()));
+                (!self.ex.is_excluded(&p)).then(|| found(fd.as_fd(), n.as_c_str(), p, false))
+            })
+            .collect())
+    }
+}
+
+impl Iterator for Walk<'_> {
+    type Item = Result<Found>;
+
+    fn next(&mut self) -> Option<Result<Found>> {
+        loop {
+            let root = self.stack.len() == 1;
+            let f = match self.stack.last_mut()?.next() {
+                Some(Ok(f)) => f,
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    self.stack.pop();
+                    continue;
+                }
+            };
+            if let Some(into) = f.into {
+                match self.list(&f.path, into, root) {
+                    Ok(inside) => self.stack.push(inside.into_iter()),
+                    // A folder that cannot be read, or was swapped, is skipped with all it holds.
+                    Err(e) => return Some(Err(anyhow!("{}: {e}", f.path.display()))),
+                }
+            }
+            return Some(Ok(f));
+        }
+    }
 }
 
 pub fn split_index(buf: &[u8]) -> Vec<&[u8]> {
@@ -348,7 +550,6 @@ pub fn check_local(keys: &Keys, last: Vec<Entry>, out: &Out) -> (u64, u64) {
 /// Opens the file the scan just looked at. A link, pipe or different file swapped in
 /// since then is refused rather than read, and a pipe cannot make the open wait.
 fn open_scanned(path: &Path, dev: u64, ino: u64) -> Result<(fs::File, u64)> {
-    use rustix::fs::OFlags;
     use std::os::unix::fs::OpenOptionsExt;
     let flags = (OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32;
     let f = fs::OpenOptions::new().read(true).custom_flags(flags).open(path)?;
@@ -902,7 +1103,7 @@ async fn run_once(
         skipped += &format!(", {} unreadable skipped", scan.skipped);
     }
     if scan.refused > 0 {
-        skipped += &format!(", {} sparse files NOT backed up", scan.refused);
+        skipped += &format!(", {} files NOT backed up", scan.refused);
     }
     if scan.deferred > 0 {
         skipped += &format!(", {} changed files left for the next run", scan.deferred);
@@ -933,7 +1134,7 @@ async fn run_once(
     if scan.refused > 0 {
         // Data the user expects to be safe is not: say so where it will be seen, not just in passing.
         let line = format!(
-            "{prefix}WARNING: {} sparse files are NOT in this restore point (marked NOT BACKED UP above)",
+            "{prefix}WARNING: {} files are NOT in this restore point (marked NOT BACKED UP above)",
             scan.refused
         );
         node.note(line.clone());
@@ -970,6 +1171,85 @@ mod tests {
             let err = holes(&sparse, MAX_HOLES + (1 << 30)).unwrap_err();
             assert!(err.to_string().starts_with("sparse file"), "{err}");
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_walk_never_leaves_the_set() {
+        let dir = std::env::temp_dir().join(format!("sdb-test-walk-{}", rand::random::<u64>()));
+        let (root, outside) = (dir.join("root"), dir.join("outside"));
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("a/x"), "x").unwrap();
+        fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("b")).unwrap();
+        std::os::unix::fs::symlink(&root, dir.join("via")).unwrap();
+        let ex = Excludes::new(&Config::new("n".into()), &BackupSet::default(), Path::new("/nonexistent")).unwrap();
+        let names = |r: &Path| -> Vec<String> {
+            Walk::new(&[r.to_path_buf()], &ex)
+                .map(|f| f.unwrap().path.strip_prefix(r).unwrap().display().to_string())
+                .collect()
+        };
+        assert_eq!(names(&root), ["", "a", "a/x", "b"]);
+        // A root given as a link is followed; links below it are not.
+        assert_eq!(names(&dir.join("via")), ["", "a", "a/x", "b"]);
+        // ...and recorded as the folder it names, so a restore can make a folder there.
+        let top = Walk::new(&[dir.join("via")], &ex).next().unwrap().unwrap();
+        assert!(top.ft == FileType::Directory && top.link.is_none());
+        // A folder swapped for a link, or for another folder, after its parent listed it.
+        let walk = Walk::new(&[], &ex);
+        let st = fs::symlink_metadata(root.join("a")).unwrap();
+        fs::rename(root.join("a"), dir.join("a")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a")).unwrap();
+        assert!(walk.list(&root.join("a"), (st.dev(), st.ino()), false).is_err());
+        fs::remove_file(root.join("a")).unwrap();
+        fs::create_dir(root.join("a")).unwrap();
+        assert!(walk.list(&root.join("a"), (st.dev(), st.ino()), false).is_err());
+        fs::remove_dir(root.join("a")).unwrap();
+        fs::rename(dir.join("a"), root.join("a")).unwrap();
+        assert_eq!(walk.list(&root.join("a"), (st.dev(), st.ino()), false).unwrap().len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn free_index_ids_are_bounded() {
+        let (zero, data) = ([0; 32], [1; 32]);
+        let mut free = Free::new(10, zero);
+        // A sparse file costs its zero chunks.
+        assert!(free.take(None, &[data, zero, zero, zero, zero]));
+        assert_eq!(free.left, 6);
+        // The first name of a linked file likewise, a further name its whole list.
+        assert!(free.take(Some((1, 2)), &[data, data, data]));
+        assert_eq!(free.left, 6);
+        assert!(free.take(Some((1, 2)), &[data, data, data]));
+        assert_eq!(free.left, 3);
+        assert!(!free.take(Some((1, 2)), &[data, data, data, data]));
+        assert!(!free.take(None, &[zero; 4]));
+        assert!(free.take(None, &[data; 100]));
+        assert_eq!(free.left, 3);
+    }
+
+    #[test]
+    fn hard_links_are_read_once_and_kept() {
+        let dir = std::env::temp_dir().join(format!("sdb-test-links-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a"), noise(3 << 20)).unwrap();
+        fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+        fs::hard_link(dir.join("a"), dir.join("c")).unwrap();
+        let keys = Arc::new(Keys::new(&[7; 32]));
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = std::thread::spawn(move || while rx.blocking_recv().is_some() {});
+        let sc = Scanner { keys, known: vec![], sent: HashSet::new(), tx, new_bytes: 0, zero: None };
+        let (otx, _orx) = tokio::sync::mpsc::unbounded_channel();
+        let ex = Excludes { globs: GlobSetBuilder::new().build().unwrap(), dirs: vec![] };
+        let res = scan("links".into(), vec![dir.clone()], ex, HashMap::new(), sc, Out(otx)).unwrap();
+        drain.join().unwrap();
+        let lists: Vec<_> =
+            res.entries.iter().filter(|e| matches!(e.kind, Kind::File { .. })).map(|e| &e.kind).collect();
+        assert_eq!(lists.len(), 3);
+        assert!(lists.iter().all(|k| *k == lists[0] && matches!(k, Kind::File { size, .. } if *size == 3 << 20)));
+        assert_eq!(res.refused, 0);
         fs::remove_dir_all(dir).unwrap();
     }
 

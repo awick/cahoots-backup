@@ -9,7 +9,7 @@
 use crate::{
     config::Cloud,
     crypto::Id,
-    proto::{MAX_BLOB, MAX_IDS, MAX_SNAPSHOT},
+    proto::{MAX_BLOB, MAX_IDS, MAX_MSG, MAX_SNAPSHOT},
     store::check_snap,
 };
 use anyhow::{Result, anyhow, bail};
@@ -31,6 +31,16 @@ const TRIES: u32 = 4;
 const MAX_PAGE: usize = 8 << 20;
 /// Most restore point records one listing takes in.
 const MAX_SNAPS: usize = 50_000;
+/// Most bytes of restore point records one listing holds, as for a friend or a drive.
+const MAX_SNAPS_BYTES: u64 = (MAX_MSG - (1 << 20)) as u64;
+/// Most pages one listing takes: enough for the most objects a node keeps, a thousand a page.
+const MAX_PAGES: u64 = (MAX_IDS + MAX_SNAPS as u64) / 1000 + 1000;
+/// A sealed chunk is a format byte, a nonce and a tag around at most this much.
+const MIN_SEALED: u64 = 1 + 24 + 16;
+const MAX_SEALED: usize = MAX_BLOB + 64;
+
+/// A restore point record's id, version tag and body, if it is still there.
+type Fetched = (String, String, Option<Vec<u8>>);
 
 pub struct Bucket {
     http: reqwest::Client,
@@ -40,6 +50,8 @@ pub struct Bucket {
     base: String,
     /// "bucket at host", for status lines.
     pub place: String,
+    /// Storage on this computer, which has no other owner to check for.
+    local: bool,
     /// Bytes stored, learned from a listing and kept current as we add and remove.
     used: Mutex<Option<u64>>,
     /// One count of the bucket at a time; the others wait for its answer.
@@ -52,15 +64,12 @@ pub struct Bucket {
 /// accepted for storage running on this computer.
 pub fn check_endpoint(endpoint: &str) -> Result<reqwest::Url> {
     let url: reqwest::Url = endpoint.parse().map_err(|_| anyhow!("{endpoint} is not a valid endpoint URL"))?;
-    let local = match url.host() {
-        Some(url::Host::Domain(d)) => d == "localhost",
-        Some(url::Host::Ipv4(a)) => a.is_loopback(),
-        Some(url::Host::Ipv6(a)) => a.is_loopback(),
-        None => bail!("{endpoint} is not a valid endpoint URL"),
-    };
+    if url.host().is_none() {
+        bail!("{endpoint} is not a valid endpoint URL");
+    }
     match url.scheme() {
         "https" => {}
-        "http" if local => {}
+        "http" if is_local(&url) => {}
         "http" => bail!("the endpoint must start with https:// (http is only accepted for this computer itself)"),
         _ => bail!("the endpoint must start with https://"),
     }
@@ -70,10 +79,27 @@ pub fn check_endpoint(endpoint: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+fn is_local(url: &reqwest::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(a)) => a.is_loopback(),
+        Some(url::Host::Ipv6(a)) => a.is_loopback(),
+        None => false,
+    }
+}
+
+/// The `<Code>` of an S3 error answer.
+fn error_code(body: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(body).ok()?;
+    let start = text.find("<Code>")? + "<Code>".len();
+    Some(text[start..][..text[start..].find("</Code>")?].trim())
+}
+
 impl Bucket {
     pub fn open(c: &Cloud, owner: &str) -> Result<Self> {
         let endpoint = check_endpoint(&c.endpoint)?;
         let host = endpoint.host_str().unwrap_or_default().to_string();
+        let local = is_local(&endpoint);
         let style = if c.path_style { UrlStyle::Path } else { UrlStyle::VirtualHost };
         let bucket = rusty_s3::Bucket::new(endpoint, style, c.bucket.clone(), c.region.clone())
             .map_err(|e| anyhow!("bad endpoint or bucket: {e}"))?;
@@ -98,6 +124,7 @@ impl Bucket {
             creds: Credentials::new(c.access_key.clone(), c.secret_key.clone()),
             base: if prefix.is_empty() { format!("{owner}/") } else { format!("{prefix}/{owner}/") },
             place: format!("{} at {host}", c.bucket),
+            local,
             used: Mutex::new(None),
             counting: Default::default(),
             snaps: Mutex::new(HashMap::new()),
@@ -148,14 +175,25 @@ impl Bucket {
         Ok(out)
     }
 
-    /// Creates the bucket; fine if it already exists and is ours.
+    /// Creates the bucket; fine if it already exists and is ours, but not if it is someone else's.
     pub async fn create(&self) -> Result<()> {
         let url = self.bucket.create_bucket(&self.creds).sign(SIGNED_FOR);
         let r = self.send("create the bucket", || self.http.put(url.as_str())).await?;
-        if r.status().is_success() || r.status().as_u16() == 409 {
+        if r.status().is_success() {
             return Ok(());
         }
-        Err(Self::fail("create the bucket", r).await)
+        if r.status().as_u16() != 409 {
+            return Err(Self::fail("create the bucket", r).await);
+        }
+        let body = Self::body(r, 2000).await.unwrap_or_default();
+        match error_code(&body) {
+            Some("BucketAlreadyOwnedByYou") => Ok(()),
+            Some("BucketAlreadyExists") => bail!(
+                "the bucket name {} is taken by another account: choose another name (if the bucket is yours, add it without creating it)",
+                self.bucket.name()
+            ),
+            code => bail!("cloud storage refused to create the bucket: 409 Conflict {}", code.unwrap_or_default()),
+        }
     }
 
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -188,7 +226,9 @@ impl Bucket {
     /// at a time and are handed over as they arrive; `each` returns false to stop early.
     async fn list(&self, prefix: &str, mut each: impl FnMut(&str, u64, &str) -> bool) -> Result<()> {
         let mut token: Option<String> = None;
-        loop {
+        // A storage that hands back any token it gave before, or pages without end, is never done.
+        let mut tokens = HashSet::new();
+        for _ in 0..MAX_PAGES {
             let mut action = self.bucket.list_objects_v2(Some(&self.creds));
             action.with_prefix(prefix.to_string());
             if let Some(t) = &token {
@@ -208,11 +248,12 @@ impl Bucket {
                 }
             }
             match page.next_continuation_token {
-                Some(t) if token.as_ref() != Some(&t) => token = Some(t),
+                Some(t) if tokens.insert(*blake3::hash(t.as_bytes()).as_bytes()) => token = Some(t),
                 Some(_) => bail!("the storage's listing does not end"),
                 None => return Ok(()),
             }
         }
+        bail!("the storage's listing does not end")
     }
 
     fn chunk_key(&self, id: &Id) -> String {
@@ -230,9 +271,19 @@ impl Bucket {
         }
     }
 
-    /// Proves the endpoint, bucket and keys work for reading, writing and deleting.
+    /// Proves the endpoint, bucket and keys work for reading, writing and deleting, and that
+    /// the bucket is not open to anyone (as one squatted under a name we picked may be).
     pub async fn check(&self) -> Result<()> {
         self.list(&self.base, |_, _, _| false).await?;
+        if !self.local {
+            let mut action = self.bucket.list_objects_v2(None);
+            action.with_prefix(self.base.clone());
+            action.with_max_keys(1);
+            let url = action.sign(SIGNED_FOR);
+            if self.send("list the bucket", || self.http.get(url.as_str())).await?.status().is_success() {
+                bail!("anyone can list {}: use a private bucket of your own", self.place);
+            }
+        }
         let key = format!("{}sdb-check", self.base);
         self.put(&key, b"sdb").await?;
         self.delete(&key).await
@@ -259,14 +310,20 @@ impl Bucket {
         self.usage().await
     }
 
-    pub async fn list_chunks(&self) -> Result<HashSet<Id>> {
+    /// Hands each chunk stored here to `each` as the listing arrives; the caller decides what to
+    /// keep, so storage that lists ids it never stored cannot make this node hold them.
+    pub async fn list_chunks(&self, mut each: impl FnMut(Id)) -> Result<()> {
         let chunks = format!("{}chunks/", self.base);
-        let (mut total, mut set, mut seen) = (0u64, HashSet::new(), 0u64);
+        let (mut total, mut seen) = (0u64, 0u64);
         self.list(&self.base, |key, size, _| {
             total = total.saturating_add(size);
             seen += 1;
-            if let Some(id) = key.strip_prefix(&chunks).and_then(|h| hex::decode(h).ok()?.try_into().ok()) {
-                set.insert(id);
+            // Only what could be a sealed chunk counts as one stored.
+            let sealed = (MIN_SEALED..=MAX_SEALED as u64).contains(&size);
+            if let Some(id) =
+                key.strip_prefix(&chunks).filter(|_| sealed).and_then(|h| hex::decode(h).ok()?.try_into().ok())
+            {
+                each(id);
             }
             seen <= MAX_IDS
         })
@@ -275,7 +332,7 @@ impl Bucket {
             bail!("implausible chunk count");
         }
         *self.used.lock().unwrap() = Some(total);
-        Ok(set)
+        Ok(())
     }
 
     /// Refuses what would go past the cap. The running total may run high (an object stored
@@ -313,7 +370,7 @@ impl Bucket {
     pub async fn get_chunks(&self, ids: &[Id]) -> Result<Vec<Option<Vec<u8>>>> {
         let gets: Vec<BoxFuture<'_, Result<Option<Vec<u8>>>>> = ids
             .iter()
-            .map(|id| Box::pin(async move { self.get(&self.chunk_key(id), MAX_BLOB + 64).await }) as BoxFuture<'_, _>)
+            .map(|id| Box::pin(async move { self.get(&self.chunk_key(id), MAX_SEALED).await }) as BoxFuture<'_, _>)
             .collect();
         stream::iter(gets).buffered(PARALLEL).try_collect().await
     }
@@ -344,13 +401,14 @@ impl Bucket {
     /// while the storage reports the same version of it.
     pub async fn list_snapshots(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let prefix = format!("{}snapshots/", self.base);
-        let mut found: Vec<(String, String)> = vec![];
+        let (mut found, mut listed): (Vec<(String, String)>, u64) = (vec![], 0);
         self.list(&prefix, |key, size, etag| {
             let id = &key[prefix.len()..];
             if check_snap(id).is_ok() && size <= MAX_SNAPSHOT as u64 {
                 found.push((id.to_string(), etag.to_string()));
+                listed += size;
             }
-            found.len() <= MAX_SNAPS
+            found.len() <= MAX_SNAPS && listed <= MAX_SNAPS_BYTES
         })
         .await?;
         // A partial list must never be taken for the whole one: cleaning up would delete the
@@ -358,25 +416,36 @@ impl Bucket {
         if found.len() > MAX_SNAPS {
             bail!("more than {MAX_SNAPS} restore points are stored there; too many to list");
         }
-        let cached = self.snaps.lock().unwrap().clone();
+        let too_big = || anyhow!("the restore point records stored there are too large to list");
+        if listed > MAX_SNAPS_BYTES {
+            return Err(too_big());
+        }
         let prefix = &prefix;
-        let gets: Vec<BoxFuture<'_, Result<Option<Vec<u8>>>>> = found
-            .iter()
-            .map(|(id, etag)| {
-                let hit = cached.get(id).filter(|(e, _)| !e.is_empty() && e == etag).map(|(_, b)| b.clone());
-                Box::pin(async move {
-                    match hit {
-                        Some(b) => Ok(Some(b)),
-                        None => self.get(&format!("{prefix}{id}"), MAX_SNAPSHOT).await,
-                    }
-                }) as BoxFuture<'_, _>
-            })
-            .collect();
-        let blobs: Vec<Option<Vec<u8>>> = stream::iter(gets).buffered(PARALLEL).try_collect().await?;
-        let mut out = vec![];
-        let mut keep = HashMap::new();
-        for ((id, etag), blob) in found.into_iter().zip(blobs) {
+        let gets: Vec<BoxFuture<'_, Result<Fetched>>> = {
+            let cached = self.snaps.lock().unwrap();
+            found
+                .into_iter()
+                .map(|(id, etag)| {
+                    let hit = cached.get(&id).filter(|(e, _)| !e.is_empty() && *e == etag).map(|(_, b)| b.clone());
+                    Box::pin(async move {
+                        let blob = match hit {
+                            Some(b) => Some(b),
+                            None => self.get(&format!("{prefix}{id}"), MAX_SNAPSHOT).await?,
+                        };
+                        Ok((id, etag, blob))
+                    }) as BoxFuture<'_, _>
+                })
+                .collect()
+        };
+        // The listing's sizes are only the storage's word: what arrives is counted too.
+        let mut blobs = stream::iter(gets).buffered(PARALLEL);
+        let (mut out, mut keep, mut held) = (vec![], HashMap::new(), 0u64);
+        while let Some((id, etag, blob)) = blobs.try_next().await? {
             if let Some(b) = blob {
+                held += b.len() as u64;
+                if held > MAX_SNAPS_BYTES {
+                    return Err(too_big());
+                }
                 keep.insert(id.clone(), (etag, b.clone()));
                 out.push((id, b));
             }
@@ -410,6 +479,15 @@ mod tests {
         assert!(check_endpoint("ftp://s3.example.com").is_err());
         assert!(check_endpoint("https://key:secret@s3.example.com").is_err());
         assert!(check_endpoint("not a url").is_err());
+    }
+
+    #[test]
+    fn only_our_own_bucket_is_taken_as_created() {
+        let err = |c: &str| format!("<?xml version=\"1.0\"?><Error><Code>{c}</Code><Message>x</Message></Error>");
+        assert_eq!(error_code(err("BucketAlreadyOwnedByYou").as_bytes()), Some("BucketAlreadyOwnedByYou"));
+        assert_eq!(error_code(err("BucketAlreadyExists").as_bytes()), Some("BucketAlreadyExists"));
+        assert_eq!(error_code(b"<Error><Code>BucketAlready"), None);
+        assert_eq!(error_code(b""), None);
     }
 
     #[test]

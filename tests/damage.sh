@@ -222,6 +222,12 @@ if [ -e halfway/data/huge ]; then
 fi
 a restore latest data/huge --to halfway --from usb >/dev/null || fail "restoring again over a stopped restore"
 cmp halfway/data/huge data/huge || fail "the second restore differs"
+# The stopped restore, if the daemon was still at it, ends within a few seconds; neither leaves its half-written file.
+for _ in $(seq 1 20); do
+    [ -z "$(find halfway -name '*.sdb-tmp')" ] && break
+    sleep 0.5
+done
+[ -z "$(find halfway -name '*.sdb-tmp')" ] || fail "a half-written file was left behind: $(find halfway -name '*.sdb-tmp')"
 rm -rf halfway data/huge
 
 step "restoring over what is already there, and where a file is in the way"

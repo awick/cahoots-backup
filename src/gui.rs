@@ -16,7 +16,6 @@ use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::mpsc,
     time::{Duration, Instant},
@@ -35,8 +34,7 @@ const LABEL_WIDTH: f32 = 104.0;
 /// `line` as they arrive; progress lines (starting "...") are passed on but not kept.
 fn call(home: &Path, cmd: &Cmd, mut line: impl FnMut(&str)) -> Result<Vec<String>, String> {
     let gone = || "the daemon is not running; quit and start `sdb gui` again".to_string();
-    let path = control::own_socket(home).ok_or_else(gone)?;
-    let mut s = UnixStream::connect(path).map_err(|_| gone())?;
+    let mut s = control::connect_blocking(home).ok_or_else(gone)?;
     let text = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
     s.write_all(format!("{text}\n").as_bytes()).map_err(|e| e.to_string())?;
     let mut out = vec![];

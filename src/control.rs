@@ -111,22 +111,44 @@ pub fn started_fingerprint() -> String {
     STARTED.get_or_init(fingerprint).clone()
 }
 
-/// Connects to the local daemon, but only through a socket this user owns.
-pub async fn connect(home: &Path) -> Option<UnixStream> {
-    let path = sock_path(home);
-    let md = std::fs::symlink_metadata(&path).ok()?;
-    if md.uid() != rustix::process::getuid().as_raw() {
-        return None;
+/// Where a client looks for the daemon: never a guessed name in a shared folder. A deep
+/// home's socket is only where the daemon recorded it, in a folder still private to this user.
+fn client_path(home: &Path) -> Option<PathBuf> {
+    let p = home.join("sdb.sock");
+    if p.as_os_str().len() < 100 {
+        return Some(p);
     }
-    UnixStream::connect(&path).await.ok()
+    let b = std::fs::read(pointer(home)).ok()?;
+    let p = PathBuf::from(OsStr::from_bytes(b.trim_ascii_end()));
+    let private = |d: &Path| {
+        std::fs::symlink_metadata(d)
+            .is_ok_and(|md| md.is_dir() && md.uid() == rustix::process::getuid().as_raw() && md.mode() & 0o077 == 0)
+    };
+    (p.is_absolute() && p.parent().is_some_and(private)).then_some(p)
 }
 
-/// The daemon's socket path, if it exists and belongs to this user.
+/// Connects to the local daemon, but only one run by this user. The kernel says who is at
+/// the other end of the connection, whatever was at the path a moment before, so nothing
+/// is sent (passphrases and keys among it) to anyone else who got a socket there.
+pub async fn connect(home: &Path) -> Option<UnixStream> {
+    let s = UnixStream::connect(client_path(home)?).await.ok()?;
+    s.peer_cred().is_ok_and(|c| c.uid() == rustix::process::getuid().as_raw()).then_some(s)
+}
+
+/// The same for a caller with no async runtime (the GUI). Done on a thread of its own, as
+/// the caller may be inside the main runtime, where another cannot run.
 #[cfg(feature = "gui")]
-pub fn own_socket(home: &Path) -> Option<PathBuf> {
-    let path = sock_path(home);
-    let md = std::fs::symlink_metadata(&path).ok()?;
-    (md.uid() == rustix::process::getuid().as_raw()).then_some(path)
+pub fn connect_blocking(home: &Path) -> Option<std::os::unix::net::UnixStream> {
+    let home = home.to_path_buf();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_io().build().ok()?;
+        let s = rt.block_on(async { connect(&home).await?.into_std().ok() })?;
+        s.set_nonblocking(false).ok()?;
+        Some(s)
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 pub fn listen(home: &Path) -> Result<UnixListener> {

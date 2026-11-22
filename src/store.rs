@@ -5,7 +5,7 @@
 
 use crate::{
     crypto::Id,
-    proto::{ID_BATCH, MAX_BLOB, MAX_MSG, MAX_SNAPSHOT},
+    proto::{ID_BATCH, MAX_BLOB, MAX_IDS, MAX_MSG, MAX_SNAPSHOT},
 };
 use anyhow::{Result, anyhow, bail};
 use rustix::{
@@ -17,7 +17,9 @@ use std::{
     ffi::OsStr,
     fs, io,
     io::{Read, Write},
+    mem,
     os::fd::{AsFd, OwnedFd},
+    os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
@@ -31,6 +33,9 @@ const MAX_SNAPSHOTS: usize = 50_000;
 
 /// The largest file the store ever writes: a chunk with its header and checksum.
 const MAX_FILE: usize = MAX_BLOB + 37;
+
+/// The smallest chunk file: its header and checksum around no data.
+const MIN_FILE: usize = 37;
 
 type Locks = Mutex<HashMap<String, Arc<Mutex<()>>>>;
 
@@ -100,6 +105,45 @@ fn read_open(f: fs::File, max: usize) -> Option<Vec<u8>> {
 /// Opening never follows a link and never waits on a pipe.
 fn read_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
+}
+
+/// A name of exactly `len` lowercase hex digits, as the store writes them.
+fn hex_name(name: &OsStr, len: usize) -> bool {
+    name.len() == len && name.as_bytes().iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Opens a folder inside an open folder, refusing a link or anything that is not a folder.
+fn sub(dir: impl AsFd, name: &OsStr) -> Option<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    rustix::fs::openat(dir, name, flags, Mode::empty()).ok()
+}
+
+/// Hands each name in an open folder, with the type the folder itself records for it, to `f`
+/// until it returns false.
+fn each_name(dir: impl AsFd, mut f: impl FnMut(&OsStr, rustix::fs::FileType) -> bool) {
+    let Ok(mut d) = rustix::fs::Dir::read_from(dir) else { return };
+    while let Some(Ok(e)) = d.read() {
+        if !f(OsStr::from_bytes(e.file_name().to_bytes()), e.file_type()) {
+            return;
+        }
+    }
+}
+
+/// Hands each well-named chunk file in an owner's open chunks folder (`<2hex>/<2hex><62hex>`) to
+/// `f`, with the open folder it sits in, until `f` returns false. Each folder is opened from the
+/// one above it and never through a link, so a folder swapped for a link cannot lead outside.
+fn each_chunk(chunks: &OwnedFd, mut f: impl FnMut(&OwnedFd, &OsStr, rustix::fs::FileType) -> bool) {
+    let mut go = true;
+    each_name(chunks, |shard, _| {
+        let Some(dir) = hex_name(shard, 2).then(|| sub(chunks, shard)).flatten() else { return true };
+        each_name(&dir, |name, ft| {
+            if hex_name(name, 64) && name.as_bytes().starts_with(shard.as_bytes()) {
+                go = f(&dir, name, ft);
+            }
+            go
+        });
+        go
+    });
 }
 
 pub fn check_owner(owner: &str) -> Result<()> {
@@ -312,7 +356,7 @@ impl Store {
     }
 
     fn intact(buf: &[u8]) -> bool {
-        buf.len() >= 37
+        buf.len() >= MIN_FILE
             && buf[..5] == FILE_MAGIC[..]
             && blake3::hash(&buf[5..buf.len() - 32]).as_bytes() == &buf[buf.len() - 32..]
     }
@@ -336,22 +380,27 @@ impl Store {
     }
 
     /// Re-reads everything friends store here and removes chunks that no longer match their checksum.
+    /// Every read and delete goes through folders opened from the root, so a folder swapped for
+    /// a link mid-scrub cannot point a delete outside the store.
     pub fn scrub(&self) -> (u64, u64) {
-        use std::os::unix::fs::OpenOptionsExt;
         let (mut checked, mut bad) = (0, 0);
-        for e in
-            walkdir::WalkDir::new(&self.root).min_depth(4).into_iter().flatten().filter(|e| e.file_type().is_file())
-        {
-            let opened = fs::OpenOptions::new().read(true).custom_flags(read_flags().bits() as i32).open(e.path());
-            let Some(buf) = opened.ok().and_then(|f| read_open(f, MAX_FILE)) else {
-                continue;
+        let Ok(root) = self.open_dir(&self.root, false) else { return (0, 0) };
+        each_name(&root, |owner, _| {
+            let ok = owner.to_str().is_some_and(|o| check_owner(o).is_ok());
+            let Some(chunks) = ok.then(|| sub(&root, owner)).flatten().and_then(|d| sub(d, "chunks".as_ref())) else {
+                return true;
             };
-            checked += 1;
-            if !Self::intact(&buf) && e.path().extension().is_none() {
-                bad += 1;
-                let _ = fs::remove_file(e.path());
-            }
-        }
+            each_chunk(&chunks, |dir, name, _| {
+                let Some(buf) = Self::read_at(dir, name, MAX_FILE) else { return true };
+                checked += 1;
+                if !Self::intact(&buf) {
+                    bad += 1;
+                    let _ = rustix::fs::unlinkat(dir, name, AtFlags::empty());
+                }
+                true
+            });
+            true
+        });
         if bad > 0 {
             for c in self.usage.lock().unwrap().values_mut() {
                 c.used = None;
@@ -362,28 +411,36 @@ impl Store {
     }
 
     /// Hands every chunk id an owner keeps here to `each`, a batch at a time, until it returns
-    /// false. Nothing is gathered in memory, however many chunks there are.
+    /// false. Nothing is gathered in memory, however many chunks there are. Only regular files
+    /// in their own shard folder, with a chunk's name and possible size, count, and never more
+    /// than one listing may carry, so planted names cannot swell the listing.
     pub fn list_chunks(&self, owner: &str, mut each: impl FnMut(Vec<Id>) -> bool) {
         let dir = self.root.join(owner).join("chunks");
-        if self.open_dir(&dir, false).is_err() {
-            return;
-        }
-        let ids = walkdir::WalkDir::new(dir)
-            .follow_root_links(false)
-            .min_depth(2)
-            .max_depth(2)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| hex::decode(e.file_name().to_str()?).ok()?.try_into().ok());
-        let mut batch = Vec::with_capacity(ID_BATCH);
-        for id in ids {
+        let Some(chunks) = check_owner(owner).ok().and_then(|_| self.open_dir(&dir, false).ok()) else { return };
+        let (mut batch, mut total, mut go) = (Vec::with_capacity(ID_BATCH), 0u64, true);
+        each_chunk(&chunks, |dir, name, ft| {
+            // The folder says what each entry is, so a listing reads only folders: a stat per
+            // chunk would make a large listing from a slow disk crawl. Damaged or empty files are
+            // what scrub and verify are for.
+            use rustix::fs::FileType;
+            let file = match ft {
+                FileType::RegularFile => true,
+                FileType::Unknown => {
+                    rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| is_file(&st))
+                }
+                _ => false,
+            };
+            let Some(id) = file.then(|| hex::decode(name.as_bytes()).ok()?.try_into().ok()).flatten() else {
+                return true;
+            };
             batch.push(id);
-            if batch.len() == ID_BATCH && !each(std::mem::replace(&mut batch, Vec::with_capacity(ID_BATCH))) {
-                return;
+            total += 1;
+            if batch.len() == ID_BATCH {
+                go = each(mem::replace(&mut batch, Vec::with_capacity(ID_BATCH)));
             }
-        }
-        if !batch.is_empty() {
+            go && total < MAX_IDS
+        });
+        if go && !batch.is_empty() {
             each(batch);
         }
     }
@@ -613,6 +670,36 @@ mod tests {
         assert!(s.put_snapshot(OWNER, "abc", b"m", 1 << 20).is_err());
         assert!(ids(&s).is_empty());
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 1, "nothing was written through the link");
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn scrub_and_listing_keep_to_the_store_layout() {
+        let (s, dir) = store(0);
+        s.put_chunk(OWNER, &[0x11; 32], b"kept", 1 << 20).unwrap();
+        let chunks = dir.join(OWNER).join("chunks");
+        let real = s.chunk_path(OWNER, &[0x11; 32]);
+        let fake = |id: [u8; 32]| hex::encode(id);
+        // Planted names: in the wrong shard, upper case, a link, a folder, a stray temp file. (Sizes
+        // are not looked at: listing reads only folders, and damaged files are scrub's and verify's.)
+        fs::write(chunks.join("11").join(fake([0x22; 32])), vec![0u8; 100]).unwrap();
+        fs::write(chunks.join("11").join(format!("11{}", "A".repeat(62))), vec![0u8; 100]).unwrap();
+        fs::create_dir_all(chunks.join("33")).unwrap();
+        std::os::unix::fs::symlink(&real, chunks.join("33").join(fake([0x33; 32]))).unwrap();
+        fs::create_dir_all(chunks.join("44").join(fake([0x44; 32]))).unwrap();
+        fs::write(chunks.join("11").join(format!("{}.tmp1", fake([0x11; 32]))), b"x").unwrap();
+        assert_eq!(ids(&s), vec![[0x11u8; 32]], "only the stored chunk is listed");
+        // An empty chunk file is for scrub to drop.
+        fs::write(chunks.join("11").join(format!("11{}", "0".repeat(62))), b"").unwrap();
+        // A shard folder that is a link to outside the store is neither read nor emptied.
+        let outside = dir.with_extension("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join(fake([0x55; 32])), b"victim").unwrap();
+        std::os::unix::fs::symlink(&outside, chunks.join("55")).unwrap();
+        assert_eq!(s.scrub(), (2, 1), "the empty chunk file in the store is dropped");
+        assert!(outside.join(fake([0x55; 32])).exists(), "nothing outside the store was deleted");
+        assert!(chunks.join("11").join(fake([0x22; 32])).exists(), "wrong-shard names are not touched");
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }

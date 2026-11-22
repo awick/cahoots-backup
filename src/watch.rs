@@ -36,6 +36,8 @@ pub async fn run(node: Arc<Node>, out: Out) {
     let mut refill = true;
     let mut last_scan = Instant::now();
     let (started, mut last_jobs, mut last_kit) = (Instant::now(), Instant::now(), Instant::now());
+    // A copy of the recovery kit still under way; a hung folder holds one thread, not one per try.
+    let mut kit_sync: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
     let mut last_alert = Instant::now() - Duration::from_secs(3000);
     let mut last_notice = Instant::now();
     let mut last_touch = Instant::now() - Duration::from_secs(280);
@@ -202,11 +204,19 @@ pub async fn run(node: Arc<Node>, out: Out) {
             // disk, so restarting the daemon does not start the wait over. Neither runs in the
             // first minutes after a start, while the network and the clock may still be settling.
             let wall = chrono::Utc::now().timestamp();
-            if last_kit.elapsed() > Duration::from_secs(600) {
+            if last_kit.elapsed() > Duration::from_secs(600) && kit_sync.as_ref().is_none_or(|h| h.is_finished()) {
                 last_kit = Instant::now();
-                // Only says so when it fails; the warnings carry it from then on.
-                if let Err(e) = crate::recovery::copy_sync(&node.home, false) {
-                    out.say(format!("recovery kit: {e:#}"));
+                // Only says so when it fails; the warnings carry it from then on. The copy may sit on a
+                // slow or hung disk, so it runs off the async workers and this loop waits only so long;
+                // one that is still stuck at the next turn is left to finish rather than joined by another.
+                let home = node.home.clone();
+                let sync =
+                    kit_sync.insert(tokio::task::spawn_blocking(move || crate::recovery::copy_sync(&home, false)));
+                match tokio::time::timeout(Duration::from_secs(60), sync).await {
+                    Ok(Ok(Ok(_))) => {}
+                    Ok(Ok(Err(e))) => out.say(format!("recovery kit: {e:#}")),
+                    Ok(Err(e)) => out.say(format!("recovery kit: {e}")),
+                    Err(_) => out.say("recovery kit: its folder did not answer within a minute"),
                 }
             }
             if started.elapsed() > SETTLE && last_jobs.elapsed() > Duration::from_secs(60) {

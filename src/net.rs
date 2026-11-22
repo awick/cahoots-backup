@@ -7,12 +7,18 @@ use crate::{
     config::Friend,
     crypto::Id,
     node::Node,
-    proto::{self, ALPN, MAX_BLOB, MAX_DELETE, MAX_IDS, MAX_SNAPSHOT, PIECE, Req, Resp},
+    proto::{self, ALPN, ID_BATCH, MAX_BLOB, MAX_DELETE, MAX_IDS, MAX_SNAPSHOT, PIECE, Req, Resp},
     store::{Store, check_snap, cost},
 };
 use anyhow::{Result, anyhow, bail};
+use futures::StreamExt;
 use iroh::{
-    Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    address_lookup::{
+        AddressLookup, AddressLookupBuilder, AddressLookupBuilderError, DnsAddressLookup, EndpointData, EndpointInfo,
+        Item, PkarrPublisher, PkarrResolver,
+    },
+    dns::{BoxIter, DNS_TIMEOUT, DnsError, DnsResolver, Resolver, TxtRecordData},
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler},
 };
@@ -20,7 +26,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     future::Future,
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -44,7 +50,15 @@ fn builder(secret: &SecretKey, upnp: bool) -> iroh::endpoint::Builder {
     let mut b = if offline() {
         Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
     } else {
-        Endpoint::builder(presets::N0)
+        // What N0 sets up, except that what a lookup says about a friend (which they sign and so
+        // choose) passes the same filter as their hints, and a name iroh resolves, a relay's
+        // included, only ever yields public addresses, so the address checked is the one dialed.
+        Endpoint::builder(presets::Minimal)
+            .address_lookup(PkarrPublisher::n0_dns())
+            .address_lookup(Public(PkarrResolver::n0_dns()))
+            .address_lookup(Public(DnsAddressLookup::n0_dns()))
+            .relay_mode(iroh::endpoint::default_relay_mode())
+            .dns_resolver(DnsResolver::custom(PublicDns(DnsResolver::new())))
     };
     if !upnp {
         b = b.portmapper_config(iroh::endpoint::PortmapperConfig::Disabled);
@@ -112,29 +126,144 @@ pub fn valid_relay(r: &str) -> bool {
 }
 
 /// True for an address on the open internet: not this computer, its local network,
-/// a link-local, carrier-NAT, unspecified, broadcast or multicast address.
+/// a link-local, carrier-NAT, unspecified, broadcast, multicast, reserved, documentation
+/// or benchmarking address, nor an IPv6 form that carries one of those inside it.
 pub(crate) fn public_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(a) => {
-            let [o0, o1, ..] = a.octets();
-            !(a.is_loopback()
-                || a.is_private()
-                || a.is_link_local()
-                || a.is_unspecified()
-                || a.is_broadcast()
-                || a.is_multicast()
-                || o0 == 0
-                || (o0 == 100 && o1 & 0xc0 == 64))
+        IpAddr::V4(a) => public_v4(a),
+        IpAddr::V6(a) => public_v6(a),
+    }
+}
+
+fn public_v4(a: Ipv4Addr) -> bool {
+    let [o0, o1, o2, _] = a.octets();
+    !(a.is_loopback()
+        || a.is_private()
+        || a.is_link_local()
+        || a.is_unspecified()
+        || a.is_broadcast()
+        || a.is_multicast()
+        || a.is_documentation()
+        || o0 == 0
+        || o0 >= 240
+        || (o0 == 100 && o1 & 0xc0 == 64)
+        || (o0 == 192 && o1 == 0 && o2 == 0)
+        || (o0 == 192 && o1 == 88 && o2 == 99)
+        || (o0 == 198 && o1 & 0xfe == 18))
+}
+
+fn public_v6(a: Ipv6Addr) -> bool {
+    let s = a.segments();
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::from((hi as u32) << 16 | lo as u32);
+    if let Some(v4) = a.to_ipv4_mapped() {
+        return public_v4(v4);
+    }
+    match s {
+        // NAT64 and 6to4 reach the IPv4 address inside them, so that address decides.
+        [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] | [0x2002, hi, lo, ..] => public_v4(v4(hi, lo)),
+        // Otherwise only global unicast, less its protocol (Teredo, benchmarking, ORCHID) and
+        // documentation ranges. Everything else (IPv4-compatible, local NAT64, discard,
+        // unique-local, link-local, multicast) is not the open internet.
+        _ => {
+            s[0] & 0xe000 == 0x2000
+                && !(s[0] == 0x2001 && s[1] < 0x200)
+                && !(s[0] == 0x2001 && s[1] == 0xdb8)
+                && !(s[0] == 0x3fff && s[1] < 0x1000)
         }
-        IpAddr::V6(a) => match a.to_ipv4_mapped() {
-            Some(v4) => public_ip(IpAddr::V4(v4)),
-            None => {
-                !(a.is_loopback()
-                    || a.is_unspecified()
-                    || a.is_multicast()
-                    || matches!(a.segments()[0] & 0xfe00, 0xfc00 | 0xfe00))
-            }
-        },
+    }
+}
+
+/// Whether an address a lookup returned for a friend may be dialed: what their hints may be.
+fn dialable_addr(a: &TransportAddr) -> bool {
+    match a {
+        TransportAddr::Ip(s) => s.port() != 0 && public_ip(s.ip()),
+        TransportAddr::Relay(u) => valid_relay(u.as_str()),
+        _ => false,
+    }
+}
+
+fn public_only(item: Item) -> Item {
+    let info = item.endpoint_info();
+    let mut data = EndpointData::new(info.addrs().filter(|a| dialable_addr(a)).cloned().collect());
+    data.set_user_data(info.user_data().cloned());
+    Item::new(EndpointInfo::from_parts(item.endpoint_id(), data), item.provenance(), item.last_updated())
+}
+
+/// An address lookup whose answers keep only what `dialable_addr` allows.
+#[derive(Debug)]
+struct Public<B>(B);
+
+#[derive(Debug)]
+struct PublicLookup<L>(L);
+
+impl<B: AddressLookupBuilder> AddressLookupBuilder for Public<B> {
+    fn into_address_lookup(self, ep: &Endpoint) -> Result<impl AddressLookup, AddressLookupBuilderError> {
+        Ok(PublicLookup(self.0.into_address_lookup(ep)?))
+    }
+}
+
+type Found = Result<Item, iroh::address_lookup::Error>;
+
+impl<L: AddressLookup> AddressLookup for PublicLookup<L> {
+    fn resolve(&self, id: EndpointId) -> Option<Pin<Box<dyn futures::Stream<Item = Found> + Send + 'static>>> {
+        Some(Box::pin(self.0.resolve(id)?.map(|r| r.map(public_only))))
+    }
+}
+
+/// A DNS resolver that drops every answer that is not a public address. iroh dials a relay
+/// at the addresses it resolved, so a name cannot pass a check and then rebind inward.
+#[derive(Debug, Clone)]
+struct PublicDns(DnsResolver);
+
+impl Resolver for PublicDns {
+    fn lookup_ipv4(&self, host: String) -> Pin<Box<dyn Future<Output = Result<BoxIter<Ipv4Addr>, DnsError>> + Send>> {
+        let dns = self.0.clone();
+        Box::pin(async move {
+            let ips: Vec<_> = dns
+                .lookup_ipv4(host, DNS_TIMEOUT)
+                .await?
+                .filter_map(|ip| match ip {
+                    IpAddr::V4(a) if public_v4(a) => Some(a),
+                    _ => None,
+                })
+                .collect();
+            Ok(Box::new(ips.into_iter()) as BoxIter<_>)
+        })
+    }
+
+    fn lookup_ipv6(&self, host: String) -> Pin<Box<dyn Future<Output = Result<BoxIter<Ipv6Addr>, DnsError>> + Send>> {
+        let dns = self.0.clone();
+        Box::pin(async move {
+            let ips: Vec<_> = dns
+                .lookup_ipv6(host, DNS_TIMEOUT)
+                .await?
+                .filter_map(|ip| match ip {
+                    IpAddr::V6(a) if public_v6(a) => Some(a),
+                    _ => None,
+                })
+                .collect();
+            Ok(Box::new(ips.into_iter()) as BoxIter<_>)
+        })
+    }
+
+    fn lookup_txt(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<TxtRecordData>, DnsError>> + Send>> {
+        let dns = self.0.clone();
+        Box::pin(async move {
+            let txt: Vec<_> = dns.lookup_txt(host, DNS_TIMEOUT).await?.collect();
+            Ok(Box::new(txt.into_iter()) as BoxIter<_>)
+        })
+    }
+
+    fn clear_cache(&self) {
+        self.0.clear_cache();
+    }
+
+    fn reset(&self) -> Box<dyn Resolver> {
+        self.0.reset();
+        Box::new(self.clone())
     }
 }
 
@@ -190,6 +319,31 @@ pub async fn connect(ep: &Endpoint, mut addr: EndpointAddr) -> Result<Connection
     }
 }
 
+/// A destination's chunk listing, sorted against what the caller wanted (see `Peer::list_chunks`).
+pub struct Listing {
+    wanted: Arc<HashSet<Id>>,
+    others: usize,
+    /// Listed chunks that were wanted.
+    pub have: HashSet<Id>,
+    /// Listed chunks that were not, at most `others` of them.
+    pub other: Vec<Id>,
+    /// Every id listed, repeats included.
+    pub count: u64,
+}
+
+impl Listing {
+    fn take(&mut self, ids: impl IntoIterator<Item = Id>) {
+        for id in ids {
+            self.count += 1;
+            if self.wanted.contains(&id) {
+                self.have.insert(id);
+            } else if self.other.len() < self.others {
+                self.other.push(id);
+            }
+        }
+    }
+}
+
 /// Where a destination's data lives: a friend over the network or a local drive.
 #[derive(Clone)]
 pub enum Link {
@@ -209,11 +363,25 @@ pub struct Peer {
 const IDLE: Duration = Duration::from_secs(300);
 /// Bytes that must move to count as progress, so a trickle of single bytes does not.
 const STEP: usize = 16 << 10;
+/// Besides never going quiet, a request must average at least this much per IDLE, so a friend
+/// that keeps one alive with a step every IDLE cannot hold it for days. Our upload goes at the
+/// friend's speed limit, which may be very low, so it need only make a piece (about 220 B/s).
+const SLOW_UP: u64 = PIECE as u64;
+/// Their reply has no speed limit behind it: about 7 KB/s, slower than any link worth using.
+const SLOW_DOWN: u64 = 2 << 20;
+
+/// How long a request may take in all, having moved `sent` and `got` bytes so far.
+fn allowed(sent: u64, got: u64) -> Duration {
+    IDLE.mul_f64(1.0 + sent as f64 / SLOW_UP as f64 + got as f64 / SLOW_DOWN as f64)
+}
 
 /// When a request last moved forward, and how many progress reports the friend may still send.
 struct Moved {
     at: Instant,
     bytes: usize,
+    start: Instant,
+    sent: u64,
+    got: u64,
     reports: u64,
     /// Bumped on each report, for a caller that watches a long upload move.
     tick: Option<Arc<AtomicU64>>,
@@ -224,12 +392,18 @@ struct Progress(Arc<Mutex<Moved>>);
 
 impl Progress {
     fn new() -> Self {
-        Progress(Arc::new(Mutex::new(Moved { at: Instant::now(), bytes: 0, reports: 0, tick: None })))
+        let now = Instant::now();
+        Progress(Arc::new(Mutex::new(Moved { at: now, bytes: 0, start: now, sent: 0, got: 0, reports: 0, tick: None })))
     }
 
-    fn moved(&self, n: usize) {
+    fn moved(&self, n: usize, sent: bool) {
         let mut m = self.0.lock().unwrap();
         m.bytes += n;
+        if sent {
+            m.sent += n as u64;
+        } else {
+            m.got += n as u64;
+        }
         if m.bytes >= STEP {
             (m.at, m.bytes) = (Instant::now(), 0);
         }
@@ -254,8 +428,10 @@ impl Progress {
         Ok(())
     }
 
-    fn idle(&self) -> Duration {
-        self.0.lock().unwrap().at.elapsed()
+    /// How long the request has been quiet, and how much longer its pace lets it run.
+    fn idle(&self) -> (Duration, Duration) {
+        let m = self.0.lock().unwrap();
+        (m.at.elapsed(), allowed(m.sent, m.got).saturating_sub(m.start.elapsed()))
     }
 }
 
@@ -267,7 +443,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Watch<S> {
         let me = self.get_mut();
         let before = buf.filled().len();
         let r = Pin::new(&mut me.0).poll_read(cx, buf);
-        me.1.moved(buf.filled().len() - before);
+        me.1.moved(buf.filled().len() - before, false);
         r
     }
 }
@@ -277,7 +453,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watch<S> {
         let me = self.get_mut();
         let r = Pin::new(&mut me.0).poll_write(cx, data);
         if let Poll::Ready(Ok(n)) = r {
-            me.1.moved(n);
+            me.1.moved(n, true);
         }
         r
     }
@@ -289,6 +465,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watch<S> {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
+}
+
+/// Most chunk ids a place that holds `bytes` of ours can list: no chunk there costs less than a
+/// disk block. A batch more allows for uploads that land while it is listed.
+fn plausible(bytes: u64) -> u64 {
+    (bytes / cost(0)).saturating_add(ID_BATCH as u64).min(MAX_IDS)
 }
 
 /// Runs blocking store work on a thread of its own: disk access, and waiting for an owner's
@@ -321,18 +503,22 @@ impl Peer {
         }
     }
 
-    /// Gives up on a friend once a request stops moving forward, so a silent one cannot hold
-    /// everything else up, while a slow but steady one is waited for.
+    /// Gives up on a friend once a request stops moving forward, or falls behind the slowest
+    /// pace it may keep, so neither a silent nor a trickling one can hold everything else up,
+    /// while a slow but steady one is waited for.
     async fn within<T>(&self, p: &Progress, f: impl Future<Output = Result<T>>) -> Result<T> {
         tokio::pin!(f);
         loop {
-            let idle = p.idle();
+            let (idle, left) = p.idle();
             if idle >= IDLE {
                 bail!("{}: no answer in time", self.friend.name);
             }
+            if left.is_zero() {
+                bail!("{}: answering too slowly", self.friend.name);
+            }
             tokio::select! {
                 r = &mut f => return r,
-                _ = tokio::time::sleep(IDLE - idle) => {}
+                _ = tokio::time::sleep((IDLE - idle).min(left)) => {}
             }
         }
     }
@@ -404,40 +590,48 @@ impl Peer {
         }
     }
 
-    pub async fn list_chunks(&self) -> Result<HashSet<Id>> {
+    /// The chunks the destination holds for us, sorted as they arrive: those in `wanted` are kept,
+    /// up to `others` of the rest are handed back (to delete), and anything beyond is only counted.
+    /// Memory so follows what this node itself knows, never what the other side claims to hold: a
+    /// listing is the one reply whose size it picks, and names on a drive or in a bucket can be
+    /// planted. Past what it could plausibly hold, the listing is refused.
+    pub async fn list_chunks(&self, wanted: Arc<HashSet<Id>>, others: usize) -> Result<Listing> {
         let implausible = || anyhow!("{}: implausible chunk count", self.friend.name);
+        let mut l = Listing { wanted, others, have: HashSet::new(), other: vec![], count: 0 };
         if let Some((st, me)) = self.store() {
-            let set = blocking(move || {
-                let mut set = HashSet::new();
+            // By the cap we set, not by what is on the drive, which planted files would swell.
+            let most = plausible(self.quota());
+            let l = blocking(move || {
                 st.list_chunks(&me, |ids| {
-                    set.extend(ids);
-                    set.len() as u64 <= MAX_IDS
+                    l.take(ids);
+                    l.count <= most
                 });
-                set
+                l
             })
             .await?;
-            return if set.len() as u64 > MAX_IDS { Err(implausible()) } else { Ok(set) };
+            return if l.count > most { Err(implausible()) } else { Ok(l) };
         }
         if let Some(b) = self.cloud() {
-            return self.named(b.list_chunks().await);
+            self.named(b.list_chunks(|id| l.take([id])).await)?;
+            return Ok(l);
         }
+        let (used, quota) = self.usage().await?;
+        let most = plausible(used.max(quota));
         let p = Progress::new();
         self.within(&p, async {
             let (mut s, mut r) = self.open(&Req::ListChunks, &p).await?;
             let _ = s.0.finish();
             let Resp::Ok = self.reply(&mut r).await? else { bail!("unexpected reply") };
-            // Counted as they arrive, repeats included: memory and time grow only with what is sent.
-            let (mut set, mut total) = (HashSet::new(), 0u64);
+            // Counted as they arrive, repeats included: time grows only with what is sent.
             loop {
                 let ids = proto::read_ids(&mut r).await?;
                 if ids.is_empty() {
-                    return Ok(set);
+                    return Ok(l);
                 }
-                total += ids.len() as u64;
-                if total > MAX_IDS {
+                l.take(ids);
+                if l.count > most {
                     return Err(implausible());
                 }
-                set.extend(ids);
             }
         })
         .await
@@ -793,10 +987,15 @@ async fn read_paced(
     report: bool,
 ) -> Result<()> {
     let mut at = 0;
-    let all_kbps = node.cfg().incoming_kbps;
+    let (mut kbps, mut all_kbps, mut checked) = (friend.max_in_kbps, node.cfg().incoming_kbps, Instant::now());
     loop {
+        // A speed limit changed while a large piece of data comes in applies from the next piece.
+        if checked.elapsed() >= RECHECK {
+            kbps = node.friend(&friend.id).map_or(kbps, |f| f.max_in_kbps);
+            (all_kbps, checked) = (node.cfg().incoming_kbps, Instant::now());
+        }
         let n = (buf.len() - at).min(PIECE);
-        tokio::time::sleep(node.guard.owe(&friend.id, n + extra, friend.max_in_kbps, all_kbps)).await;
+        tokio::time::sleep(node.guard.owe(&friend.id, n + extra, kbps, all_kbps)).await;
         r.read_exact(&mut buf[at..at + n]).await?;
         // The sender hears its data is moving however slow the limit, so only a silent node is given up on.
         if report {
@@ -856,6 +1055,7 @@ async fn serve(node: &Arc<Node>, remote: &str, s: &mut SendStream, r: &mut RecvS
         Req::PutChunks { count } => {
             // Read to the end even when refused, so the sender gets the reason rather than a broken stream.
             let (mut err, mut checked) = ((!accepting).then(|| anyhow!(CLOSED)), Instant::now());
+            let (mut friend, mut quota) = (friend.clone(), quota);
             for _ in 0..count {
                 let id = proto::read_id(r).await?;
                 let len = r.read_u32().await? as usize;
@@ -867,10 +1067,14 @@ async fn serve(node: &Arc<Node>, remote: &str, s: &mut SendStream, r: &mut RecvS
                 let extra = cost(len as u64 + 36) as usize - len;
                 let mut data = vec![0u8; len];
                 read_paced(node, &friend, s, r, &mut data, extra, true).await?;
-                // A friend removed while their upload runs stops here; the store refuses a purged one at once.
+                // The owner's current terms hold for a long upload too: a friend removed while it
+                // runs stops here (the store refuses a purged one at once), and a closed door, a
+                // lower quota or a new speed limit apply from the next chunk.
                 if checked.elapsed() >= RECHECK {
-                    if node.friend(remote).is_none() {
-                        bail!("you are not on this node's friend list");
+                    friend = node.friend(remote).ok_or_else(|| anyhow!("you are not on this node's friend list"))?;
+                    quota = friend.quota_gb.saturating_mul(1 << 30);
+                    if !node.accepting() {
+                        err.get_or_insert_with(|| anyhow!(CLOSED));
                     }
                     checked = Instant::now();
                 }
@@ -978,5 +1182,64 @@ mod tests {
         ] {
             assert!(!valid_relay(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn forms_that_reach_inward_are_not_public() {
+        for ok in ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "64:ff9b::808:808", "2002:808:808::1", "::ffff:8.8.8.8"] {
+            assert!(public_ip(ok.parse().unwrap()), "{ok}");
+        }
+        for bad in [
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.0.170",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.88.99.1",
+            "64:ff9b::a00:1",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::a00:1",
+            "2002:a00:1::1",
+            "2002:7f00:1::",
+            "::a00:1",
+            "::7f00:1",
+            "2001::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "3fff::1",
+            "100::1",
+            "fec0::1",
+            "5f00::1",
+        ] {
+            assert!(!public_ip(bad.parse().unwrap()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn lookups_keep_only_what_a_hint_could_name() {
+        let id = SecretKey::from_bytes(&[7; 32]).public();
+        let (public, inward): (SocketAddr, SocketAddr) =
+            ("8.8.8.8:4433".parse().unwrap(), "10.0.0.1:161".parse().unwrap());
+        let info = EndpointInfo::new(id)
+            .with_relay_url("http://127.0.0.1:8080/".parse().unwrap())
+            .with_relay_url("https://relay.example.com/".parse().unwrap())
+            .with_ip_addrs(vec![public, inward]);
+        let kept = public_only(Item::new(info, "test", None)).into_endpoint_addr();
+        assert_eq!(kept.ip_addrs().collect::<Vec<_>>(), [&public]);
+        assert_eq!(kept.relay_urls().map(|u| u.to_string()).collect::<Vec<_>>(), ["https://relay.example.com/"]);
+    }
+
+    #[test]
+    fn a_request_must_keep_a_pace() {
+        assert_eq!(allowed(0, 0), IDLE);
+        // A trickle of one step per IDLE earns almost nothing, where real data earns its time.
+        assert!(allowed(0, 100 * STEP as u64) < IDLE * 2);
+        assert!(allowed(8 << 20, 0) >= IDLE * 128, "an upload at a very low speed limit still fits");
+        assert_eq!(plausible(0), ID_BATCH as u64);
+        assert_eq!(plausible(1 << 30), (1 << 18) + ID_BATCH as u64);
+        assert_eq!(plausible(u64::MAX), MAX_IDS);
     }
 }

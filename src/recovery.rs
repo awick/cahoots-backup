@@ -216,13 +216,32 @@ fn before(file: &str) -> String {
     format!("{file}.before")
 }
 
+/// A kit is a few KB; anything far larger in the folder is not one.
+const MAX_KIT: u64 = 4 << 20;
+
+/// Reads a kit from a folder others may write: never through a link, never waiting on a pipe
+/// or device, and never more than a kit's size.
+fn read_kit(path: &Path) -> Option<String> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    use std::io::Read;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = rustix::fs::open(path, flags, Mode::empty()).ok()?;
+    let st = rustix::fs::fstat(&fd).ok()?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile || st.st_size as u64 > MAX_KIT {
+        return None;
+    }
+    let mut s = String::new();
+    fs::File::from(fd).take(MAX_KIT).read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
 fn copy_write(home: &Path, force: bool, copy: &mut Copy) -> Result<bool> {
     let (plain, cfg, node) = plain(home)?;
     let hash = blake3::hash(&plain).to_hex().to_string();
     // Named for the computer. Where another computer of the same name already keeps its kit
     // in this folder, the start of this one's id goes in the name rather than writing over it.
     let mut file = file_name(&cfg.name);
-    let theirs = fs::read_to_string(copy.folder.join(&file)).ok().and_then(|k| crypto::kit_node(&k));
+    let theirs = read_kit(&copy.folder.join(&file)).and_then(|k| crypto::kit_node(&k));
     if theirs.is_some_and(|n| n != node) {
         file = file_name(&format!("{}-{}", cfg.name, &node[..node.len().min(8)]));
     }
@@ -250,4 +269,25 @@ fn copy_write(home: &Path, force: bool, copy: &mut Copy) -> Result<bool> {
     (copy.file, copy.hash, copy.at) = (file, hash, chrono::Utc::now().timestamp());
     mark(home, &cfg)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_kit_is_read_only_from_a_small_regular_file() {
+        let dir = std::env::temp_dir().join(format!("sdb-test-kit-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kit"), "sealed").unwrap();
+        assert_eq!(read_kit(&dir.join("kit")).as_deref(), Some("sealed"));
+        std::os::unix::fs::symlink(dir.join("kit"), dir.join("link")).unwrap();
+        assert!(read_kit(&dir.join("link")).is_none());
+        let fifo = dir.join("fifo");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(read_kit(&fifo).is_none());
+        fs::File::create(dir.join("big")).unwrap().set_len(MAX_KIT + 1).unwrap();
+        assert!(read_kit(&dir.join("big")).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -944,7 +944,9 @@ impl Node {
         let Some(c) = crate::recovery::copy_load(&self.home) else {
             bail!("no copy is kept anywhere (sdb recovery copy-to FOLDER)");
         };
-        crate::recovery::copy_sync(&self.home, true)?;
+        // The copy may sit on a slow or network disk: keep the file work off the async workers.
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || crate::recovery::copy_sync(&home, true)).await??;
         out.say(format!("the recovery kit in {} is up to date", c.folder.display()));
         Ok(())
     }
