@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::{Config, Identity};
 use node::{CloudAdd, Cmd, Node, Out, Secret, SetEdit, Tune};
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
@@ -460,11 +460,21 @@ async fn daemon(home: PathBuf) -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
-        _ = node.quit.notified() => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        _ = node.quit.notified() => {
+            // Out of reach first, so no new command arrives at a daemon on its way out; then
+            // a moment for the answer to the one that stopped it.
+            let _ = fs::remove_file(control::sock_path(&home));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
     let _ = fs::remove_file(control::sock_path(&home));
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), router.shutdown()).await;
     Ok(())
+}
+
+/// Prints a line; a reader that has stopped listening (`| head`) is not an error.
+fn say(text: impl std::fmt::Display) {
+    let _ = writeln!(std::io::stdout(), "{text}");
 }
 
 /// Starts the daemon in the background, detached from this terminal.
@@ -486,6 +496,18 @@ fn spawn_daemon(home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Waits, a few seconds at most, until the daemon that was told to stop has really gone:
+/// out of reach and no longer holding its home. The next command then starts a new one
+/// rather than catching the old one leaving.
+async fn gone(home: &std::path::Path) {
+    for _ in 0..50 {
+        if control::connect(home).await.is_none() && lock(home).is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Connects to the daemon, starting it if it is not running and replacing it
 /// if it was started from an older build than this client.
 async fn daemon_stream(home: &std::path::Path) -> Result<tokio::net::UnixStream> {
@@ -502,12 +524,7 @@ async fn daemon_stream(home: &std::path::Path) -> Result<tokio::net::UnixStream>
             if let Some(s) = control::connect(home).await {
                 let _ = control::request(s, &Cmd::Stop, &mut |_| {}).await;
             }
-            for _ in 0..50 {
-                if control::connect(home).await.is_none() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            gone(home).await;
         }
         if control::connect(home).await.is_none() {
             spawn_daemon(home)?;
@@ -528,7 +545,11 @@ async fn run(cmd: Cmd) -> Result<()> {
     let home = config::home();
     if matches!(cmd, Cmd::Stop) {
         return match control::connect(&home).await {
-            Some(s) => control::client(s, &cmd).await,
+            Some(s) => {
+                let res = control::client(s, &cmd).await;
+                gone(&home).await;
+                res
+            }
             None => {
                 println!("the daemon is not running");
                 Ok(())
@@ -614,11 +635,11 @@ async fn real_main() -> Result<()> {
                 None => PathBuf::from(recovery::file_name(&Config::load(&home)?.name)),
             };
             recovery::export(&home, &passphrase(true)?, &file)?;
-            println!(
+            say(format!(
                 "Wrote {}. With it and the passphrase you can restore everything on a new computer.",
                 file.display()
-            );
-            println!("Export again after adding friends so the kit knows how to reach them.");
+            ));
+            say("Export again after adding friends so the kit knows how to reach them.");
             return Ok(());
         }
         C::Recovery { cmd: RecoveryCmd::CopyTo { off: true, .. } } => Cmd::KitCopyOff,
@@ -628,25 +649,25 @@ async fn real_main() -> Result<()> {
                 bail!("name the folder to keep the copy in, or --now to write it again, or --off to stop")
             };
             let folder = fs::canonicalize(&folder).with_context(|| folder.display().to_string())?;
-            println!(
+            say(format!(
                 "The kit will be kept as {}",
                 folder.join(recovery::file_name(&Config::load(&home)?.name)).display()
-            );
+            ));
             Cmd::KitCopyOn { passphrase: Secret(passphrase(true)?), folder }
         }
         C::Recovery { cmd: RecoveryCmd::Import { file } } => {
             let config = recovery::import(&home, &passphrase(false)?, &file)?;
             let sets: Vec<&str> = config.sets.iter().map(|b| b.name.as_str()).collect();
-            println!(
+            say(format!(
                 "Recovered \"{}\" with {} friends and {} backup sets ({}).",
                 config.name,
                 config.friends.len(),
                 sets.len(),
                 sets.join(", ")
-            );
-            println!("`sdb status` shows whether your destinations are reachable, `sdb snapshots` the restore points.");
-            println!("To put a set's files back where they were: sdb restore latest --set NAME --in-place");
-            println!("(or --to FOLDER to look first; `sdb gui` and `sdb tui` do the same from their Restore page).");
+            ));
+            say("`sdb status` shows whether your destinations are reachable, `sdb snapshots` the restore points.");
+            say("To put a set's files back where they were: sdb restore latest --set NAME --in-place");
+            say("(or --to FOLDER to look first; `sdb gui` and `sdb tui` do the same from their Restore page).");
             return Ok(());
         }
         C::Add { paths, set } => {

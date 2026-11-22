@@ -143,6 +143,12 @@ a name renamed | grep -q "now called renamed" || fail "the name was not changed"
 a status | grep -q "name: *renamed" || fail "status does not show the new name"
 a name alice >/dev/null
 
+step "a command right after stop gets a new daemon, not the one leaving"
+for _ in 1 2 3; do
+    a stop >/dev/null
+    a status >/dev/null || fail "the command after stop was cut off"
+done
+
 step "a computer that takes no backups from friends"
 HELD=$(b destinations | grep alice)
 b accept off | grep -q "no longer back up" || fail "accept off was not saved"
