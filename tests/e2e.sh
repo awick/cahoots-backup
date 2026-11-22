@@ -140,6 +140,34 @@ a name renamed | grep -q "now called renamed" || fail "the name was not changed"
 a status | grep -q "name: *renamed" || fail "status does not show the new name"
 a name alice >/dev/null
 
+step "a computer that takes no backups from friends"
+HELD=$(b destinations | grep alice)
+b accept off | grep -q "no longer back up" || fail "accept off was not saved"
+echo closed >data/closed
+a backup --set default >backup.out 2>&1 || fail "backup with a closed friend and a drive"
+grep -q "bob does not accept backups" backup.out || fail "a closed friend was not skipped"
+grep -q "created on usb:" backup.out || fail "the drive should still get the backup"
+[ "$(b destinations | grep alice)" = "$HELD" ] || fail "what a friend already kept here changed"
+a status | grep -q "takes no backups from you" || fail "status does not say bob takes no backups"
+b accept on >/dev/null
+a backup --set default | grep -q "created on .*bob" || fail "bob did not get the backup after accepting again"
+
+step "the recovery kit, and knowing whether there is one"
+a status | grep -q "recovery kit: never exported" || fail "a kit that was never written should say so"
+SDB_PASSPHRASE=correct-horse a recovery export "$T/kit.json" >/dev/null || fail "recovery export"
+a status | grep -q "recovery kit: exported .* up to date" || fail "status does not know the kit"
+SDB_PASSPHRASE=wrong-horse-9 SDB_HOME=$T/again "$SDB" recovery import "$T/kit.json" >/dev/null 2>&1 &&
+    fail "a wrong passphrase opened the kit"
+SDB_PASSPHRASE=correct-horse SDB_HOME=$T/again "$SDB" recovery import "$T/kit.json" | grep -q 'Recovered "alice"' ||
+    fail "recovery import"
+[ -f "$T/again/identity.key" ] || fail "the recovered folder has no identity"
+
+step "space for new friends and free space to keep"
+b default-quota 250 >/dev/null
+b keep-free 3 >/dev/null
+grep -q "default_quota_gb = 250" "$T/bob/config.toml" || fail "the quota for new friends was not saved"
+grep -q "min_free_gb = 3" "$T/bob/config.toml" || fail "the free space to keep was not saved"
+
 step "verify one set"
 a verify --set pics | grep -q "usb: " || fail "verify of one set"
 a verify --set pics | grep -q "bob" && fail "a set that is not sent to bob was checked there"

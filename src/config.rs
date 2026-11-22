@@ -281,6 +281,9 @@ pub struct Config {
     /// Automatic backups are paused until this unix time.
     #[serde(default)]
     pub paused_until: i64,
+    /// Whether friends may store backups here; off makes this a computer that only backs up to others.
+    #[serde(default = "yes")]
+    pub accept_backups: bool,
     /// Stop accepting friends' data when this computer's disk has less than this many GB free.
     #[serde(default = "d_min_free")]
     pub min_free_gb: u64,
@@ -328,6 +331,7 @@ impl Config {
             incoming_kbps: 0,
             backup_hours: String::new(),
             paused_until: 0,
+            accept_backups: true,
             min_free_gb: d_min_free(),
             port: 20000 + rand::random::<u16>() % 40000,
             upnp: true,
@@ -571,6 +575,7 @@ impl Friend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn speeds_are_typed_in_mb_a_second_with_decimals() {
@@ -589,7 +594,24 @@ mod tests {
             assert_eq!(parse_mbps(&mbps(kbps)), Some(kbps));
         }
     }
-    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_recovery_kit_goes_stale_when_a_destination_is_added() {
+        use crate::recovery::{Kit, mark, state};
+        let home = std::env::temp_dir().join(format!("sdb-test-kit-{}", rand::random::<u64>()));
+        fs::create_dir_all(&home).unwrap();
+        let mut c = Config::new("x".into());
+        assert_eq!(state(&home, &c), Kit::Never);
+        c.friends.push(friend("a", false));
+        mark(&home, &c).unwrap();
+        assert!(matches!(state(&home, &c), Kit::Current(_)));
+        c.friends.push(friend("usb", true));
+        assert!(matches!(state(&home, &c), Kit::Stale(_)));
+        // One fewer destination than the kit knows is nothing to export again for.
+        c.friends.clear();
+        assert!(matches!(state(&home, &c), Kit::Current(_)));
+        fs::remove_dir_all(&home).unwrap();
+    }
 
     fn friend(name: &str, drive: bool) -> Friend {
         Friend {

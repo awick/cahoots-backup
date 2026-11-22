@@ -26,6 +26,8 @@ const GREEN: Color32 = Color32::from_rgb(60, 170, 80);
 const YELLOW: Color32 = Color32::from_rgb(200, 150, 30);
 const RED: Color32 = Color32::from_rgb(210, 70, 70);
 const BLUE: Color32 = Color32::from_rgb(70, 140, 210);
+/// A friend who is there but takes no backups from this computer.
+const PURPLE: Color32 = Color32::from_rgb(150, 105, 215);
 /// Width of the label column in a backup set's rows.
 const LABEL_WIDTH: f32 = 104.0;
 
@@ -214,7 +216,7 @@ impl Gui {
         if let Some(c) = first(Cmd::Config).and_then(|l| serde_json::from_str(&l).ok()) {
             self.cfg = c;
         }
-        // For development: SDB_GUI_SHOW=restore|destinations|settings|history|status|files|schedule
+        // For development: SDB_GUI_SHOW=restore|destinations|settings|kit|history|status|files|schedule
         // opens on that page with its data already loaded, so a screenshot shows it.
         let show = std::env::var("SDB_GUI_SHOW").unwrap_or_default();
         let first_set = self.cfg.sets.first().map(|b| b.name.clone()).unwrap_or_default();
@@ -245,6 +247,11 @@ impl Gui {
             }
             "destinations" => self.page = Page::Destinations,
             "settings" => self.page = Page::Settings,
+            "kit" => {
+                self.page = Page::Settings;
+                self.fields.insert("kit-pass".into(), "correct horse".into());
+                self.fields.insert("kit-again".into(), "correct horse".into());
+            }
             "history" | "status" => {
                 self.page = if show == "history" { Page::History } else { Page::Status };
                 let cmd = if show == "history" { Cmd::Log } else { Cmd::Status };
@@ -506,6 +513,7 @@ impl Gui {
     fn dest_dot(&self, name: &str) -> (&'static str, Color32) {
         let d = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == name));
         match d.and_then(|d| d["state"].as_str()) {
+            Some("online") if d.is_some_and(|d| d["closed"] == true) => ("full", PURPLE),
             Some("online") | Some("connected") => ("full", GREEN),
             Some("checking") => ("ring", YELLOW),
             _ => ("ring", RED),
@@ -1406,6 +1414,9 @@ impl Gui {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let mut about = vec![f.kind().to_string(), o["state"].as_str().unwrap_or("checking").to_string()];
+                    if o["closed"] == true {
+                        about.push("takes no backups from you".into());
+                    }
                     about.extend(o["link"].as_str().map(String::from));
                     match o["version"].as_str() {
                         Some(v) => about.push(format!("version {v}")),
@@ -1429,7 +1440,12 @@ impl Gui {
                     (Some(u), None) => format!("{} there", human(u)),
                     _ => "not known yet".to_string(),
                 };
-                ui.label(format!("{there} · last sent {}", ago(o["last_out"].as_i64())));
+                ui.horizontal(|ui| {
+                    ui.label(format!("{there} · last sent {}", ago(o["last_out"].as_i64())));
+                    if o["closed"] == true {
+                        ui.colored_label(PURPLE, "they do not accept backups from this computer");
+                    }
+                });
                 ui.end_row();
                 match (&f.path, &f.cloud) {
                     (Some(p), _) => {
@@ -1442,12 +1458,17 @@ impl Gui {
                     }
                     _ => {
                         ui.weak("They use");
-                        ui.label(format!(
-                            "{} of {} GB here · last backup from them {}",
-                            human(o["used_here"].as_u64().unwrap_or(0)),
-                            f.quota_gb,
-                            ago(o["last_in"].as_i64())
-                        ));
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{} of {} GB here · last backup from them {}",
+                                human(o["used_here"].as_u64().unwrap_or(0)),
+                                f.quota_gb,
+                                ago(o["last_in"].as_i64())
+                            ));
+                            if !self.cfg.accept_backups {
+                                ui.colored_label(PURPLE, "this computer accepts no new backups (see Settings)");
+                            }
+                        });
                     }
                 }
                 ui.end_row();
@@ -1721,8 +1742,57 @@ impl Gui {
                     self.rule(ui, "def-incoming", "Max incoming", cur.clone(), "MB/s", hint),
                     &cur,
                 );
+                ui.weak("Recovery kit");
+                let open = self.fields.contains_key("kit-pass");
+                ui.horizontal(|ui| {
+                    let text = self.ov["kit"]["text"].as_str().unwrap_or("not known yet").to_string();
+                    let color = if self.ov["kit"]["act"] == true { YELLOW } else { GREEN };
+                    ui.colored_label(color, text);
+                    if ui.button(if open { "Cancel" } else { "Export..." }).clicked() {
+                        for k in ["kit-pass", "kit-again"] {
+                            if open {
+                                self.fields.remove(k);
+                            } else {
+                                self.fields.insert(k.into(), String::new());
+                            }
+                        }
+                    }
+                });
+                ui.end_row();
+                if open {
+                    self.kit_rows(ui);
+                }
             });
             save |= save_button(ui, &v, &["name", "limit", "incoming"]);
+        });
+        ui.add_space(4.0);
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new("Friends' backups to this computer").strong().size(15.0));
+            ui.add_space(2.0);
+            Self::rows(ui, "friends-in", |ui| {
+                ui.weak("Accept");
+                ui.horizontal(|ui| {
+                    let mut on = c.accept_backups;
+                    if ui.checkbox(&mut on, "friends may back up to this computer").changed() {
+                        self.save(&ctx, Cmd::Tune(Tune { accept_backups: Some(on), ..Default::default() }));
+                    }
+                    if c.accept_backups {
+                        ui.weak("untick to only back up to your friends and take nothing from them");
+                    } else {
+                        let note = "off: this computer only backs up to its friends; what they already keep here stays";
+                        ui.colored_label(PURPLE, note);
+                    }
+                });
+                ui.end_row();
+                let cur = c.default_quota_gb.to_string();
+                let hint = "what a friend you pair with from now on may store here; each friend's own is on Friends";
+                note(&mut v, "quota", self.rule(ui, "def-quota", "New friends get", cur.clone(), "GB", hint), &cur);
+                let cur = c.min_free_gb.to_string();
+                let hint = "friends' backups are refused while this disk has less free than this; 0 = no check";
+                note(&mut v, "free", self.rule(ui, "def-free", "Keep free", cur.clone(), "GB", hint), &cur);
+            });
+            save |= save_button(ui, &v, &["quota", "free"]);
         });
         ui.add_space(4.0);
         ui.group(|ui| {
@@ -1786,7 +1856,8 @@ impl Gui {
         });
         if save {
             let num = |k: &str| v.get(k).and_then(|t| t.parse::<u32>().ok());
-            if ["name", "limit", "incoming", "hours", "warn"].iter().any(|k| v.contains_key(k)) {
+            let whole = |k: &str| v.get(k).and_then(|t| t.parse::<u64>().ok());
+            if ["name", "limit", "incoming", "hours", "warn", "quota", "free"].iter().any(|k| v.contains_key(k)) {
                 self.save(
                     &ctx,
                     Cmd::Tune(Tune {
@@ -1795,6 +1866,8 @@ impl Gui {
                         incoming_kbps: v.get("incoming").and_then(|t| parse_mbps(t)),
                         hours: v.get("hours").cloned(),
                         warn_days: num("warn"),
+                        default_quota_gb: whole("quota"),
+                        min_free_gb: whole("free"),
                         ..Default::default()
                     }),
                 );
@@ -1813,6 +1886,49 @@ impl Gui {
         }
         ui.add_space(8.0);
         self.exclude_lists(ui);
+    }
+
+    /// The passphrase, typed twice, and the button that writes the recovery kit to a file.
+    fn kit_rows(&mut self, ui: &mut egui::Ui) {
+        let mut pass = self.fields.get("kit-pass").cloned().unwrap_or_default();
+        let mut again = self.fields.get("kit-again").cloned().unwrap_or_default();
+        ui.weak("Passphrase");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut pass).password(true).desired_width(200.0));
+            ui.weak("at least 8 characters; recovering takes the file and this passphrase");
+        });
+        ui.end_row();
+        ui.weak("Again");
+        let mut write = false;
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut again).password(true).desired_width(200.0));
+            let ok = pass.len() >= 8 && pass == again;
+            write = ui.add_enabled(ok, egui::Button::new("Save the kit as...")).clicked();
+            if !again.is_empty() && pass != again {
+                ui.colored_label(YELLOW, "the two do not match");
+            } else {
+                ui.weak("keep the file somewhere other than this computer");
+            }
+        });
+        ui.end_row();
+        let picked = write.then(|| {
+            rfd::FileDialog::new().set_title("Save the recovery kit").set_file_name("sdb-recovery-kit.json").save_file()
+        });
+        if let Some(Some(file)) = picked {
+            self.status = match crate::recovery::export(&self.home, &pass, &file) {
+                Ok(()) => format!(
+                    "Recovery kit written to {}. Keep it and its passphrase somewhere other than this computer.",
+                    file.display()
+                ),
+                Err(e) => format!("{e:#}"),
+            };
+            self.fields.remove("kit-pass");
+            self.fields.remove("kit-again");
+            self.last_poll = Instant::now() - Duration::from_secs(10);
+            return;
+        }
+        self.fields.insert("kit-pass".into(), pass);
+        self.fields.insert("kit-again".into(), again);
     }
 
     /// The exclusion lists: the built-in ones to read and copy, your own to change.

@@ -53,6 +53,9 @@ pub struct Tune {
     pub hours: Option<String>,
     pub pause_hours: Option<i64>,
     pub warn_days: Option<u32>,
+    pub accept_backups: Option<bool>,
+    pub default_quota_gb: Option<u64>,
+    pub min_free_gb: Option<u64>,
 }
 
 /// A change to one backup set; what is left unset stays as it is.
@@ -364,6 +367,8 @@ pub struct Node {
     log: Mutex<std::collections::VecDeque<String>>,
     /// The last reachability check of each destination.
     probes: Mutex<HashMap<String, Probe>>,
+    /// Friends last found to take no backups from this node.
+    closed: Mutex<HashSet<String>>,
     last_probe: Mutex<Option<Instant>>,
     pub quit: Notify,
     /// When the daemon next intends to back up each set to each destination, keyed "set|id".
@@ -480,6 +485,7 @@ impl Node {
             running: Default::default(),
             log: Default::default(),
             probes: Default::default(),
+            closed: Default::default(),
             last_probe: Mutex::new(None),
             quit: Notify::new(),
             next: Default::default(),
@@ -513,6 +519,25 @@ impl Node {
     }
 
     /// The friend with this node id, if they are (still) one.
+    /// Whether friends may store backups on this node.
+    pub fn accepting(&self) -> bool {
+        self.cfg.lock().unwrap().accept_backups
+    }
+
+    /// Remembers whether a friend takes this node's backups.
+    pub fn set_closed(&self, id: &str, closed: bool) {
+        let mut c = self.closed.lock().unwrap();
+        if closed {
+            c.insert(id.to_string());
+        } else {
+            c.remove(id);
+        }
+    }
+
+    pub fn is_closed(&self, id: &str) -> bool {
+        self.closed.lock().unwrap().contains(id)
+    }
+
     pub fn friend(&self, id: &str) -> Option<Friend> {
         self.cfg.lock().unwrap().friends.iter().find(|f| f.id == id && f.is_friend()).cloned()
     }
@@ -1681,11 +1706,15 @@ impl Node {
                     let peer = node.peer(&f).await?;
                     let (used, quota) = peer.usage().await?;
                     let version = peer.version().await;
-                    Ok::<_, anyhow::Error>((used, quota, peer.describe_link().await, version))
+                    let closed = !peer.accepts().await;
+                    Ok::<_, anyhow::Error>((used, quota, peer.describe_link().await, version, closed))
                 };
                 let res = tokio::time::timeout(Duration::from_secs(25), check).await;
                 let probe = match res {
-                    Ok(Ok((used, quota, link, version))) => Probe { at: now(), ok: true, used, quota, link, version },
+                    Ok(Ok((used, quota, link, version, closed))) => {
+                        node.set_closed(&f.id, closed);
+                        Probe { at: now(), ok: true, used, quota, link, version }
+                    }
                     _ => Probe { at: now(), ok: false, used: 0, quota: 0, link: String::new(), version: None },
                 };
                 node.probes.lock().unwrap().insert(f.id.clone(), probe);
@@ -1761,6 +1790,7 @@ impl Node {
                     "keep_last": f.retention.as_ref().map(|r| r.keep_last),
                     "path": f.path.as_ref().map(|p| p.display().to_string()),
                     "state": state,
+                    "closed": self.is_closed(&f.id),
                     "link": p.filter(|p| p.ok).map(|p| p.link.clone()),
                     "version": p.filter(|p| p.ok).and_then(|p| p.version.clone()),
                     "checked": p.map(|p| p.at),
@@ -1776,12 +1806,14 @@ impl Node {
                 })
             })
             .collect();
+        let kit = crate::recovery::state(&self.home, &c).describe();
         json!({
             "name": c.name,
             "id": self.id(),
             "warnings": self.warnings(),
             "held": c.held(),
             "limit": c.upload_kbps,
+            "kit": { "text": kit.0, "act": kit.1 },
             "service": crate::service::installed(),
             "version": net::VERSION,
             "turned_away": self.guard.rejected.load(std::sync::atomic::Ordering::Relaxed),
@@ -1835,6 +1867,19 @@ impl Node {
                 w.push(format!("set {} has no destination and is not being backed up", b.name));
             }
         }
+        if !c.all_paths().is_empty() && c.friends.iter().any(|f| f.backup_to) {
+            match crate::recovery::state(&self.home, &c) {
+                crate::recovery::Kit::Never => w.push(
+                    "no recovery kit yet: without one, losing this computer loses your backups (sdb recovery export FILE)"
+                        .into(),
+                ),
+                crate::recovery::Kit::Stale(_) => w.push(
+                    "the recovery kit is older than your newest friend or drive: export it again (sdb recovery export FILE)"
+                        .into(),
+                ),
+                crate::recovery::Kit::Current(_) => {}
+            }
+        }
         if c.warn_after_days == 0 {
             return w;
         }
@@ -1846,6 +1891,10 @@ impl Node {
                 let last = ok.get(&f.id).copied();
                 if now() - last.unwrap_or(created) > limit {
                     w.push(match last {
+                        _ if self.is_closed(&f.id) => format!(
+                            "{} does not accept backups from this computer, so nothing new of yours is kept there",
+                            f.name
+                        ),
                         Some(t) => format!(
                             "no backup has reached {} since {} ({} days ago)",
                             f.name,

@@ -572,6 +572,12 @@ impl Peer {
         }
     }
 
+    /// Whether the destination takes backups from this node. Only a friend's computer can say
+    /// no; one too old to answer takes them.
+    pub async fn accepts(&self) -> bool {
+        !(matches!(self.link, Link::Remote(_)) && matches!(self.simple(Req::Accepts).await, Ok(Resp::Accepts(false))))
+    }
+
     /// Usage counted afresh, for deciding by it right after deleting: cloud storage's running
     /// figure does not drop until its next listing.
     pub async fn usage_exact(&self) -> Result<(u64, u64)> {
@@ -670,6 +676,8 @@ impl Default for Guard {
     }
 }
 
+/// What a friend is told when this node takes no backups.
+const CLOSED: &str = "this computer does not accept backups from friends";
 /// The pace entry shared by all friends; no friend has an empty id.
 const EVERYONE: &str = "";
 const MAX_STRANGERS: usize = 4;
@@ -827,6 +835,7 @@ async fn serve(node: &Arc<Node>, remote: &str, s: &mut SendStream, r: &mut RecvS
     };
     crate::store::check_owner(remote)?;
     let quota = friend.quota_gb.saturating_mul(1 << 30);
+    let accepting = node.accepting();
     match req {
         Req::Pair { .. } => unreachable!(),
         Req::ListChunks => {
@@ -845,7 +854,8 @@ async fn serve(node: &Arc<Node>, remote: &str, s: &mut SendStream, r: &mut RecvS
             proto::write_ids(s, &[]).await?;
         }
         Req::PutChunks { count } => {
-            let (mut err, mut checked) = (None, Instant::now());
+            // Read to the end even when refused, so the sender gets the reason rather than a broken stream.
+            let (mut err, mut checked) = ((!accepting).then(|| anyhow!(CLOSED)), Instant::now());
             for _ in 0..count {
                 let id = proto::read_id(r).await?;
                 let len = r.read_u32().await? as usize;
@@ -889,6 +899,7 @@ async fn serve(node: &Arc<Node>, remote: &str, s: &mut SendStream, r: &mut RecvS
             on_store(node, remote, move |st, o| st.delete_chunks(o, &ids)).await?;
             proto::send(s, &Resp::Ok).await?;
         }
+        Req::PutSnapshot { .. } if !accepting => bail!(CLOSED),
         Req::PutSnapshot { id, data } => {
             on_store(node, remote, move |st, o| st.put_snapshot(o, &id, &data, quota)).await??;
             proto::send(s, &Resp::Ok).await?;
@@ -907,6 +918,7 @@ async fn serve(node: &Arc<Node>, remote: &str, s: &mut SendStream, r: &mut RecvS
             proto::send(s, &Resp::Usage { used, quota }).await?
         }
         Req::Version => proto::send(s, &Resp::Version(VERSION.into())).await?,
+        Req::Accepts => proto::send(s, &Resp::Accepts(accepting)).await?,
     }
     Ok(())
 }

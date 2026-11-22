@@ -19,6 +19,7 @@ use std::{
     io::{Read, Write},
     os::fd::{AsFd, OwnedFd},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -48,7 +49,7 @@ struct Count {
 pub struct Store {
     root: PathBuf,
     /// Writes are refused once the disk has less free space than this.
-    min_free: u64,
+    min_free: AtomicU64,
     usage: Mutex<HashMap<String, Count>>,
     /// One lock per owner, held while their files and their usage count change together.
     /// Only ever taken off the async workers.
@@ -116,6 +117,10 @@ pub fn check_snap(id: &str) -> Result<()> {
 }
 
 impl Store {
+    pub fn set_min_free(&self, bytes: u64) {
+        self.min_free.store(bytes, Ordering::Relaxed);
+    }
+
     pub fn new(root: PathBuf, min_free: u64) -> Self {
         if fs::create_dir_all(&root).is_ok() {
             // Through a handle that refuses a link, so a link swapped in cannot redirect the change.
@@ -124,7 +129,7 @@ impl Store {
         }
         Store {
             root,
-            min_free,
+            min_free: AtomicU64::new(min_free),
             usage: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             walks: Mutex::new(HashMap::new()),
@@ -270,7 +275,8 @@ impl Store {
         if self.used(owner).saturating_sub(old) + new > quota {
             bail!("storage quota exceeded ({} GB)", quota >> 30);
         }
-        if self.min_free > 0 && fs2::available_space(&self.root).is_ok_and(|free| free < self.min_free + new) {
+        let min_free = self.min_free.load(Ordering::Relaxed);
+        if min_free > 0 && fs2::available_space(&self.root).is_ok_and(|free| free < min_free + new) {
             bail!("this computer is too low on disk space to accept more backups");
         }
         let mut tmp = name.to_os_string();

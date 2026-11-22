@@ -15,6 +15,7 @@ mod gui;
 mod net;
 mod node;
 mod proto;
+mod recovery;
 mod restore;
 mod service;
 mod snapshot;
@@ -26,7 +27,6 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::{Config, Identity};
 use node::{CloudAdd, Cmd, Node, Out, SetEdit, Tune};
-use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
 
@@ -192,6 +192,16 @@ enum C {
     Resume,
     /// Warn when a backup is this many days stale (0 = never)
     WarnAfter { days: u32 },
+    /// Whether friends may back up to this computer: `sdb accept off` makes it one that only
+    /// backs up to its friends
+    Accept {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// GB a friend you pair with from now on may store on this computer
+    DefaultQuota { gb: u64 },
+    /// Stop taking friends' backups when this computer's disk has less than this many GB free
+    KeepFree { gb: u64 },
     /// How often automatic backups go out: `sdb every 60` for all, `sdb every 15 usb` for one destination
     Every { minutes: u32, name: Option<String> },
     /// Also back up to an external drive or folder
@@ -358,15 +368,6 @@ enum RecoveryCmd {
 enum ServiceCmd {
     Install,
     Uninstall,
-}
-
-#[derive(Serialize, Deserialize)]
-struct KitData {
-    identity: Identity,
-    config: Config,
-    /// Restore points deleted on purpose, so a destination cannot bring them back after recovery.
-    #[serde(default)]
-    forgotten: std::collections::HashSet<String>,
 }
 
 fn passphrase(confirm: bool) -> Result<String> {
@@ -581,16 +582,7 @@ async fn real_main() -> Result<()> {
             };
         }
         C::Recovery { cmd: RecoveryCmd::Export { file } } => {
-            let mut config = Config::load(&home)?;
-            config.invites.clear();
-            let forgotten = match fs::read(home.join("forgotten.json")) {
-                Ok(b) => serde_json::from_slice(&b).context("forgotten.json")?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
-                Err(e) => return Err(e).context("forgotten.json"),
-            };
-            let data = KitData { identity: Identity::load(&home)?, config, forgotten };
-            let kit = crypto::kit_seal(&passphrase(true)?, &serde_json::to_vec(&data)?)?;
-            config::write_private(&file, kit.as_bytes())?;
+            recovery::export(&home, &passphrase(true)?, &file)?;
             println!(
                 "Wrote {}. With it and the passphrase you can restore everything on a new computer.",
                 file.display()
@@ -599,19 +591,8 @@ async fn real_main() -> Result<()> {
             return Ok(());
         }
         C::Recovery { cmd: RecoveryCmd::Import { file } } => {
-            if home.join("identity.key").exists() {
-                bail!("{} is already set up; move it away first", home.display());
-            }
-            let kit = fs::read_to_string(&file).with_context(|| file.display().to_string())?;
-            let data: KitData = serde_json::from_slice(&crypto::kit_open(&passphrase(false)?, &kit)?)?;
-            fs::create_dir_all(&home)?;
-            fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-            data.identity.save(&home)?;
-            data.config.save(&home)?;
-            if !data.forgotten.is_empty() {
-                config::write_private(&home.join("forgotten.json"), &serde_json::to_vec(&data.forgotten)?)?;
-            }
-            println!("Recovered \"{}\" with {} friends.", data.config.name, data.config.friends.len());
+            let config = recovery::import(&home, &passphrase(false)?, &file)?;
+            println!("Recovered \"{}\" with {} friends.", config.name, config.friends.len());
             println!("Run `sdb snapshots`, then `sdb restore latest --to <folder>` (or --in-place).");
             return Ok(());
         }
@@ -744,6 +725,9 @@ async fn real_main() -> Result<()> {
         C::Pause { hours } => Cmd::Tune(Tune { pause_hours: Some(hours.unwrap_or(24 * 3650)), ..Default::default() }),
         C::Resume => Cmd::Tune(Tune { pause_hours: Some(0), ..Default::default() }),
         C::WarnAfter { days } => Cmd::Tune(Tune { warn_days: Some(days), ..Default::default() }),
+        C::Accept { state } => Cmd::Tune(Tune { accept_backups: Some(state == "on"), ..Default::default() }),
+        C::DefaultQuota { gb } => Cmd::Tune(Tune { default_quota_gb: Some(gb), ..Default::default() }),
+        C::KeepFree { gb } => Cmd::Tune(Tune { min_free_gb: Some(gb), ..Default::default() }),
         C::Every { minutes, name } => Cmd::Every { name, minutes },
         C::Drive { name, path } => {
             Cmd::DriveAdd { name, path: fs::canonicalize(&path).with_context(|| path.display().to_string())? }

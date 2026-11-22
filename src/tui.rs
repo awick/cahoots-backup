@@ -320,6 +320,7 @@ enum Act {
     Quota,
     InLimit,
     ServiceInfo,
+    KitInfo,
     UseDest,
     RemoveDest,
     Pick,
@@ -400,11 +401,15 @@ enum Choice {
 }
 
 /// The general settings, in the groups the screens show them in: the essentials up to
-/// `ESSENTIAL`, automatic backups up to `AUTOMATIC`, then how much history is kept.
-const GENERAL: [(&str, &str); 14] = [
+/// `ESSENTIAL`, what friends may store here up to `FRIENDS`, automatic backups up to
+/// `AUTOMATIC`, then how much history is kept.
+const GENERAL: [(&str, &str); 17] = [
     ("name", "Name: what this computer is called (friends you already have keep the name they know)"),
     ("limit", "Max outgoing in MB/s, such as 0.5: your backups to friends and cloud storage (0 = unlimited)"),
     ("incoming", "Max incoming in MB/s: all your friends' backups to this computer together (0 = unlimited)"),
+    ("accept", "Accept: may friends back up to this computer? (no = it only backs up to its friends)"),
+    ("quota", "New friends get this many GB to store here (each friend's own is under Friends)"),
+    ("free", "Keep free: friends' backups are refused while the disk has fewer GB free (0 = no check)"),
     ("hours", "Only between these hours, such as 22-7 ('always' for any time)"),
     ("pause", "Right now (enter: pause for a number of hours; 0 resumes)"),
     ("every", "Minutes between backups to a local drive (friends and cloud storage default to 60)"),
@@ -418,7 +423,8 @@ const GENERAL: [(&str, &str); 14] = [
     ("monthly", "Monthly: one a month is kept for this many months"),
 ];
 const ESSENTIAL: usize = 3;
-const AUTOMATIC: usize = 7;
+const FRIENDS: usize = 6;
+const AUTOMATIC: usize = 10;
 
 const RULES: [(&str, &str); 4] = [
     ("set-every", "Back up every this many minutes (0 = each destination's own pace)"),
@@ -664,6 +670,8 @@ impl App {
             "set-days" => own.keep_days,
             "every" => (self.cfg.min_interval_secs / 60).max(1) as u32,
             "warn" => self.cfg.warn_after_days,
+            "quota" => self.cfg.default_quota_gb as u32,
+            "free" => self.cfg.min_free_gb as u32,
             "versions" => r.max_versions,
             "days" => r.keep_days,
             "last" => r.keep_last,
@@ -680,6 +688,7 @@ impl App {
             "set-hours" if self.cur_set().hours.is_empty() => "general".into(),
             "set-hours" => self.cur_set().hours,
             "name" => self.cfg.name.clone(),
+            "accept" => if self.cfg.accept_backups { "yes" } else { "no" }.into(),
             "limit" => mbps(self.cfg.upload_kbps),
             "incoming" => mbps(self.cfg.incoming_kbps),
             "hours" if self.cfg.backup_hours.is_empty() => "any time".into(),
@@ -711,6 +720,13 @@ impl App {
             ("set-versions", Some(n)) => edit(None, None, None, Some(n)),
             ("set-days", Some(n)) => edit(None, None, Some(n), None),
             ("name", _) if !text.is_empty() => Cmd::Tune(Tune { name: Some(text.to_string()), ..Default::default() }),
+            ("accept", _) => match text.to_ascii_lowercase().as_str() {
+                "yes" | "y" | "on" => Cmd::Tune(Tune { accept_backups: Some(true), ..Default::default() }),
+                "no" | "n" | "off" => Cmd::Tune(Tune { accept_backups: Some(false), ..Default::default() }),
+                _ => return false,
+            },
+            ("quota", Some(n)) => Cmd::Tune(Tune { default_quota_gb: Some(n as u64), ..Default::default() }),
+            ("free", Some(n)) => Cmd::Tune(Tune { min_free_gb: Some(n as u64), ..Default::default() }),
             ("limit", _) => match parse_mbps(text) {
                 Some(k) => tune(Some(k), None, None, None),
                 None => return false,
@@ -725,7 +741,7 @@ impl App {
             ("every", Some(n)) => Cmd::Every { name: None, minutes: n },
             ("warn", Some(n)) => tune(None, None, None, Some(n)),
             ("versions", Some(n)) => Cmd::Keep { set: vec![], versions: Some(n), pattern: None },
-            (k, Some(n)) if !["name", "hours", "pause", "set-hours"].contains(&k) => {
+            (k, Some(n)) if !["name", "accept", "hours", "pause", "set-hours"].contains(&k) => {
                 Cmd::Keep { set: vec![(k.to_string(), n)], versions: None, pattern: None }
             }
             _ => return false,
@@ -1073,6 +1089,16 @@ impl App {
                 val("Max incoming (MB/s)", "incoming"),
                 act(
                     format!(
+                        "Recovery kit: {}",
+                        if self.ov["kit"]["act"] == true { "needs exporting" } else { "up to date" }
+                    ),
+                    Act::KitInfo,
+                ),
+                val("Accept friends' backups", "accept"),
+                val("New friends get (GB)", "quota"),
+                val("Keep free (GB)", "free"),
+                act(
+                    format!(
                         "At login: {}",
                         if self.ov["service"].as_bool() == Some(true) { "starts by itself" } else { "not started" }
                     ),
@@ -1191,13 +1217,14 @@ impl App {
             }
             Kind::Settings => {
                 self.page = SETTINGS;
-                // The start-at-login line follows the essentials and has no row in the table.
+                // The recovery kit and start-at-login lines end their groups and have no row in the table.
                 self.settings.select(match sel {
                     s if s < ESSENTIAL => Some(s),
-                    s if s == ESSENTIAL => None,
-                    s => Some(s - 1),
+                    s if s == ESSENTIAL || s == FRIENDS + 1 => None,
+                    s if s <= FRIENDS => Some(s - 1),
+                    s => Some(s - 2),
                 });
-                if sel > GENERAL.len() {
+                if sel > GENERAL.len() + 1 {
                     self.sub = Sub::Excludes;
                     self.exlist = None;
                 }
@@ -1263,6 +1290,18 @@ impl App {
                 if let Some(parent) = Path::new(&self.root).parent() {
                     self.set_root(parent.to_string_lossy().into_owned());
                 }
+            }
+            Act::KitInfo => {
+                let state = self.ov["kit"]["text"].as_str().unwrap_or("not known yet").to_string();
+                self.popup = Some(vec![
+                    format!("Recovery kit: {state}"),
+                    String::new(),
+                    "The kit is this computer's identity, key and settings in one passphrase-protected file.".into(),
+                    "With it and the passphrase you can restore everything on a new computer.".into(),
+                    String::new(),
+                    "To write it, quit and run:  sdb recovery export ~/sdb-recovery-kit.json".into(),
+                    "Then keep the file somewhere other than this computer.".into(),
+                ]);
             }
             Act::ServiceInfo => {
                 let on = self.ov["service"].as_bool() == Some(true);
@@ -1795,6 +1834,7 @@ impl App {
     fn dest_state(&self, name: &str) -> (String, Color) {
         let d = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == name));
         match d.and_then(|d| d["state"].as_str()) {
+            Some("online") if d.is_some_and(|d| d["closed"] == true) => ("●".into(), Color::Magenta),
             Some("online") | Some("connected") => ("●".into(), Color::Green),
             Some("checking") => ("◌".into(), Color::Yellow),
             _ => ("○".into(), Color::Red),
@@ -2011,15 +2051,19 @@ impl App {
         let mut items = vec![heading("Essentials")];
         items.extend(GENERAL[..ESSENTIAL].iter().map(|(k, label)| row(self, k, label)));
         items.push(ListItem::new(""));
+        items.push(heading("Friends' backups to this computer"));
+        items.extend(GENERAL[ESSENTIAL..FRIENDS].iter().map(|(k, label)| row(self, k, label)));
+        items.push(ListItem::new(""));
         items.push(heading("Automatic backups"));
-        items.extend(GENERAL[ESSENTIAL..AUTOMATIC].iter().map(|(k, label)| row(self, k, label)));
+        items.extend(GENERAL[FRIENDS..AUTOMATIC].iter().map(|(k, label)| row(self, k, label)));
         items.push(ListItem::new(""));
         items.push(heading("History kept"));
         items.extend(GENERAL[AUTOMATIC..].iter().map(|(k, label)| row(self, k, label)));
         let chosen = self.settings.selected().map(|i| match i {
             i if i < ESSENTIAL => i + 1,
-            i if i < AUTOMATIC => i + 3,
-            i => i + 5,
+            i if i < FRIENDS => i + 3,
+            i if i < AUTOMATIC => i + 5,
+            i => i + 7,
         });
         let mut st = ListState::default().with_selected(chosen);
         let block = Block::bordered()
@@ -2090,6 +2134,7 @@ impl App {
             let get = |k: &str| o.map(|o| o[k].clone()).unwrap_or(Value::Null);
             let (dot, color) = self.dest_state(&x.name);
             let state = get("state").as_str().unwrap_or("checking").to_string();
+            let state = if get("closed") == true { format!("{state} · takes no backups from you") } else { state };
             let link = get("link").as_str().map(|l| format!(", {l}")).unwrap_or_default();
             let link = match get("version").as_str() {
                 Some(v) => format!("{link}, version {v}"),
@@ -2130,10 +2175,11 @@ impl App {
                 _ => Self::labelled(
                     "They use",
                     vec![Line::raw(format!(
-                        "{} of {} GB here · last backup from them {}",
+                        "{} of {} GB here · last backup from them {}{}",
                         human(get("used_here").as_u64().unwrap_or(0)),
                         x.quota_gb,
-                        ago(get("last_in").as_i64())
+                        ago(get("last_in").as_i64()),
+                        if self.cfg.accept_backups { "" } else { " · this computer accepts no new backups" }
                     ))],
                 ),
             });
@@ -2464,6 +2510,7 @@ impl App {
                 }
                 Prompt::Setting("pause") => " Pause for how many hours? (blank = until resumed, 0 = resume) ".into(),
                 Prompt::Setting("name") => " New name for this computer ".into(),
+                Prompt::Setting("accept") => " May friends back up to this computer? (yes or no) ".into(),
                 Prompt::Setting(_) => " New value ".into(),
                 Prompt::Join => " Paste the invite, then Enter ".into(),
                 Prompt::RestoreTo => " Restore into which folder? ".into(),

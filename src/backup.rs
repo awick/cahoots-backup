@@ -594,6 +594,14 @@ fn forgotten(home: &Path) -> HashSet<String> {
     fs::read(home.join("forgotten.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
+/// What asking a destination before a backup found.
+enum Probed {
+    Ready(Box<Target>),
+    Full,
+    /// A friend who takes no backups from this node.
+    Closed,
+}
+
 async fn run_once(
     node: &Arc<Node>,
     tag: Option<String>,
@@ -622,9 +630,14 @@ async fn run_once(
     let names = &cfg;
     let probes = futures::future::join_all(friends.iter().map(|f| async move {
         let peer = node.peer_patient(f).await?;
+        let closed = !peer.accepts().await;
+        node.set_closed(&f.id, closed);
+        if closed {
+            return Ok(Probed::Closed);
+        }
         let (used, quota) = peer.usage().await?;
         if used > quota {
-            return Ok(None);
+            return Ok(Probed::Full);
         }
         let known = node.known(&peer, false).await?;
         let newest = peer
@@ -642,18 +655,34 @@ async fn run_once(
                 })
             })
             .max_by_key(|n| n.at);
-        Ok::<_, anyhow::Error>(Some(Target { peer, known, added: vec![], newest, failed: None, full: false }))
+        Ok::<_, anyhow::Error>(Probed::Ready(Box::new(Target {
+            peer,
+            known,
+            added: vec![],
+            newest,
+            failed: None,
+            full: false,
+        })))
     }))
     .await;
+    let mut closed = 0;
     for (f, probe) in friends.iter().zip(probes) {
         match probe {
-            Ok(Some(t)) => targets.push(t),
-            Ok(None) => full.push(f.clone()),
+            Ok(Probed::Ready(t)) => targets.push(*t),
+            Ok(Probed::Full) => full.push(f.clone()),
+            Ok(Probed::Closed) => {
+                closed += 1;
+                out.say(format!("  {} does not accept backups from this computer: nothing is sent there", f.name));
+            }
             Err(e) => out.say(format!("  {} is unreachable: {e:#}", f.name)),
         }
     }
     if !full.is_empty() {
         return Ok(full);
+    }
+    if targets.is_empty() && closed == friends.len() {
+        // Nothing to do and nothing wrong here: the warnings say where no backup arrives.
+        return Ok(vec![]);
     }
     if targets.is_empty() {
         bail!("none of your friends are reachable right now");

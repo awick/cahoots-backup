@@ -88,6 +88,9 @@ restore point shortly after files stop changing.
 | `sdb name NAME` | give this computer another name (friends you already have keep the name they know) |
 | `sdb limit MBPS` | cap the speed of your backups going out, to friends and cloud storage, in MB/s such as 0.5 or 20 (0 = unlimited) |
 | `sdb limit --incoming MBPS` | cap what all your friends together send to your computer (0 = unlimited) |
+| `sdb accept off` / `sdb accept on` | whether friends may back up to your computer; off makes it one that only backs up to its friends |
+| `sdb default-quota GB` | what a friend you pair with from now on may store on your computer (100 unless you change it) |
+| `sdb keep-free GB` | friends' backups are refused while your disk has less free than this (default 5, 0 = no check) |
 | `sdb schedule 22-7` / `sdb schedule always` | hours of the day automatic backups may run |
 | `sdb pause [HOURS]` / `sdb resume` | hold automatic backups |
 | `sdb warn-after DAYS` | warn when a backup, yours or a friend's to you, is this stale (default 3) |
@@ -123,7 +126,7 @@ when each last got a backup), its schedule, and what it is doing right now.
 | Backup | the backup sets and their status; create a set, choose its files, its destinations, its exclusion list and its schedule and history rules; back up now, verify, and take what the set now leaves out from its older restore points |
 | Restore | choose a backup set, then browse its files as of any restore point, search by name, step through time, list a file's versions, choose which destination to read from, restore |
 | Friends | friends' computers, and drives and cloud storage of your own, each under its own heading: whether each is reachable and how, what you store there, what they store here; invite, accept an invite, add a drive or cloud storage, set pace, quota or cap, and how much history each keeps; clean up what sets no longer sent there left behind |
-| Settings | the essentials first (this computer's name, the most to send and to receive per second), then hours, pause, pace, warnings and history rules that apply to every set; the exclusion lists |
+| Settings | the essentials first (this computer's name, the most to send and to receive per second, and whether the recovery kit has been exported, with a button to export it), then whether friends may back up to this computer and how much room they get, then hours, pause, pace, warnings and history rules that apply to every set; the exclusion lists |
 | History | what the daemon has done since it started |
 | Status | the full `sdb status` report |
 
@@ -253,6 +256,13 @@ Destinations are backed up at their own pace (friends hourly, a new drive every
 15 minutes, unless you change it), so the same state can carry different ids on
 different destinations.
 
+**One-way friends.** A computer can back up to its friends without taking
+anything from them: untick "friends may back up to this computer" in Settings,
+or run `sdb accept off`. What friends already keep there stays, and they can
+still restore or remove it, but nothing new is accepted. On their side that
+computer shows a purple dot and "takes no backups from you", and their backups
+skip it without deleting anything.
+
 **Backup sets.** A set is a named group of folders with its own destinations,
 pace, hours and history rules; folders start in the `default` set, which goes to
 every destination. Each restore point belongs to one set. Sets share storage, so
@@ -333,7 +343,10 @@ of guessing.
 **Losing your computer.** `sdb recovery export` writes your identity, master key
 and friend list encrypted with a passphrase (Argon2id). On a new machine:
 `sdb recovery import kit.json`, then `sdb restore latest --in-place`. Without
-the kit the backups cannot be decrypted by anyone.
+the kit the backups cannot be decrypted by anyone. `sdb status` and the
+Settings page say whether a kit has been exported, and when it is older than
+your newest friend or drive and should be exported again; the GUI can write it
+from Settings.
 
 ## Files
 

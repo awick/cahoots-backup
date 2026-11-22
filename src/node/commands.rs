@@ -154,6 +154,10 @@ impl Node {
         if c.incoming_kbps > 0 {
             out.say(format!("max incoming: {} MB/s", mbps(c.incoming_kbps)));
         }
+        if !c.accept_backups {
+            out.say("friends:  cannot back up to this computer (sdb accept on to allow it)");
+        }
+        out.say(format!("recovery kit: {}", crate::recovery::state(&self.home, &c).describe().0));
         out.say("backing up:");
         for b in &c.sets {
             if c.sets.len() > 1 || !b.destinations.is_empty() || b.every_minutes > 0 || !b.hours.is_empty() {
@@ -193,7 +197,8 @@ impl Node {
                 };
                 let room =
                     if f.path.is_some() || quota == u64::MAX { String::new() } else { format!(" of {}", human(quota)) };
-                Ok::<_, anyhow::Error>(format!("online {link}, you use {}{room} there", human(used)))
+                let closed = if peer.accepts().await { "" } else { ", takes no backups from you" };
+                Ok::<_, anyhow::Error>(format!("online {link}{closed}, you use {}{room} there", human(used)))
             };
             let mine = match tokio::time::timeout(Duration::from_secs(8), probe).await {
                 Ok(Ok(s)) => s,
@@ -836,7 +841,17 @@ impl Node {
     }
 
     pub(super) async fn tune(&self, t: Tune, out: &Out) -> Result<()> {
-        let Tune { name, upload_kbps, incoming_kbps, hours, pause_hours, warn_days } = t;
+        let Tune {
+            name,
+            upload_kbps,
+            incoming_kbps,
+            hours,
+            pause_hours,
+            warn_days,
+            accept_backups,
+            default_quota_gb,
+            min_free_gb,
+        } = t;
         if let Some(h) = &hours {
             if !h.is_empty() && crate::config::parse_hours(h).is_none() {
                 bail!("hours look like 22-7 (10pm to 7am); use 'always' to remove the limit");
@@ -856,6 +871,15 @@ impl Node {
             if let Some(k) = incoming_kbps {
                 c.incoming_kbps = k;
             }
+            if let Some(a) = accept_backups {
+                c.accept_backups = a;
+            }
+            if let Some(gb) = default_quota_gb {
+                c.default_quota_gb = gb;
+            }
+            if let Some(gb) = min_free_gb {
+                c.min_free_gb = gb;
+            }
             if let Some(h) = hours {
                 c.backup_hours = h;
             }
@@ -866,11 +890,18 @@ impl Node {
                 c.warn_after_days = d;
             }
         })?;
-        match name {
-            Some(n) => {
+        if let Some(gb) = min_free_gb {
+            self.store.set_min_free(gb.saturating_mul(1 << 30));
+        }
+        match (name, accept_backups) {
+            (Some(n), _) => {
                 out.say(format!("this computer is now called {n}; friends you already have keep the name they know"))
             }
-            None => out.say("saved"),
+            (_, Some(false)) => out.say(
+                "friends can no longer back up to this computer; what they already keep here stays until they remove it",
+            ),
+            (_, Some(true)) => out.say("friends can back up to this computer again"),
+            _ => out.say("saved"),
         }
         Ok(())
     }

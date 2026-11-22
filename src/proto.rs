@@ -56,6 +56,9 @@ pub enum Req {
     /// Which sdb release the other side runs. Added after the first release, so it stays
     /// last: an older node answers it with an error, which reads as "unknown".
     Version,
+    /// Whether this node takes the asker's backups at all. Newer still, so it stays last:
+    /// a node too old to know it answers with an error, which reads as "yes".
+    Accepts,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -76,6 +79,7 @@ pub enum Resp {
     Version(String),
     /// Sent ahead of the reply, once per piece of a large request read so far.
     Progress,
+    Accepts(bool),
 }
 
 pub async fn send<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
