@@ -30,6 +30,10 @@ start
 x status >status.out 2>&1 || fail "status"
 grep -q "^name: *boxed" status.out || fail "SDB_NAME was not used"
 grep -q "daemon: *running" status.out || fail "the daemon is not running"
+grep -q "the container runs the daemon" status.out || fail "status does not know it is in a container"
+grep -q "service install" status.out && fail "status suggests a login service inside a container"
+x service install >/dev/null 2>&1 && fail "a login service was installed inside a container"
+x status >/dev/null 2>&1 || fail "refusing the service stopped the daemon"
 x status | grep -q ":45111" || fail "SDB_PORT was not used"
 [ "$(docker exec "$NAME" id -u)" != 0 ] || fail "the daemon runs as root"
 ID=$(x status | awk '/node id/ {print $3}')

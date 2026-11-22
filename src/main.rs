@@ -618,6 +618,11 @@ async fn real_main() -> Result<()> {
         C::Gui => bail!("this sdb was built without the graphical interface; use `sdb tui`"),
         C::Service { cmd } => {
             return match cmd {
+                ServiceCmd::Install if service::in_container() => {
+                    bail!(
+                        "sdb runs in a container here: the container starts the daemon, and its restart policy brings it back"
+                    )
+                }
                 ServiceCmd::Install => {
                     // Hand over: a daemon this user started by hand would block the service's one.
                     if let Some(s) = control::connect(&home).await {

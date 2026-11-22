@@ -393,8 +393,9 @@ impl Gui {
     }
 
     /// Draws a small status circle: filled when reachable, a ring when not.
-    fn dot(ui: &mut egui::Ui, (kind, color): (&'static str, Color32)) {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    fn dot(ui: &mut egui::Ui, (kind, color, meaning): (&'static str, Color32, &'static str)) {
+        let (rect, over) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        over.on_hover_text(meaning);
         if kind == "full" {
             ui.painter().circle_filled(rect.center(), 5.0, color);
         } else {
@@ -511,14 +512,40 @@ impl Gui {
         });
     }
 
-    fn dest_dot(&self, name: &str) -> (&'static str, Color32) {
+    /// The circle for a destination: its shape, its colour, and what the two mean, which
+    /// shows when the pointer rests on it.
+    fn dest_dot(&self, name: &str) -> (&'static str, Color32, &'static str) {
         let d = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == name));
         match d.and_then(|d| d["state"].as_str()) {
-            Some("online") if d.is_some_and(|d| d["closed"] == true) => ("full", PURPLE),
-            Some("online") | Some("connected") => ("full", GREEN),
-            Some("checking") => ("ring", YELLOW),
-            _ => ("ring", RED),
+            Some("online") if d.is_some_and(|d| d["closed"] == true) => {
+                ("full", PURPLE, "Purple: online, but it takes no backups from this computer")
+            }
+            Some("online") => ("full", GREEN, "Green: online, backups can go there now"),
+            Some("connected") => ("full", GREEN, "Green: the drive is connected, backups can go there now"),
+            Some("checking") => ("ring", YELLOW, "Yellow ring: not heard from yet, still checking"),
+            Some("not connected") => {
+                ("ring", RED, "Red ring: the drive is not connected; it catches up when it is plugged in again")
+            }
+            _ => ("ring", RED, "Red ring: cannot be reached right now; it catches up when it is back"),
         }
+    }
+
+    /// What needs attention, each with the place to deal with it where there is one.
+    /// Returns how many there were.
+    fn warnings(&mut self, ui: &mut egui::Ui) -> usize {
+        let warnings: Vec<String> =
+            self.ov["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str()).map(String::from).collect();
+        for w in &warnings {
+            // What a terminal would be told to type is, in a window, a place to go.
+            let text = w.split_once(" (sdb ").map_or(w.as_str(), |(text, _)| text);
+            ui.horizontal(|ui| {
+                ui.colored_label(RED, format!("! {text}"));
+                if w.contains("recovery kit") && ui.link("Fix it in Settings").clicked() {
+                    self.page = Page::Settings;
+                }
+            });
+        }
+        warnings.len()
     }
 
     fn set_edit(name: &str) -> Cmd {
@@ -534,18 +561,7 @@ impl Gui {
             self.edit = None;
         }
         let ctx = ui.ctx().clone();
-        let warnings: Vec<String> =
-            self.ov["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str()).map(String::from).collect();
-        for w in warnings {
-            // What a terminal would be told to type is, in a window, a place to go.
-            let text = w.split_once(" (sdb ").map_or(w.as_str(), |(text, _)| text);
-            ui.horizontal(|ui| {
-                ui.colored_label(RED, format!("! {text}"));
-                if w.contains("recovery kit") && ui.link("Fix it in Settings").clicked() {
-                    self.page = Page::Settings;
-                }
-            });
-        }
+        self.warnings(ui);
         if let Some(h) = self.ov["held"].as_str() {
             ui.colored_label(YELLOW, format!("Automatic backups are held: {h}"));
         }
@@ -1816,10 +1832,10 @@ impl Gui {
                 if self.ov["service"].as_bool() == Some(true) {
                     ui.colored_label(GREEN, "the daemon starts by itself (the background service is installed)");
                 } else {
-                    ui.colored_label(
-                        YELLOW,
-                        "not started; run `sdb service install` in a terminal to have it start by itself",
-                    );
+                    ui.horizontal(|ui| {
+                        ui.colored_label(YELLOW, "not started; to have it start by itself, run this in a terminal");
+                        Self::command(ui, "sdb service install");
+                    });
                 }
                 ui.end_row();
                 ui.weak("Right now");
@@ -2124,6 +2140,245 @@ impl Gui {
         });
     }
 
+    /// A command to run in a terminal, with a button that copies it.
+    fn command(ui: &mut egui::Ui, text: &str) {
+        ui.label(RichText::new(text).monospace());
+        if ui.small_button("Copy").on_hover_text("Copy the command").clicked() {
+            ui.ctx().copy_text(text.to_string());
+        }
+    }
+
+    /// A card on the Status page: a title and what goes under it.
+    fn status_card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new(title).strong().size(15.0));
+            ui.add_space(2.0);
+            add(ui);
+        });
+        ui.add_space(4.0);
+    }
+
+    /// A table on the Status page: weak column titles, then the rows `add` draws.
+    fn status_table(ui: &mut egui::Ui, id: &str, titles: &[&str], add: impl FnOnce(&mut egui::Ui)) {
+        egui::Grid::new(id).num_columns(titles.len()).spacing([22.0, 7.0]).show(ui, |ui| {
+            for t in titles {
+                ui.weak(*t);
+            }
+            ui.end_row();
+            add(ui);
+        });
+    }
+
+    /// How this computer and its backups stand: what needs attention, the computer itself,
+    /// each backup set, each place backups go and what friends keep here.
+    fn status_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if self.text_at.elapsed() > Duration::from_secs(5) {
+            self.text_at = Instant::now();
+            self.spawn(&ctx, Job::Text(Page::Status), Cmd::Status, None);
+        }
+        ui.heading("Status");
+        ui.weak("How this computer and its backups stand right now.");
+        ui.add_space(4.0);
+        let (ov, c) = (self.ov.clone(), self.cfg.clone());
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            Self::status_card(ui, "Needs attention", |ui| {
+                let mut any = self.warnings(ui) > 0;
+                if let Some(h) = ov["held"].as_str() {
+                    ui.colored_label(YELLOW, format!("Automatic backups are held: {h}"));
+                    any = true;
+                }
+                if !any {
+                    ui.colored_label(GREEN, "Nothing. Backups are running as they should.");
+                }
+            });
+            Self::status_card(ui, "This computer", |ui| {
+                Self::rows(ui, "st-this", |ui| {
+                    ui.weak("Name");
+                    ui.label(format!("{} · sdb {}", c.name, ov["version"].as_str().unwrap_or(crate::net::VERSION)));
+                    ui.end_row();
+                    ui.weak("Id");
+                    ui.horizontal(|ui| {
+                        let id = ov["id"].as_str().unwrap_or_default();
+                        let short: String = id.chars().take(16).collect();
+                        ui.label(RichText::new(format!("{short}...")).monospace()).on_hover_text(id);
+                        if ui.small_button("Copy").clicked() {
+                            ctx.copy_text(id.to_string());
+                        }
+                        ui.weak("what friends know this computer by");
+                    });
+                    ui.end_row();
+                    ui.weak("Daemon");
+                    ui.horizontal(|ui| {
+                        ui.colored_label(GREEN, "running");
+                        if ov["container"] == true {
+                            ui.weak("· the container starts it");
+                        } else if ov["service"] == true {
+                            ui.weak("· starts by itself at login");
+                        } else {
+                            ui.colored_label(YELLOW, "· not started at login: run this in a terminal");
+                            Self::command(ui, "sdb service install");
+                        }
+                    });
+                    ui.end_row();
+                    ui.weak("Reachable at");
+                    ui.horizontal(|ui| {
+                        let addrs: Vec<&str> =
+                            ov["addrs"].as_array().into_iter().flatten().filter_map(|a| a.as_str()).collect();
+                        ui.label(if addrs.is_empty() { "not known yet".to_string() } else { addrs.join(", ") });
+                        if let Some(r) = ov["relay"].as_str() {
+                            let host = r.trim_start_matches("https://").trim_end_matches('/').trim_end_matches('.');
+                            ui.weak(format!("· relay {host}"));
+                        }
+                    });
+                    ui.end_row();
+                    ui.weak("Recovery kit");
+                    ui.horizontal(|ui| {
+                        let color = if ov["kit"]["act"] == true { YELLOW } else { GREEN };
+                        ui.colored_label(color, ov["kit"]["text"].as_str().unwrap_or("not known yet"));
+                        if let Some(f) = ov["kit_copy"]["folder"].as_str() {
+                            ui.weak(format!("· kept in {}", tilde(f)));
+                        }
+                    });
+                    ui.end_row();
+                    ui.weak("Friends' backups");
+                    ui.horizontal(|ui| {
+                        if c.accept_backups {
+                            ui.label("accepted");
+                        } else {
+                            ui.colored_label(PURPLE, "not accepted: this computer only backs up to its friends");
+                        }
+                        match ov["turned_away"].as_u64() {
+                            Some(n) if n > 0 => ui.weak(format!("· {n} strangers turned away")),
+                            _ => ui.weak("· no strangers turned away"),
+                        };
+                    });
+                    ui.end_row();
+                    ui.weak("Speed");
+                    let limit =
+                        |kbps: u64| if kbps == 0 { "unlimited".to_string() } else { format!("{} MB/s", mbps(kbps)) };
+                    ui.label(format!("outgoing {} · incoming {}", limit(c.upload_kbps), limit(c.incoming_kbps)));
+                    ui.end_row();
+                    ui.weak("History kept");
+                    let r = &c.retention;
+                    ui.label(format!(
+                        "last {} · hourly {} · daily {} · weekly {} · monthly {} · {}",
+                        r.keep_last,
+                        r.keep_hourly,
+                        r.keep_daily,
+                        r.keep_weekly,
+                        r.keep_monthly,
+                        if r.keep_days == 0 {
+                            "no age limit".to_string()
+                        } else {
+                            format!("{} days at most", r.keep_days)
+                        }
+                    ));
+                    ui.end_row();
+                });
+            });
+            Self::status_card(ui, "Backup sets", |ui| {
+                let sets: Vec<Value> = ov["sets"].as_array().cloned().unwrap_or_default();
+                if sets.is_empty() {
+                    ui.weak("No backup sets yet. Make one on the Backup page.");
+                    return;
+                }
+                Self::status_table(ui, "st-sets", &["Set", "Size", "Last backup", "Goes to"], |ui| {
+                    for o in &sets {
+                        ui.label(RichText::new(o["name"].as_str().unwrap_or_default()).strong());
+                        ui.label(match o["files"].as_u64() {
+                            Some(n) => format!("{n} files, {}", human(o["bytes"].as_u64().unwrap_or(0))),
+                            None => "not backed up yet".to_string(),
+                        });
+                        match o["running"].as_str() {
+                            Some(r) => ui.colored_label(BLUE, format!("backing up: {r}")),
+                            None => ui.label(ago(o["last"].as_i64())),
+                        };
+                        ui.horizontal(|ui| {
+                            let to: Vec<&str> = o["dests"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|d| d["name"].as_str())
+                                .collect();
+                            if to.is_empty() {
+                                ui.colored_label(YELLOW, "nowhere");
+                            }
+                            for name in to {
+                                Self::dot(ui, self.dest_dot(name));
+                                ui.label(name);
+                                ui.add_space(6.0);
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            });
+            let dests: Vec<Value> = ov["dests"].as_array().cloned().unwrap_or_default();
+            Self::status_card(ui, "Where your backups go", |ui| {
+                if dests.is_empty() {
+                    ui.weak("Nowhere yet. Invite a friend or add a drive on the Friends page.");
+                    return;
+                }
+                Self::status_table(ui, "st-dests", &["", "How it is reached", "You use", "Last sent"], |ui| {
+                    for d in &dests {
+                        let name = d["name"].as_str().unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            Self::dot(ui, self.dest_dot(name));
+                            ui.label(RichText::new(name).strong());
+                            if d["in_use"] == false {
+                                ui.colored_label(YELLOW, "not in use");
+                            }
+                        });
+                        let mut how = vec![d["kind"].as_str().unwrap_or_default().to_string()];
+                        how.push(d["state"].as_str().unwrap_or("checking").to_string());
+                        how.extend(d["link"].as_str().map(String::from));
+                        if d["closed"] == true {
+                            how.push("takes no backups from you".into());
+                        }
+                        ui.label(how.join(" · "));
+                        ui.label(match (d["used_there"].as_u64(), d["quota_there"].as_u64()) {
+                            (Some(u), Some(q)) => format!("{} of {}", human(u), human(q)),
+                            (Some(u), None) => human(u),
+                            _ => "not known yet".to_string(),
+                        });
+                        ui.label(ago(d["last_out"].as_i64()));
+                        ui.end_row();
+                    }
+                });
+            });
+            let friends: Vec<&Value> = dests.iter().filter(|d| d["kind"] == "friend").collect();
+            if !friends.is_empty() {
+                Self::status_card(ui, "What friends keep on this computer", |ui| {
+                    Self::status_table(ui, "st-here", &["Friend", "They use", "Last backup from them"], |ui| {
+                        for d in &friends {
+                            ui.label(RichText::new(d["name"].as_str().unwrap_or_default()).strong());
+                            ui.label(format!(
+                                "{} of {} GB",
+                                human(d["used_here"].as_u64().unwrap_or(0)),
+                                d["quota_gb"].as_u64().unwrap_or(0)
+                            ));
+                            ui.label(ago(d["last_in"].as_i64()));
+                            ui.end_row();
+                        }
+                    });
+                });
+            }
+            egui::CollapsingHeader::new("The full report, as `sdb status` prints it").id_salt("st-full").show(
+                ui,
+                |ui| {
+                    if ui.button("Copy").clicked() {
+                        ctx.copy_text(self.text.join("\n"));
+                    }
+                    for l in &self.text {
+                        ui.monospace(l);
+                    }
+                },
+            );
+        });
+    }
+
     fn text_page(&mut self, ui: &mut egui::Ui, title: &str) {
         let ctx = ui.ctx().clone();
         if self.text_at.elapsed() > Duration::from_secs(5) {
@@ -2252,7 +2507,7 @@ impl eframe::App for Gui {
                 egui::ScrollArea::vertical().show(ui, |ui| self.settings_page(ui));
             }
             Page::History => self.text_page(ui, "History"),
-            Page::Status => self.text_page(ui, "Status"),
+            Page::Status => self.status_page(ui),
         });
     }
 }

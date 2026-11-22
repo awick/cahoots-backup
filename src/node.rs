@@ -1828,6 +1828,7 @@ impl Node {
             })
             .collect();
         let kit = crate::recovery::state(&self.home, &c).describe();
+        let (relay, addrs) = net::my_addrs(&self.endpoint);
         let copy = crate::recovery::copy_load(&self.home);
         json!({
             "name": c.name,
@@ -1843,6 +1844,10 @@ impl Node {
                 "error": copy.as_ref().and_then(|c| c.error.clone()),
             },
             "service": crate::service::installed(),
+            "container": crate::service::in_container(),
+            "addrs": addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "relay": relay,
+            "last_new": self.last_backup.lock().unwrap().clone(),
             "version": net::VERSION,
             "turned_away": self.guard.rejected.load(std::sync::atomic::Ordering::Relaxed),
             "sets": sets,

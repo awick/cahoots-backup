@@ -25,6 +25,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /sdb /usr/local/bin/sdb
 COPY docker/entrypoint.sh /usr/local/bin/sdb-entrypoint
 USER sdb
-ENV SDB_HOME=/config
+ENV SDB_HOME=/config SDB_IN_CONTAINER=1
 VOLUME ["/config", "/backups"]
 ENTRYPOINT ["sdb-entrypoint"]

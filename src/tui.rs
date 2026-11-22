@@ -1100,7 +1100,13 @@ impl App {
                 act(
                     format!(
                         "At login: {}",
-                        if self.ov["service"].as_bool() == Some(true) { "starts by itself" } else { "not started" }
+                        if self.ov["container"] == true {
+                            "the container starts it"
+                        } else if self.ov["service"].as_bool() == Some(true) {
+                            "starts by itself"
+                        } else {
+                            "not started"
+                        }
                     ),
                     Act::ServiceInfo,
                 ),
@@ -1310,7 +1316,12 @@ impl App {
             }
             Act::ServiceInfo => {
                 let on = self.ov["service"].as_bool() == Some(true);
-                self.popup = Some(if on {
+                self.popup = Some(if self.ov["container"] == true {
+                    vec![
+                        "sdb runs in a container here, and the container runs the daemon.".into(),
+                        "Its restart policy (such as `restart: unless-stopped`) brings it back after a reboot.".into(),
+                    ]
+                } else if on {
                     vec![
                         "The background service is installed: the daemon starts by itself when you log in.".into(),
                         String::new(),

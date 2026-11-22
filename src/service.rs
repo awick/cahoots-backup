@@ -27,6 +27,15 @@ pub fn installed() -> bool {
     unit_path().exists()
 }
 
+/// Whether this sdb runs inside a container, where the container is what starts the
+/// daemon and a login service has no meaning. The project's image says so itself; the
+/// marker files cover an image built some other way.
+pub fn in_container() -> bool {
+    std::env::var_os("SDB_IN_CONTAINER").is_some()
+        || Path::new("/.dockerenv").exists()
+        || Path::new("/run/.containerenv").exists()
+}
+
 /// Has the login service start the daemon, or start it afresh, so that the service stays the
 /// one running it: a daemon started beside it would leave the service failing to start its
 /// own, over and over. False when there is no service or it looks after another home (it

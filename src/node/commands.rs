@@ -127,14 +127,13 @@ impl Node {
                 "not running (files are not watched; back up by hand or run `sdb service install`)"
             }
         ));
-        out.say(format!(
-            "at login: {}",
-            if crate::service::installed() {
-                "the daemon starts by itself (service installed)"
-            } else {
-                "the daemon is not started (run `sdb service install`)"
-            }
-        ));
+        out.say(if crate::service::in_container() {
+            "at start: the container runs the daemon (its restart policy brings it back)".to_string()
+        } else if crate::service::installed() {
+            "at login: the daemon starts by itself (service installed)".to_string()
+        } else {
+            "at login: the daemon is not started (run `sdb service install`)".to_string()
+        });
         let (relay, addrs) = net::my_addrs(&self.endpoint);
         let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
         out.say(format!(
