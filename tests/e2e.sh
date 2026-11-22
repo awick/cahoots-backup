@@ -234,6 +234,30 @@ a ls latest >ls.out
 grep -q "target/b.o" ls.out || fail "the set did not go back to the Standard list"
 grep -q "sub/note.txt" ls.out || fail "a folder put back was not backed up"
 
+step "taking what is now left out from older restore points"
+a keep --last 24 >/dev/null
+a backup --set default >/dev/null
+OLD=$(a snapshots | awk '/ default / {id=$1} END {print id}')
+a ls "$OLD" | grep -q "target/b.o" || fail "the older restore point should hold the build folder"
+a set default --exclude Developer >/dev/null
+a prune --set default >/dev/null 2>&1 && fail "--set was accepted without --apply-exclusions"
+a prune --apply-exclusions --set default --dry-run >dry.out
+grep -q "would be taken out of" dry.out || fail "dry run of apply-exclusions"
+grep -q "bob: would free roughly .* of the .* chunks it holds" dry.out || fail "the dry run does not say what would be freed where"
+a ls "$OLD" | grep -q "target/b.o" || fail "a dry run changed a restore point"
+a prune --apply-exclusions --set default >applied.out
+grep -q "set default: .* taken out of" applied.out || fail "apply-exclusions"
+grep -q "bob: freed .* chunks)" applied.out || fail "no word on what was freed where: $(cat applied.out)"
+a ls "$OLD" >ls.out
+grep -q "proj/target" ls.out && fail "an older restore point still holds what is now left out"
+grep -q "proj/main.rs" ls.out || fail "apply-exclusions took out too much"
+a restore "$OLD" --to thinned >/dev/null || fail "a thinned restore point no longer restores"
+[ ! -e thinned/data/proj/target ] || fail "the left-out folder was restored"
+[ -f thinned/data/proj/main.rs ] || fail "a kept file was not restored"
+a verify --full | grep -q "all good" || fail "apply-exclusions removed chunks still needed"
+a prune --apply-exclusions | grep -q "no older restore point holds anything" || fail "a second pass found more to take out"
+a set default --exclude Standard >/dev/null
+
 step "files put back as they were still get a new restore point"
 echo v1 >data/flip
 a backup --set default >/dev/null

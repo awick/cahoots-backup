@@ -44,6 +44,15 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
+strip = true
+
+# For binaries handed to others (GitHub releases, `cargo build --profile dist`): optimised
+# across crates, which makes them smaller and a little faster but several times slower to
+# link, so everyday release builds and the checks do without it.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
 
 [features]
 default = ["gui"]

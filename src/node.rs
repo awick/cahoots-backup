@@ -27,6 +27,8 @@ use std::{
 };
 use tokio::sync::{Notify, mpsc};
 
+mod commands;
+
 #[derive(Clone)]
 pub struct Out(pub mpsc::UnboundedSender<String>);
 
@@ -40,6 +42,44 @@ impl Out {
 /// words from other nodes may hold line breaks or escape codes, which become `?`.
 pub fn clean(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+}
+
+/// A change to one backup set; what is left unset stays as it is.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SetEdit {
+    pub name: String,
+    pub to: Option<Vec<String>>,
+    pub every: Option<u32>,
+    pub hours: Option<String>,
+    pub days: Option<u32>,
+    pub versions: Option<u32>,
+    pub last: Option<u32>,
+    pub delete: bool,
+}
+
+/// Cloud storage to add as a destination, or new details for one already added.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CloudAdd {
+    pub name: String,
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: Option<String>,
+    pub prefix: Option<String>,
+    pub access_key: String,
+    pub secret_key: String,
+    /// How the bucket is addressed; None tries `bucket.endpoint` and then `endpoint/bucket`.
+    pub path_style: Option<bool>,
+    pub create: bool,
+    /// Certificates to trust for this storage instead of the usual ones (PEM text).
+    #[serde(default)]
+    pub ca_pem: Option<String>,
+}
+
+impl std::fmt::Debug for CloudAdd {
+    /// The secret key stays out of anything that prints a command.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CloudAdd {{ name: {:?}, endpoint: {:?}, bucket: {:?}, .. }}", self.name, self.endpoint, self.bucket)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -68,6 +108,12 @@ pub enum Cmd {
     },
     Prune {
         dry_run: bool,
+        /// Also take what the exclusion lists now leave out from older restore points.
+        #[serde(default)]
+        apply_exclusions: bool,
+        /// ... of this set only.
+        #[serde(default)]
+        set: Option<String>,
     },
     Forget {
         snap: String,
@@ -110,16 +156,7 @@ pub enum Cmd {
         name: String,
         to: String,
     },
-    SetEdit {
-        name: String,
-        to: Option<Vec<String>>,
-        every: Option<u32>,
-        hours: Option<String>,
-        days: Option<u32>,
-        versions: Option<u32>,
-        last: Option<u32>,
-        delete: bool,
-    },
+    SetEdit(SetEdit),
     RemovePath {
         path: PathBuf,
     },
@@ -173,21 +210,7 @@ pub enum Cmd {
         path: PathBuf,
     },
     /// Add cloud storage as a destination, or give an existing one new details.
-    CloudAdd {
-        name: String,
-        endpoint: String,
-        bucket: String,
-        region: Option<String>,
-        prefix: Option<String>,
-        access_key: String,
-        secret_key: String,
-        /// How the bucket is addressed; None tries `bucket.endpoint` and then `endpoint/bucket`.
-        path_style: Option<bool>,
-        create: bool,
-        /// Certificates to trust for this storage instead of the usual ones (PEM text).
-        #[serde(default)]
-        ca_pem: Option<String>,
-    },
+    CloudAdd(CloudAdd),
     /// Remove from one destination what the sets no longer sent there left behind.
     DestClean {
         name: String,
@@ -217,6 +240,23 @@ pub enum Cmd {
     },
 }
 
+impl Cmd {
+    /// Carries on to the end even if the client that asked for it goes away.
+    pub fn detached(&self) -> bool {
+        matches!(
+            self,
+            Cmd::Backup { .. } | Cmd::Prune { .. } | Cmd::Forget { .. } | Cmd::DestClean { dry_run: false, .. }
+        )
+    }
+
+    /// Changes what destinations hold or how records are filed, so it waits its turn behind any
+    /// other such job. A backup is one too, but takes its turn inside `backup::run`, which the
+    /// daemon's own automatic backups also go through.
+    fn exclusive(&self) -> bool {
+        matches!(self, Cmd::Prune { .. } | Cmd::Forget { .. } | Cmd::DestClean { .. } | Cmd::SetRename { .. })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Ticket {
     id: [u8; 32],
@@ -243,6 +283,49 @@ impl Snap {
 
 /// For each destination: when its chunk list was last fetched, and the list.
 type KnownChunks = HashMap<String, (Instant, Arc<HashSet<Id>>)>;
+
+/// Which chunks each restore point's files use, for working out what a destination still
+/// needs. Restore points share most of their chunks, so each is kept as a list of small
+/// numbers into one table of ids rather than as its whole file list: pruning a long history
+/// of a large folder then takes megabytes, not gigabytes.
+#[derive(Default)]
+struct Uses {
+    ids: Vec<Id>,
+    number: HashMap<Id, u32>,
+    by_snap: HashMap<String, Vec<u32>>,
+}
+
+impl Uses {
+    fn knows(&self, snap: &str) -> bool {
+        self.by_snap.contains_key(snap)
+    }
+
+    /// Records the chunks of a restore point's files, replacing what was recorded before.
+    fn set(&mut self, snap: &str, entries: &[Entry]) {
+        let mut mine: Vec<u32> = vec![];
+        for e in entries {
+            let Kind::File { chunks, .. } = &e.kind else { continue };
+            for id in chunks {
+                let next = self.ids.len() as u32;
+                let n = *self.number.entry(*id).or_insert(next);
+                if n == next {
+                    self.ids.push(*id);
+                }
+                mine.push(n);
+            }
+        }
+        mine.sort_unstable();
+        mine.dedup();
+        mine.shrink_to_fit();
+        self.by_snap.insert(snap.to_string(), mine);
+    }
+
+    fn add_to(&self, snap: &str, live: &mut HashSet<Id>) {
+        for n in self.by_snap.get(snap).into_iter().flatten() {
+            live.insert(self.ids[*n as usize]);
+        }
+    }
+}
 
 /// Result of checking on one destination in the background.
 #[derive(Clone)]
@@ -841,77 +924,9 @@ impl Node {
         Ok(mine)
     }
 
-    async fn invite(&self, out: &Out) -> Result<()> {
-        let token: [u8; 16] = rand::random();
-        self.update(|c| c.invites.push(Invite { token: hex::encode(token), expires: now() + 86400 }))?;
-        if !net::offline() {
-            let _ = tokio::time::timeout(Duration::from_secs(8), self.endpoint.online()).await;
-        }
-        let (relay, addrs) = net::my_addrs(&self.endpoint);
-        let t = Ticket { id: *self.endpoint.id().as_bytes(), relay, addrs, token };
-        let ticket = format!("sdb1{}", data_encoding::BASE32_NOPAD.encode(&postcard::to_stdvec(&t)?).to_lowercase());
-        let waiter = self.paired.notified();
-        tokio::pin!(waiter);
-        waiter.as_mut().enable();
-        out.say("Send this one-time invite to your friend (valid for 24 hours, treat it like a password):");
-        out.say("");
-        out.say(format!("  sdb join {ticket}"));
-        out.say("");
-        if self.daemon {
-            out.say("The daemon will accept it whenever they join.");
-        } else {
-            out.say(
-                "Waiting for your friend to join (Ctrl-C to stop; run `sdb daemon` to accept in the background)...",
-            );
-            if tokio::time::timeout(Duration::from_secs(86400), waiter).await.is_ok() {
-                let c = self.cfg();
-                out.say(format!("Paired with {}.", c.friends.last().map(|f| f.name.as_str()).unwrap_or("friend")));
-            }
-        }
-        Ok(())
-    }
-
-    async fn join(&self, ticket: &str, out: &Out) -> Result<()> {
-        let raw = ticket.trim().strip_prefix("sdb1").ok_or_else(|| anyhow!("that is not an sdb invite"))?;
-        let bytes =
-            data_encoding::BASE32_NOPAD.decode(raw.to_uppercase().as_bytes()).map_err(|_| anyhow!("damaged invite"))?;
-        let t: Ticket = postcard::from_bytes(&bytes).map_err(|_| anyhow!("damaged invite"))?;
-        let id = PublicKey::from_bytes(&t.id).map_err(|_| anyhow!("damaged invite"))?.to_string();
-        if id == self.id() {
-            bail!("that is your own invite");
-        }
-        let relay_hint = t.relay.filter(|r| net::valid_relay(r));
-        let hints = dialable(&t.addrs);
-        let conn = net::connect(&self.endpoint, net::endpoint_addr(&id, &relay_hint, &hints)?).await?;
-        let placeholder = Friend {
-            name: "friend".into(),
-            id: id.clone(),
-            quota_gb: 0,
-            backup_to: true,
-            relay: None,
-            addrs: vec![],
-            every_minutes: 0,
-            max_in_kbps: 0,
-            path: None,
-            drive_key: None,
-            cloud: None,
-            retention: None,
-        };
-        let peer = Peer { friend: placeholder, link: Link::Remote(conn.clone()) };
-        if !net::offline() {
-            let _ = tokio::time::timeout(Duration::from_secs(8), self.endpoint.online()).await;
-        }
-        let (relay, addrs) = net::my_addrs(&self.endpoint);
-        let theirs = peer.pair(Req::Pair { token: t.token, name: self.cfg().name, relay, addrs }).await?;
-        let name = self.update(|c| add_friend(c, &id, &theirs, relay_hint, hints))?;
-        self.store.allow(&id);
-        self.conns.lock().unwrap().insert(id, conn);
-        out.say(format!("Paired with {name}. You now back up to each other."));
-        Ok(())
-    }
-
     /// Deletes every chunk a friend holds for us that no remaining restore point uses.
-    async fn gc(&self, peer: &Peer, snaps: &[&Snap], cache: &mut HashMap<String, Vec<Entry>>) -> Result<u64> {
+    /// The chunks a destination holds, and those among them that none of `snaps` needs.
+    async fn unneeded(&self, peer: &Peer, snaps: &[&Snap], uses: &mut Uses) -> Result<(HashSet<Id>, Vec<Id>)> {
         let mut live: HashSet<Id> = HashSet::new();
         for s in snaps {
             let Some((_, idx)) = s.peers.iter().find(|(f, _)| f.id == peer.friend.id) else {
@@ -919,21 +934,32 @@ impl Node {
             };
             live.extend(idx.iter().copied());
             live.extend(s.m.index.iter().copied());
-            if !cache.contains_key(&s.id) {
-                cache.insert(s.id.clone(), self.load_index(s).await?);
+            if !uses.knows(&s.id) {
+                uses.set(&s.id, &self.load_index(s).await?);
             }
-            for e in &cache[&s.id] {
-                if let Kind::File { chunks, .. } = &e.kind {
-                    live.extend(chunks.iter().copied());
-                }
-            }
+            uses.add_to(&s.id, &mut live);
         }
         let have = peer.list_chunks().await?;
-        let dead: Vec<Id> = have.difference(&live).copied().collect();
+        let dead = have.difference(&live).copied().collect();
+        Ok((have, dead))
+    }
+
+    /// Deletes the chunks a destination holds that none of `snaps` needs. Returns how many
+    /// went and how many bytes that freed there, by the destination's own count.
+    async fn gc(&self, peer: &Peer, snaps: &[&Snap], uses: &mut Uses) -> Result<(u64, u64)> {
+        let (have, dead) = self.unneeded(peer, snaps, uses).await?;
+        if dead.is_empty() {
+            self.known.lock().await.insert(peer.friend.id.clone(), (Instant::now(), Arc::new(have)));
+            return Ok((0, 0));
+        }
+        let before = peer.usage().await.map(|u| u.0).ok();
         peer.delete_chunks(&dead).await?;
-        let kept: HashSet<Id> = have.intersection(&live).copied().collect();
+        let gone: HashSet<Id> = dead.iter().copied().collect();
+        let kept: HashSet<Id> = have.difference(&gone).copied().collect();
         self.known.lock().await.insert(peer.friend.id.clone(), (Instant::now(), Arc::new(kept)));
-        Ok(dead.len() as u64)
+        let after = peer.usage_exact().await.map(|u| u.0).ok();
+        let freed = before.zip(after).map_or(0, |(b, a)| b.saturating_sub(a));
+        Ok((dead.len() as u64, freed))
     }
 
     /// Frees room at a friend by dropping our oldest restore points there. Never drops the newest of any set.
@@ -949,7 +975,7 @@ impl Node {
         }
         mine.retain(|s| !newest.iter().any(|n| n.id == s.id));
         mine.sort_by_key(|s| (s.m.tag.is_some(), s.m.time, s.m.nanos));
-        let mut cache = HashMap::new();
+        let mut uses = Uses::default();
         let mut freed = false;
         while !mine.is_empty() {
             let victim = mine.remove(0);
@@ -957,7 +983,7 @@ impl Node {
             peer.delete_snapshot(&victim.id).await?;
             out.say(format!("    removed restore point {} ({}) from {}", victim.id, when(victim.m.time), friend.name));
             let rest: Vec<&Snap> = mine.iter().copied().chain(newest.iter().copied()).collect();
-            self.gc(&peer, &rest, &mut cache).await?;
+            self.gc(&peer, &rest, &mut uses).await?;
             freed = true;
             let (used, quota) = peer.usage_exact().await?;
             if used <= quota / 10 * 9 {
@@ -1031,11 +1057,12 @@ impl Node {
         for s in &go {
             peer.delete_snapshot(&s.id).await?;
         }
-        let freed = self.gc(&peer, &stay, &mut HashMap::new()).await?;
+        let (chunks, freed) = self.gc(&peer, &stay, &mut Uses::default()).await?;
         let (used, _) = peer.usage_exact().await.unwrap_or((0, 0));
         out.say(format!(
-            "removed {} restore points and {freed} chunks from {name}; {} restore points and {} remain there",
+            "removed {} restore points from {name} and freed {} there ({chunks} chunks); {} restore points and {} remain",
             go.len(),
+            human(freed),
             stay.len(),
             human(used)
         ));
@@ -1083,7 +1110,16 @@ impl Node {
 
     /// Applies the retention policy: drops expired restore points, trims files to
     /// their maximum number of versions, then reclaims the space at each friend.
-    pub async fn prune(&self, dry_run: bool, forget: Option<String>, out: &Out) -> Result<()> {
+    /// With `exclusions`, what a set's exclusion list and skipped folders now leave out is
+    /// also taken out of the restore points made before (of every set, or of `only_set`).
+    pub async fn prune(
+        &self,
+        dry_run: bool,
+        forget: Option<String>,
+        exclusions: bool,
+        only_set: Option<&str>,
+        out: &Out,
+    ) -> Result<()> {
         let cfg = self.cfg();
         let (mut snaps, peers) = self.snapshots(out).await?;
         if snaps.is_empty() {
@@ -1157,9 +1193,10 @@ impl Node {
         }
         for s in snaps.iter().filter(|s| !keep.contains(&s.id)) {
             out.say(format!(
-                "  {} restore point {} ({})",
+                "  {} restore point {} of set {} ({})",
                 if dry_run { "would remove" } else { "removing" },
                 s.id,
+                s.m.set,
                 when(s.m.time)
             ));
             removed += 1;
@@ -1176,12 +1213,17 @@ impl Node {
         }
         snaps.retain(|s| keep.contains(&s.id));
 
-        let mut cache: HashMap<String, Vec<Entry>> = HashMap::new();
+        let mut uses = Uses::default();
         let mut thinned = 0u64;
         let limited = cfg.retention.max_versions > 0
             || !cfg.version_rules.is_empty()
             || cfg.sets.iter().any(|b| b.retention.as_ref().is_some_and(|r| r.max_versions > 0));
-        if limited && forget.is_none() {
+        // What each set leaves out today, and how much of it older restore points held.
+        let mut leaves_out: HashMap<String, Option<backup::Excludes>> = HashMap::new();
+        let mut left_out: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        // About how large each chunk of a file taken out is, for the dry run's estimate.
+        let mut sizes: HashMap<Id, u64> = HashMap::new();
+        if (limited || exclusions) && forget.is_none() {
             let rules: Vec<(globset::GlobMatcher, u32)> = cfg
                 .version_rules
                 .iter()
@@ -1211,7 +1253,7 @@ impl Node {
                     }
                 };
                 if s.m.tag.is_some() {
-                    cache.insert(s.id.clone(), entries);
+                    uses.set(&s.id, &entries);
                     continue;
                 }
                 let before = entries.len();
@@ -1220,14 +1262,34 @@ impl Node {
                     .and_then(|b| b.retention.as_ref())
                     .map(|r| r.max_versions)
                     .unwrap_or(cfg.retention.max_versions);
-                let mut bytes = 0;
+                let ex = match exclusions && only_set.is_none_or(|n| n == s.m.set) {
+                    true => leaves_out
+                        .entry(s.m.set.clone())
+                        .or_insert_with(|| backup::Excludes::new(&cfg, cfg.set(&s.m.set)?, &self.home).ok())
+                        .as_ref(),
+                    false => None,
+                };
+                let roots: Vec<PathBuf> = s.m.roots.iter().map(PathBuf::from).collect();
+                let (mut bytes, mut excluded) = (0, 0u64);
                 let kept: Vec<Entry> = entries
                     .into_iter()
                     .filter(|e| {
+                        let p = e.path();
+                        if ex.is_some_and(|ex| roots.iter().any(|r| p.starts_with(r) && ex.covers(&p, r))) {
+                            excluded += 1;
+                            if let (true, Kind::File { size, chunks }) = (dry_run, &e.kind) {
+                                let each = size / chunks.len().max(1) as u64;
+                                sizes.extend(chunks.iter().map(|id| (*id, each)));
+                            }
+                            return false;
+                        }
                         let Kind::File { size, chunks } = &e.kind else {
                             return true;
                         };
-                        let p = e.path();
+                        if !limited {
+                            bytes += size;
+                            return true;
+                        }
                         let limit = rules.iter().find(|(g, _)| g.is_match(&p)).map(|(_, n)| *n).unwrap_or(set_limit);
                         let v = sig(chunks, *size);
                         let st = seen.entry([s.m.set.as_bytes(), b"\0", &e.path[..]].concat()).or_insert((0, !v));
@@ -1242,32 +1304,71 @@ impl Node {
                     })
                     .collect();
                 let gone = (before - kept.len()) as u64;
+                if excluded > 0 {
+                    let n = left_out.entry(s.m.set.clone()).or_default();
+                    *n = (n.0 + excluded, n.1 + 1);
+                }
                 if gone > 0 {
-                    thinned += gone;
+                    thinned += gone - excluded;
                     if !dry_run {
                         self.rewrite(s, &kept, bytes, gone, &peers, &mut failed).await?;
                     }
                 }
-                cache.insert(s.id.clone(), kept);
+                uses.set(&s.id, &kept);
             }
         }
+        for (set, (entries, points)) in &left_out {
+            out.say(format!(
+                "  set {set}: {points} older restore points still hold what the set now leaves out \
+                 ({entries} files and folders in all); {}",
+                if dry_run { "it would be taken out of them" } else { "it was taken out of them" }
+            ));
+        }
+        if exclusions && left_out.is_empty() {
+            out.say("  no older restore point holds anything the exclusion lists now leave out");
+        }
+        let all: Vec<&Snap> = snaps.iter().collect();
         if dry_run {
+            // Nothing is deleted, but each destination can say how much it holds that would go.
+            for p in &peers {
+                let Ok((have, dead)) = self.unneeded(p, &all, &mut uses).await else {
+                    out.say(format!("  {}: could not work out what would be freed there", p.friend.name));
+                    continue;
+                };
+                // A chunk of a file being taken out is about that file's size divided by its
+                // chunks; for any other, the destination's average has to do.
+                let used = p.usage().await.map_or(0, |u| u.0);
+                let average = used / have.len().max(1) as u64;
+                let space: u64 = dead.iter().map(|id| sizes.get(id).copied().unwrap_or(average)).sum();
+                out.say(format!(
+                    "  {}: would free roughly {} ({} of the {} chunks it holds)",
+                    p.friend.name,
+                    human(space.min(used)),
+                    dead.len(),
+                    have.len()
+                ));
+            }
             out.say(format!("dry run: {removed} restore points and {thinned} old file versions would be removed"));
             return Ok(());
         }
-        let mut freed = 0;
-        let all: Vec<&Snap> = snaps.iter().collect();
+        let (mut chunks, mut bytes) = (0, 0);
         for p in &peers {
             if failed.contains_key(&p.friend.id) {
                 continue;
             }
-            match self.gc(p, &all, &mut cache).await {
-                Ok(n) => freed += n,
+            match self.gc(p, &all, &mut uses).await {
+                Ok((n, freed)) => {
+                    if n > 0 {
+                        out.say(format!("  {}: freed {} ({n} chunks)", p.friend.name, human(freed)));
+                    }
+                    (chunks, bytes) = (chunks + n, bytes + freed);
+                }
                 Err(e) => drop(failed.insert(p.friend.id.clone(), format!("{e:#}"))),
             }
         }
         out.say(format!(
-            "removed {removed} restore points and {thinned} old file versions, freed {freed} chunks; {} restore points kept",
+            "removed {removed} restore points and {thinned} old file versions, freed {} ({chunks} chunks) across destinations; {} restore points kept",
+            human(bytes),
             snaps.len()
         ));
         if !failed.is_empty() {
@@ -1275,6 +1376,9 @@ impl Node {
                 out.say(format!("  not finished: {e}"));
             }
             bail!("pruning could not finish at {} destination(s); the others are done", failed.len());
+        }
+        if forget.is_none() {
+            self.job_mark("prune");
         }
         Ok(())
     }
@@ -1490,125 +1594,6 @@ impl Node {
         n
     }
 
-    async fn status(self: &Arc<Self>, out: &Out) -> Result<()> {
-        let c = self.cfg();
-        for w in self.warnings() {
-            out.say(format!("WARNING:  {w}"));
-        }
-        out.say(format!("name:     {}", c.name));
-        out.say(format!("version:  {}", net::VERSION));
-        out.say(format!("node id:  {}", self.id()));
-        let turned_away = self.guard.rejected.load(std::sync::atomic::Ordering::Relaxed);
-        if turned_away > 0 {
-            out.say(format!(
-                "security: {turned_away} connection attempts from unknown nodes turned away since this started"
-            ));
-        }
-        out.say(format!(
-            "daemon:   {}",
-            if self.watching {
-                "running (watching for changes)"
-            } else {
-                "not running (files are not watched; back up by hand or run `sdb service install`)"
-            }
-        ));
-        out.say(format!(
-            "at login: {}",
-            if crate::service::installed() {
-                "the daemon starts by itself (service installed)"
-            } else {
-                "the daemon is not started (run `sdb service install`)"
-            }
-        ));
-        let (relay, addrs) = net::my_addrs(&self.endpoint);
-        let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
-        out.say(format!(
-            "reachable at: {}{}",
-            addrs.join(", "),
-            relay.map(|r| format!(" (relay {r})")).unwrap_or_default()
-        ));
-        if let Some(t) = self.last_backup.lock().unwrap().clone() {
-            out.say(format!("last new restore point: {t}"));
-        }
-        if let Some(why) = c.held() {
-            out.say(format!("automatic backups: held ({why})"));
-        }
-        if c.upload_kbps > 0 {
-            out.say(format!("upload limit: {} KB/s", c.upload_kbps));
-        }
-        out.say("backing up:");
-        for b in &c.sets {
-            if c.sets.len() > 1 || !b.destinations.is_empty() || b.every_minutes > 0 || !b.hours.is_empty() {
-                let to =
-                    if b.destinations.is_empty() { "every destination".to_string() } else { b.destinations.join(", ") };
-                let pace = if b.every_minutes > 0 { format!(", every {} min", b.every_minutes) } else { String::new() };
-                let hours = if b.hours.is_empty() { String::new() } else { format!(", hours {}", b.hours) };
-                out.say(format!("  set {} -> {to}{pace}{hours}", b.name));
-            }
-            for p in &b.paths {
-                out.say(format!("    {}", p.display()));
-            }
-        }
-        let r = &c.retention;
-        out.say(format!(
-            "keeping:  last {}, hourly {}, daily {}, weekly {}, monthly {}, max age {}, max versions per file {}",
-            r.keep_last,
-            r.keep_hourly,
-            r.keep_daily,
-            r.keep_weekly,
-            r.keep_monthly,
-            if r.keep_days == 0 { "unlimited".into() } else { format!("{} days", r.keep_days) },
-            if r.max_versions == 0 { "unlimited".into() } else { r.max_versions.to_string() }
-        ));
-        for v in &c.version_rules {
-            out.say(format!("          {} -> {} versions", v.pattern, v.max_versions));
-        }
-        out.say("destinations:");
-        for f in &c.friends {
-            let theirs = self.stored_here(&f.id).map_or("counting...".into(), human);
-            let probe = async {
-                let peer = self.peer(f).await?;
-                let (used, quota) = peer.usage().await?;
-                let link = match peer.version().await {
-                    Some(v) => format!("{}, version {v}", peer.describe_link().await),
-                    None => peer.describe_link().await,
-                };
-                let room =
-                    if f.path.is_some() || quota == u64::MAX { String::new() } else { format!(" of {}", human(quota)) };
-                Ok::<_, anyhow::Error>(format!("online {link}, you use {}{room} there", human(used)))
-            };
-            let mine = match tokio::time::timeout(Duration::from_secs(8), probe).await {
-                Ok(Ok(s)) => s,
-                _ => "offline".into(),
-            };
-            let mine = format!("{mine}, sent at most every {} min", f.interval_secs(&c) / 60);
-            if f.path.is_some() {
-                out.say(format!(
-                    "  {:<16} {}",
-                    f.name,
-                    mine.replace("online local drive", "connected local drive")
-                        .replace("offline", "local drive, not connected")
-                ));
-                continue;
-            }
-            if f.cloud.is_some() {
-                let keep = match &f.retention {
-                    Some(r) if r.keep_days > 0 => format!(", keeps {} days", r.keep_days),
-                    Some(_) => ", own history rules".into(),
-                    None => String::new(),
-                };
-                out.say(format!("  {:<16} {}{keep}", f.name, mine.replace("offline", "cloud storage, not reachable")));
-                continue;
-            }
-            let last = match self.store.last_snapshot(&f.id) {
-                Some(t) => format!(", last backup from them {}", when(t)),
-                None => String::new(),
-            };
-            out.say(format!("  {:<16} {mine}; they use {theirs} of {} GB here{last}", f.name, f.quota_gb));
-        }
-        Ok(())
-    }
-
     /// The restore points at which a file's content changed, oldest first.
     #[allow(clippy::type_complexity)]
     async fn versions(
@@ -1803,6 +1788,33 @@ impl Node {
         self.home.join("cache").join("last-ok.json")
     }
 
+    fn jobs_path(&self) -> PathBuf {
+        self.home.join("cache").join("jobs.json")
+    }
+
+    /// When one of the daemon's regular jobs ("prune", "check") last ran. It is kept on disk,
+    /// so a daemon that is restarted more often than the job comes round still gets to it.
+    pub fn job_last(&self, job: &str) -> Option<i64> {
+        let all: HashMap<String, i64> =
+            fs::read(self.jobs_path()).ok().and_then(|b| serde_json::from_slice(&b).ok())?;
+        all.get(job).copied()
+    }
+
+    pub fn job_mark(&self, job: &str) {
+        let mut all: HashMap<String, i64> =
+            fs::read(self.jobs_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        all.insert(job.to_string(), now());
+        let _ = fs::create_dir_all(self.home.join("cache"));
+        let _ = fs::write(self.jobs_path(), serde_json::to_vec(&all).unwrap_or_default());
+    }
+
+    /// Whether a job last run at `last` and wanted every `every` seconds is due at `now`. A
+    /// time still ahead of us means the clock has been set back since: nothing is due then,
+    /// least of all a job that deletes by age.
+    pub fn job_due(last: Option<i64>, now: i64, every: i64) -> bool {
+        last.is_none_or(|t| now >= t && now - t >= every)
+    }
+
     /// When each destination last completed a backup run, by friend id.
     pub fn last_ok(&self) -> HashMap<String, i64> {
         fs::read(self.state_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
@@ -1856,846 +1868,58 @@ impl Node {
         c.friends.iter_mut().find(|f| f.name == name).ok_or_else(|| anyhow!("no friend named {name}"))
     }
 
+    /// Does what one command asks. Each command is one method, most of them in `commands.rs`.
     pub async fn run(self: &Arc<Self>, cmd: Cmd, out: &Out) -> Result<()> {
+        let _turn = if cmd.exclusive() { Some(self.op.lock().await) } else { None };
         match cmd {
-            Cmd::Backup { tag, set } => backup::run(self, tag, set.as_deref(), None, out).await,
-            Cmd::Snapshots => {
-                let (snaps, _) = self.snapshots(out).await?;
-                out.say(format!(
-                    "{:<17} {:<20} {:<10} {:>9} {:>10} {:>10}  {:<12} {}",
-                    "ID", "WHEN", "SET", "FILES", "SIZE", "UPLOADED", "TAG", "STORED WITH"
-                ));
-                for s in &snaps {
-                    let names: Vec<_> = s.peers.iter().map(|(f, _)| f.name.clone()).collect();
-                    out.say(format!(
-                        "{:<17} {:<20} {:<10} {:>9} {:>10} {:>10}  {:<12} {}",
-                        s.id,
-                        when(s.m.time),
-                        s.m.set,
-                        s.m.files,
-                        human(s.m.bytes),
-                        human(s.m.new_bytes),
-                        s.m.tag.clone().unwrap_or_default(),
-                        names.join(", ")
-                    ));
-                }
-                Ok(())
-            }
-            Cmd::Ls { snap, path } => {
-                let (snaps, _) = self.snapshots(out).await?;
-                let s = self.resolve(&snaps, &snap)?;
-                let filters: Vec<String> = path.into_iter().collect();
-                for e in self.load_index(s).await?.iter().filter(|e| under(&e.path(), &filters)) {
-                    let t = match e.kind {
-                        Kind::Dir => 'd',
-                        Kind::Symlink(_) => 'l',
-                        Kind::File { .. } => '-',
-                    };
-                    out.say(format!(
-                        "{t}{:04o} {:>10} {} {}",
-                        e.mode & 0o7777,
-                        human(e.size()),
-                        when(e.mtime / 1_000_000_000),
-                        e.show()
-                    ));
-                }
-                Ok(())
-            }
-            Cmd::Diff { a, b } => {
-                let (snaps, _) = self.snapshots(out).await?;
-                let (sa, sb) = (self.resolve(&snaps, &a)?, self.resolve(&snaps, &b)?);
-                let ea: BTreeMap<Vec<u8>, Entry> =
-                    self.load_index(sa).await?.into_iter().map(|e| (e.path.clone(), e)).collect();
-                let eb: BTreeMap<Vec<u8>, Entry> =
-                    self.load_index(sb).await?.into_iter().map(|e| (e.path.clone(), e)).collect();
-                let mut n = 0;
-                for (p, e) in &eb {
-                    match ea.get(p) {
-                        None => out.say(format!("+ {}", e.show())),
-                        Some(o) if o.kind != e.kind => out.say(format!("M {}", e.show())),
-                        Some(o) if o.mode != e.mode => out.say(format!("m {}", e.show())),
-                        _ => continue,
-                    }
-                    n += 1;
-                }
-                for e in ea.values().filter(|e| !eb.contains_key(&e.path)) {
-                    out.say(format!("- {}", e.show()));
-                    n += 1;
-                }
-                out.say(format!("{n} differences between {} and {}", sa.id, sb.id));
-                Ok(())
-            }
-            Cmd::History { path } => {
-                let list = self.versions(&path, &None, out).await?;
-                for (id, time, v, _) in &list {
-                    match v {
-                        Some((size, mtime)) => out.say(format!(
-                            "{id}  {}  {:>10}  modified {}",
-                            when(*time),
-                            human(*size),
-                            when(mtime / 1_000_000_000)
-                        )),
-                        None => out.say(format!("{id}  {}  (not present)", when(*time))),
-                    }
-                }
-                let n = list.iter().filter(|v| v.2.is_some()).count();
-                out.say(format!("{n} versions of {path}; restore one with `sdb restore <ID> {path} --to <dir>`"));
-                Ok(())
-            }
-            Cmd::Versions { path, from } => {
-                for (id, time, v, at) in self.versions(&path, &from, out).await? {
-                    out.say(serde_json::json!({"id": id, "time": time, "size": v.map(|x| x.0), "at": at}).to_string());
-                }
-                Ok(())
-            }
-            Cmd::Restore { snap, paths, to, from } => {
-                let snaps = self.snapshots_from(&from, out).await?;
-                let s = self.resolve(&snaps, &snap)?;
-                let entries: Vec<Entry> =
-                    self.load_index(s).await?.into_iter().filter(|e| under(&e.path(), &paths)).collect();
-                if entries.is_empty() {
-                    bail!("nothing in restore point {} matches", s.id);
-                }
-                out.say(format!(
-                    "restoring {} entries from restore point {} ({})",
-                    entries.len(),
-                    s.id,
-                    when(s.m.time)
-                ));
-                restore::run(self, &s.friends(), entries, &to, &s.m.roots, out).await
-            }
-            Cmd::Prune { dry_run } => {
-                let _op = self.op.lock().await;
-                self.prune(dry_run, None, out).await
-            }
-            Cmd::Forget { snap } => {
-                let _op = self.op.lock().await;
-                self.prune(false, Some(snap), out).await
-            }
-            Cmd::Verify { set: Some(name), .. } if self.cfg().set(&name).is_none() => bail!("no set named {name}"),
-            Cmd::Verify { local: true, set, .. } => self.check_local(set.as_deref(), out).await,
-            Cmd::Verify { full, set, .. } => self.verify(full, set.as_deref(), out).await,
+            Cmd::Backup { tag, set } => self.backup(tag, set, out).await,
+            Cmd::Snapshots => self.show_snapshots(out).await,
+            Cmd::Ls { snap, path } => self.ls(snap, path, out).await,
+            Cmd::Diff { a, b } => self.diff(a, b, out).await,
+            Cmd::History { path } => self.history(path, out).await,
+            Cmd::Versions { path, from } => self.show_versions(path, from, out).await,
+            Cmd::Restore { snap, paths, to, from } => self.restore(snap, paths, to, from, out).await,
+            Cmd::Prune { dry_run, apply_exclusions, set } => self.run_prune(dry_run, apply_exclusions, set, out).await,
+            Cmd::Forget { snap } => self.prune(false, Some(snap), false, None, out).await,
+            Cmd::Verify { full, local, set } => self.run_verify(full, local, set, out).await,
             Cmd::Scrub => self.scrub(out).await,
             Cmd::Status => self.status(out).await,
             Cmd::Invite => self.invite(out).await,
             Cmd::Join { ticket } => self.join(&ticket, out).await,
-            Cmd::Friends => {
-                for f in self.cfg().friends {
-                    if let Some(p) = &f.path {
-                        out.say(format!(
-                            "{:<16} local drive at {}{}",
-                            f.name,
-                            p.display(),
-                            if f.backup_to { "" } else { " (not in use)" }
-                        ));
-                        continue;
-                    }
-                    if let Some(c) = &f.cloud {
-                        out.say(format!(
-                            "{:<16} cloud storage, bucket {} at {}{}{}",
-                            f.name,
-                            c.bucket,
-                            c.endpoint,
-                            if f.quota_gb > 0 { format!(", capped at {} GB", f.quota_gb) } else { String::new() },
-                            if f.backup_to { "" } else { " (not in use)" }
-                        ));
-                        continue;
-                    }
-                    out.say(format!(
-                        "{:<16} quota {} GB, using {}{}  {}",
-                        f.name,
-                        f.quota_gb,
-                        self.stored_here(&f.id).map_or("counting...".into(), human),
-                        if f.backup_to { "" } else { ", not backing up to them" },
-                        f.id
-                    ));
-                }
-                Ok(())
-            }
-            Cmd::FriendRemove { name, purge } => {
-                let mut stranded = vec![];
-                let f = self.update(|c| {
-                    let pos = c.friends.iter().position(|f| f.name == name)?;
-                    for b in c.sets.iter_mut().filter(|b| b.destinations.contains(&name)) {
-                        b.destinations.retain(|d| *d != name);
-                        // An empty list would mean "everywhere", which nobody asked for.
-                        if b.destinations.is_empty() {
-                            b.destinations.push(NOWHERE.into());
-                            stranded.push(b.name.clone());
-                        }
-                    }
-                    Some(c.friends.remove(pos))
-                })?;
-                let f = f.ok_or_else(|| anyhow!("no friend named {name}"))?;
-                if let Some(conn) = self.conns.lock().unwrap().remove(&f.id) {
-                    conn.close(1u32.into(), b"removed");
-                }
-                self.drives.lock().unwrap().retain(|p, _| f.path.as_ref().is_none_or(|d| !p.starts_with(d)));
-                self.clouds.lock().unwrap().remove(&f.id);
-                self.drop_known(&f.id).await;
-                for set in stranded {
-                    out.say(format!(
-                        "set {set} went only to {name} and now has no destination: it is not backed up until you run `sdb set {set} --to NAME` (or `--to all`)"
-                    ));
-                }
-                if !f.is_friend() {
-                    out.say(format!("removed {name} (what is stored there was left in place)"));
-                    return Ok(());
-                }
-                if purge {
-                    self.store.forget_owner(&f.id)?;
-                }
-                out.say(format!(
-                    "removed {name}{}",
-                    if purge {
-                        " and deleted the data they stored here"
-                    } else {
-                        " (their stored data was left in place; use --purge to delete it)"
-                    }
-                ));
-                Ok(())
-            }
-            Cmd::FriendLimit { name, kbps } => {
-                if self.cfg().friends.iter().any(|f| f.name == name && !f.is_friend()) {
-                    bail!("{name} is not a friend's computer: nothing arrives from it to limit");
-                }
-                self.update(|c| Self::friend_mut(c, &name).map(|f| f.max_in_kbps = kbps))??;
-                out.say(if kbps == 0 {
-                    format!("{name} may send backups here at any speed")
-                } else {
-                    format!("{name} may send backups here at up to {kbps} KB/s")
-                });
-                Ok(())
-            }
-            Cmd::FriendQuota { name, gb } => {
-                let kind = self.cfg().friends.iter().find(|f| f.name == name).map(|f| f.kind());
-                if kind == Some("drive") {
-                    bail!("a drive has no quota");
-                }
-                self.update(|c| Self::friend_mut(c, &name).map(|f| f.quota_gb = gb))??;
-                if kind == Some("cloud") {
-                    out.say(if gb == 0 {
-                        format!("{name} has no cap: everything your history rules keep is stored there")
-                    } else {
-                        format!("at most {gb} GB is kept on {name}; when that is reached your oldest restore points there are removed")
-                    });
-                    return Ok(());
-                }
-                out.say(format!("{name} may now store up to {gb} GB here; if they are over it, their next backup removes their oldest restore points"));
-                Ok(())
-            }
-            Cmd::FriendBackupTo { name, on } => {
-                self.update(|c| Self::friend_mut(c, &name).map(|f| f.backup_to = on))??;
-                out.say(format!("{} backing up to {name}", if on { "now" } else { "no longer" }));
-                Ok(())
-            }
-            Cmd::AddPaths { paths, set } => {
-                let first = self.cfg().sets.first().map(|b| b.name.clone());
-                let name = clean_name(set.as_deref().or(first.as_deref()).unwrap_or(DEFAULT_SET));
-                if self.cfg().set(&name).is_none() {
-                    refuse_reserved(&name)?;
-                }
-                self.update(|c| {
-                    for b in c.sets.iter_mut() {
-                        b.paths.retain(|p| !paths.contains(p));
-                    }
-                    if c.set(&name).is_none() {
-                        c.sets.push(BackupSet { name: name.clone(), ..Default::default() });
-                    }
-                    let b = c.sets.iter_mut().find(|b| b.name == name).unwrap();
-                    b.paths.extend(paths);
-                })?;
-                out.say(format!("ok (set {name})"));
-                Ok(())
-            }
-            Cmd::RemovePath { path } => {
-                self.update(|c| {
-                    for b in c.sets.iter_mut() {
-                        b.paths.retain(|p| *p != path);
-                        let roots = b.paths.clone();
-                        b.skip.retain(|s| roots.iter().any(|r| s.starts_with(r)));
-                    }
-                })?;
-                out.say("ok (existing restore points still contain it)");
-                Ok(())
-            }
-            Cmd::SetRename { name, to } => {
-                let to = clean_name(&to);
-                refuse_reserved(&to)?;
-                let c = self.cfg();
-                if c.set(&name).is_none() {
-                    bail!("no set named {name}");
-                }
-                if to == name {
-                    return Ok(());
-                }
-                if c.set(&to).is_some() || c.sets.iter().any(|b| b.name != name && b.former_names.contains(&to)) {
-                    bail!("the name {to} is already used by a set");
-                }
-                let _op = self.op.lock().await;
-                // Local records are filed under the set's name: move them along.
-                let _ = fs::rename(self.last_index_path(&name), self.last_index_path(&to));
-                let mut ok = self.last_ok();
-                let prefix = format!("{name}|");
-                for key in ok.keys().filter(|k| k.starts_with(&prefix)).cloned().collect::<Vec<_>>() {
-                    if let Some(v) = ok.remove(&key) {
-                        ok.insert(format!("{to}|{}", &key[prefix.len()..]), v);
-                    }
-                }
-                let _ = fs::write(self.state_path(), serde_json::to_vec(&ok).unwrap_or_default());
-                let stats_path = self.home.join("cache").join("set-stats.json");
-                let mut stats: HashMap<String, (u64, u64, i64)> =
-                    fs::read(&stats_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-                if let Some(v) = stats.remove(&name) {
-                    stats.insert(to.clone(), v);
-                    let _ = fs::write(stats_path, serde_json::to_vec(&stats).unwrap_or_default());
-                }
-                self.update(|c| {
-                    if let Some(b) = c.sets.iter_mut().find(|b| b.name == name) {
-                        b.former_names.retain(|n| *n != to);
-                        b.former_names.push(name.clone());
-                        b.name = to.clone();
-                    }
-                })?;
-                out.say(format!("set {name} is now {to}; its existing restore points stay with it"));
-                Ok(())
-            }
-            Cmd::Sets => {
-                let c = self.cfg();
-                for b in &c.sets {
-                    let to = if b.destinations.is_empty() {
-                        "every destination".to_string()
-                    } else {
-                        b.destinations.join(", ")
-                    };
-                    let pace = if b.every_minutes > 0 {
-                        format!("every {} min", b.every_minutes)
-                    } else {
-                        "each destination's own pace".into()
-                    };
-                    let hours =
-                        if b.hours.is_empty() { "general hours".to_string() } else { format!("hours {}", b.hours) };
-                    let keep = match &b.retention {
-                        Some(r) => format!(
-                            "own history rules (last {}, max age {} days, max versions {})",
-                            r.keep_last, r.keep_days, r.max_versions
-                        ),
-                        None => "general history rules".into(),
-                    };
-                    out.say(format!(
-                        "{}: {} folders -> {to}; {pace}; {hours}; {keep}; exclusion list {}",
-                        b.name,
-                        b.paths.len(),
-                        c.list_for(b).name
-                    ));
-                    for p in &b.paths {
-                        out.say(format!("    {}", p.display()));
-                    }
-                    for p in &b.skip {
-                        out.say(format!("    not {}", p.display()));
-                    }
-                }
-                Ok(())
-            }
-            Cmd::SetEdit { name, to, every, hours, days, versions, last, delete } => {
-                let name = clean_name(&name);
-                let c = self.cfg();
-                if let Some(h) = &hours {
-                    if !h.is_empty() && crate::config::parse_hours(h).is_none() {
-                        bail!("hours look like 22-7 (10pm to 7am); use 'always' to follow the general setting");
-                    }
-                }
-                // An empty list is stored as "everywhere", so it is only written when asked for by name.
-                let to = match to {
-                    Some(t) if t.is_empty() => {
-                        bail!("a set needs at least one destination (use `--to all` for every destination)")
-                    }
-                    Some(t) if t.iter().any(|d| d == EVERYWHERE) => {
-                        if t.len() > 1 {
-                            bail!("a set goes either to every destination or to the ones named, not both");
-                        }
-                        Some(vec![])
-                    }
-                    t => t,
-                };
-                if let Some(bad) = to.iter().flatten().find(|d| !c.friends.iter().any(|f| &f.name == *d)) {
-                    bail!("no destination named {bad}");
-                }
-                if delete {
-                    if c.sets.len() <= 1 {
-                        bail!("the last set cannot be deleted; remove its folders instead");
-                    }
-                    self.update(|c| c.sets.retain(|b| b.name != name))?;
-                    out.say(format!("set {name} deleted (its restore points stay until pruned or forgotten)"));
-                    return Ok(());
-                }
-                self.update(|c| {
-                    if c.set(&name).is_none() {
-                        c.sets.push(BackupSet { name: name.clone(), ..Default::default() });
-                    }
-                    let general = c.retention.clone();
-                    let b = c.sets.iter_mut().find(|b| b.name == name).unwrap();
-                    if let Some(t) = to {
-                        b.destinations = t;
-                    }
-                    if let Some(e) = every {
-                        b.every_minutes = e;
-                    }
-                    if let Some(h) = hours {
-                        b.hours = h;
-                    }
-                    if days.is_some() || versions.is_some() || last.is_some() {
-                        let r = b.retention.get_or_insert(general);
-                        r.keep_days = days.unwrap_or(r.keep_days);
-                        r.max_versions = versions.unwrap_or(r.max_versions);
-                        r.keep_last = last.unwrap_or(r.keep_last);
-                    }
-                })?;
-                out.say(format!("set {name} saved"));
-                Ok(())
-            }
-            Cmd::Skip { path, set, remove } => {
-                let name = self.update(|c| {
-                    let b = c.sets.iter_mut().find(|b| {
-                        set.as_ref().is_none_or(|n| *n == b.name) && b.paths.iter().any(|r| path.starts_with(r))
-                    })?;
-                    b.skip.retain(|p| *p != path);
-                    if !remove {
-                        b.skip.push(path.clone());
-                    }
-                    Some(b.name.clone())
-                })?;
-                let name =
-                    name.ok_or_else(|| anyhow!("{} is not inside a folder that is backed up", path.display()))?;
-                out.say(if remove {
-                    format!("{} is backed up again (set {name})", path.display())
-                } else {
-                    format!("{} is left out of set {name}; restore points made so far still contain it", path.display())
-                });
-                Ok(())
-            }
-            Cmd::SetExclude { name, list } => {
-                let c = self.cfg();
-                if c.set(&name).is_none() {
-                    bail!("no set named {name}");
-                }
-                let found = c.lists().into_iter().find(|l| l.name.eq_ignore_ascii_case(list.trim()));
-                let list =
-                    found.ok_or_else(|| anyhow!("no exclusion list named {list}; see `sdb exclude lists`"))?.name;
-                self.update(|c| {
-                    if let Some(b) = c.sets.iter_mut().find(|b| b.name == name) {
-                        b.exclude_list = if list == STANDARD { String::new() } else { list.clone() };
-                    }
-                })?;
-                out.say(format!("set {name} now uses the exclusion list \"{list}\""));
-                Ok(())
-            }
-            Cmd::ExcludeLists => {
-                let c = self.cfg();
-                for l in c.lists() {
-                    let users: Vec<&str> =
-                        c.sets.iter().filter(|b| c.list_for(b).name == l.name).map(|b| b.name.as_str()).collect();
-                    out.say(format!(
-                        "{}{}: {}",
-                        l.name,
-                        if is_builtin_list(&l.name) { " (built in)" } else { "" },
-                        if users.is_empty() {
-                            "not used by any set".into()
-                        } else {
-                            format!("used by {}", users.join(", "))
-                        }
-                    ));
-                    for p in &l.patterns {
-                        out.say(format!("    {p}"));
-                    }
-                }
-                for b in c.sets.iter().filter(|b| !b.skip.is_empty()) {
-                    out.say(format!("left out of set {} by hand:", b.name));
-                    for p in &b.skip {
-                        out.say(format!("    {}", p.display()));
-                    }
-                }
-                Ok(())
-            }
-            Cmd::ExcludeNew { name, from } => {
-                let name: String =
-                    name.chars().filter(|c| c.is_alphanumeric() || "-_. ".contains(*c)).take(32).collect();
-                let name = name.trim().to_string();
-                let c = self.cfg();
-                if name.is_empty() {
-                    bail!("use letters and digits for the list's name");
-                }
-                if c.lists().iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
-                    bail!("there is already a list called {name}");
-                }
-                let patterns = match &from {
-                    Some(f) => {
-                        let found = c.lists().into_iter().find(|l| l.name.eq_ignore_ascii_case(f.trim()));
-                        found.ok_or_else(|| anyhow!("no exclusion list named {f}"))?.patterns
-                    }
-                    None => vec![],
-                };
-                let n = patterns.len();
-                self.update(|c| c.exclude_lists.push(ExcludeList { name: name.clone(), patterns }))?;
-                out.say(format!(
-                    "list {name} created with {n} patterns; a set uses it after `sdb set NAME --exclude \"{name}\"`"
-                ));
-                Ok(())
-            }
-            Cmd::ExcludeDelete { name } => {
-                if is_builtin_list(&name) {
-                    bail!("{name} is built in and stays");
-                }
-                let name = self.own_list(&name)?;
-                let users = self.update(|c| {
-                    let before = c.exclude_lists.len();
-                    c.exclude_lists.retain(|l| l.name != name);
-                    if c.exclude_lists.len() == before {
-                        return None;
-                    }
-                    let mut users = vec![];
-                    for b in c.sets.iter_mut().filter(|b| b.exclude_list == name) {
-                        b.exclude_list = String::new();
-                        users.push(b.name.clone());
-                    }
-                    Some(users)
-                })?;
-                let users = users.ok_or_else(|| anyhow!("no exclusion list named {name}"))?;
-                out.say(if users.is_empty() {
-                    format!("list {name} deleted")
-                } else {
-                    format!(
-                        "list {name} deleted; {} now use{} Standard",
-                        users.join(", "),
-                        if users.len() == 1 { "s" } else { "" }
-                    )
-                });
-                Ok(())
-            }
+            Cmd::Friends => self.show_destinations(out).await,
+            Cmd::FriendRemove { name, purge } => self.remove_destination(name, purge, out).await,
+            Cmd::FriendLimit { name, kbps } => self.limit_friend(name, kbps, out).await,
+            Cmd::FriendQuota { name, gb } => self.set_quota(name, gb, out).await,
+            Cmd::FriendBackupTo { name, on } => self.use_destination(name, on, out).await,
+            Cmd::AddPaths { paths, set } => self.add_paths(paths, set, out).await,
+            Cmd::RemovePath { path } => self.remove_path(path, out).await,
+            Cmd::SetRename { name, to } => self.rename_set(name, to, out).await,
+            Cmd::Sets => self.show_sets(out).await,
+            Cmd::SetEdit(e) => self.edit_set(e, out).await,
+            Cmd::Skip { path, set, remove } => self.skip_path(path, set, remove, out).await,
+            Cmd::SetExclude { name, list } => self.choose_exclude_list(name, list, out).await,
+            Cmd::ExcludeLists => self.show_exclude_lists(out).await,
+            Cmd::ExcludeNew { name, from } => self.new_exclude_list(name, from, out).await,
+            Cmd::ExcludeDelete { name } => self.delete_exclude_list(name, out).await,
             Cmd::ExcludePattern { list, pattern, remove } => {
-                if is_builtin_list(&list) {
-                    bail!("{list} is built in: copy it to change it, with `sdb exclude new NAME --from {list}`");
-                }
-                let list = self.own_list(&list)?;
-                // A bare name such as node_modules means that name anywhere, when adding and
-                // when removing alike; removing also takes the pattern exactly as listed.
-                let typed = pattern.trim().to_string();
-                let pattern = if typed.starts_with('/') || typed.starts_with("**/") {
-                    typed.clone()
-                } else {
-                    format!("**/{typed}")
-                };
-                if typed.is_empty() || pattern == "**/" {
-                    bail!("the pattern is empty");
-                }
-                if !remove {
-                    globset::Glob::new(&pattern).map_err(|e| anyhow!("bad pattern: {e}"))?;
-                }
-                let found = self.update(|c| {
-                    let l = c.exclude_lists.iter_mut().find(|l| l.name == list)?;
-                    let had = l.patterns.len();
-                    l.patterns.retain(|p| *p != pattern && !(remove && *p == typed));
-                    if !remove {
-                        l.patterns.push(pattern.clone());
-                    }
-                    Some(l.patterns.len() != had)
-                })?;
-                match found {
-                    None => bail!("no exclusion list named {list}"),
-                    Some(false) if remove => bail!("{list} has no pattern {pattern}"),
-                    Some(_) if remove => out.say(format!("{pattern} removed from {list}")),
-                    Some(_) => out.say(format!(
-                        "{pattern} added to {list}; restore points made so far still contain what it matches"
-                    )),
-                }
-                Ok(())
+                self.edit_exclude_pattern(list, pattern, remove, out).await
             }
             Cmd::Tune { upload_kbps, hours, pause_hours, warn_days } => {
-                if let Some(h) = &hours {
-                    if !h.is_empty() && crate::config::parse_hours(h).is_none() {
-                        bail!("hours look like 22-7 (10pm to 7am); use 'always' to remove the limit");
-                    }
-                }
-                self.update(|c| {
-                    if let Some(k) = upload_kbps {
-                        c.upload_kbps = k;
-                    }
-                    if let Some(h) = hours {
-                        c.backup_hours = h;
-                    }
-                    if let Some(p) = pause_hours {
-                        c.paused_until = if p <= 0 { 0 } else { now() + p.min(24 * 3650) * 3600 };
-                    }
-                    if let Some(d) = warn_days {
-                        c.warn_after_days = d;
-                    }
-                })?;
-                out.say("saved");
-                Ok(())
+                self.tune(upload_kbps, hours, pause_hours, warn_days, out).await
             }
-            Cmd::Every { name: Some(name), minutes } => {
-                self.update(|c| Self::friend_mut(c, &name).map(|f| f.every_minutes = minutes))??;
-                out.say(if minutes == 0 {
-                    format!("{name} is back on the default (every 60 minutes for a friend)")
-                } else {
-                    format!("automatic backups go to {name} at most every {minutes} minutes")
-                });
-                Ok(())
-            }
-            Cmd::Every { name: None, minutes } => {
-                self.update(|c| c.min_interval_secs = minutes.max(1) as u64 * 60)?;
-                out.say(format!("local drives get automatic backups at most every {} minutes unless set otherwise; friends default to 60", minutes.max(1)));
-                Ok(())
-            }
-            Cmd::DriveAdd { name, path } => {
-                let dir = path.join("sdb-store");
-                fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-                if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
-                    bail!("{} is a link or a file; choose a real folder", dir.display());
-                }
-                let name = clean_name(&name);
-                refuse_reserved(&name)?;
-                if let Some(f) = self.cfg().friends.iter().find(|f| f.name == name && f.path.is_none()) {
-                    let what = if f.cloud.is_some() { "cloud storage" } else { "a friend" };
-                    bail!("{what} is already called {name}; give the drive another name");
-                }
-                // Adding a drive (again) is the moment its disk is trusted and marked.
-                self.drives.lock().unwrap().remove(&dir);
-                self.drop_known(&format!("drive-{name}")).await;
-                self.update(|c| {
-                    c.friends.retain(|f| f.name != name);
-                    c.friends.push(Friend {
-                        name: name.clone(),
-                        id: format!("drive-{name}"),
-                        quota_gb: 1_000_000,
-                        backup_to: true,
-                        relay: None,
-                        addrs: vec![],
-                        every_minutes: 15,
-                        max_in_kbps: 0,
-                        path: Some(path.clone()),
-                        drive_key: None,
-                        cloud: None,
-                        retention: None,
-                    });
-                })?;
-                out.say(format!("{name} added: backups also go to {} (encrypted like everything else). When the drive is unplugged it is skipped and catches up later.", dir.display()));
-                Ok(())
-            }
-            Cmd::CloudAdd {
-                name,
-                endpoint,
-                bucket,
-                region,
-                prefix,
-                access_key,
-                secret_key,
-                path_style,
-                create,
-                ca_pem,
-            } => {
-                let name = clean_name(&name);
-                refuse_reserved(&name)?;
-                if self.cfg().friends.iter().any(|f| f.name == name && f.cloud.is_none()) {
-                    bail!("a friend or drive is already called {name}; give the cloud storage another name");
-                }
-                let (bucket, access_key) = (bucket.trim().to_string(), access_key.trim().to_string());
-                if bucket.is_empty() || access_key.is_empty() || secret_key.trim().is_empty() {
-                    bail!("cloud storage needs a bucket, an access key and a secret key");
-                }
-                let mut cloud = Cloud {
-                    endpoint: endpoint.trim().trim_end_matches('/').to_string(),
-                    bucket,
-                    region: region
-                        .map(|r| r.trim().to_string())
-                        .filter(|r| !r.is_empty())
-                        .unwrap_or("us-east-1".into()),
-                    prefix: prefix.unwrap_or_default().trim_matches('/').to_string(),
-                    access_key,
-                    secret_key: secret_key.trim().to_string(),
-                    // New keys for storage already added keep the certificate it was given.
-                    ca_pem: ca_pem.filter(|p| !p.trim().is_empty()).or_else(|| {
-                        let known = self.cfg().friends.into_iter().find(|f| f.name == name);
-                        known.and_then(|f| f.cloud).and_then(|c| c.ca_pem)
-                    }),
-                    path_style: path_style.unwrap_or(false),
-                };
-                // Nothing is saved until the storage has taken, listed and deleted an object for us.
-                let try_it = async |c: &Cloud| {
-                    let b = crate::cloud::Bucket::open(c, &self.id())?;
-                    if create {
-                        b.create().await?;
-                    }
-                    b.check().await?;
-                    Ok::<_, anyhow::Error>(b)
-                };
-                let b = match try_it(&cloud).await {
-                    Ok(b) => b,
-                    Err(first) if path_style.is_none() => {
-                        cloud.path_style = true;
-                        // Whichever way of addressing the bucket fits this storage is the one whose
-                        // complaint is worth showing: a bare address can only be reached the second way.
-                        let bare = crate::cloud::check_endpoint(&cloud.endpoint)
-                            .is_ok_and(|u| !matches!(u.host(), Some(url::Host::Domain(d)) if d != "localhost"));
-                        match try_it(&cloud).await {
-                            Ok(b) => b,
-                            Err(second) if bare => return Err(second),
-                            Err(_) => return Err(first),
-                        }
-                    }
-                    Err(e) => return Err(e),
-                };
-                let id = format!("cloud-{name}");
-                self.clouds.lock().unwrap().remove(&id);
-                self.drop_known(&id).await;
-                let place = b.place.clone();
-                self.update(|c| match c.friends.iter_mut().find(|f| f.name == name) {
-                    Some(f) => f.cloud = Some(cloud),
-                    None => c.friends.push(Friend {
-                        name: name.clone(),
-                        id,
-                        quota_gb: 0,
-                        backup_to: true,
-                        relay: None,
-                        addrs: vec![],
-                        every_minutes: 0,
-                        max_in_kbps: 0,
-                        path: None,
-                        drive_key: None,
-                        cloud: Some(cloud),
-                        retention: None,
-                    }),
-                })?;
-                out.say(format!(
-                    "{name} added: backups also go to {place}, encrypted like everything else. \
-                     Do not add expiry (lifecycle) rules to the bucket: sdb removes what is no longer needed itself."
-                ));
-                Ok(())
-            }
-            Cmd::DestClean { name, dry_run } => {
-                let _op = self.op.lock().await;
-                self.clean_dest(&name, dry_run, out).await
-            }
-            Cmd::DestKeep { name, set, clear } => {
-                let general = self.cfg().retention;
-                let r = self.update(|c| {
-                    Self::friend_mut(c, &name).map(|f| {
-                        if clear {
-                            f.retention = None;
-                        } else {
-                            let r = f.retention.get_or_insert(Retention { max_versions: 0, ..general });
-                            for (k, v) in set {
-                                match k.as_str() {
-                                    "last" => r.keep_last = v,
-                                    "hourly" => r.keep_hourly = v,
-                                    "daily" => r.keep_daily = v,
-                                    "weekly" => r.keep_weekly = v,
-                                    "monthly" => r.keep_monthly = v,
-                                    _ => r.keep_days = v,
-                                }
-                            }
-                        }
-                        f.retention.clone()
-                    })
-                })??;
-                out.say(match r {
-                    Some(r) => format!(
-                        "{name} keeps: last {}, hourly {}, daily {}, weekly {}, monthly {}, max age {}; applied at the next `sdb prune` (the daemon prunes daily)",
-                        r.keep_last,
-                        r.keep_hourly,
-                        r.keep_daily,
-                        r.keep_weekly,
-                        r.keep_monthly,
-                        if r.keep_days == 0 { "unlimited".into() } else { format!("{} days", r.keep_days) }
-                    ),
-                    None => format!("{name} keeps whatever each set's history rules keep"),
-                });
-                Ok(())
-            }
-            Cmd::Overview => {
-                out.say(self.overview().to_string());
-                Ok(())
-            }
-            Cmd::Log => {
-                for l in self.log.lock().unwrap().iter() {
-                    out.say(l.clone());
-                }
-                Ok(())
-            }
-            Cmd::Hello => {
-                out.say(crate::control::started_fingerprint());
-                Ok(())
-            }
-            Cmd::Stop => {
-                out.say("stopping");
-                self.quit.notify_waiters();
-                Ok(())
-            }
-            Cmd::Config => {
-                // Screens show the config; the cloud secrets have no business on them.
-                let mut c = self.cfg();
-                for f in c.friends.iter_mut() {
-                    if let Some(cl) = f.cloud.as_mut() {
-                        cl.secret_key = String::new();
-                    }
-                }
-                out.say(serde_json::to_string(&c)?);
-                Ok(())
-            }
-            Cmd::SnapList { from } => {
-                for s in self.snapshots_from(&from, out).await? {
-                    let at: Vec<&str> = s.peers.iter().map(|(f, _)| f.name.as_str()).collect();
-                    out.say(serde_json::json!({"id": s.id, "time": s.m.time, "files": s.m.files, "bytes": s.m.bytes, "tag": s.m.tag, "at": at, "set": s.m.set}).to_string());
-                }
-                Ok(())
-            }
-            Cmd::Tree { snap, from } => {
-                let snaps = self.snapshots_from(&from, out).await?;
-                let s = self.resolve(&snaps, &snap)?;
-                for e in self.load_index(s).await? {
-                    let v = match &e.kind {
-                        Kind::File { size, chunks } => sig(chunks, *size).to_string(),
-                        Kind::Symlink(t) => String::from_utf8_lossy(t).into_owned(),
-                        Kind::Dir => String::new(),
-                    };
-                    out.say(
-                        serde_json::json!({"p": e.show(), "d": e.kind == Kind::Dir, "s": e.size(), "v": v}).to_string(),
-                    );
-                }
-                Ok(())
-            }
-            Cmd::Keep { set, versions, pattern } => {
-                if let Some(p) = &pattern {
-                    globset::Glob::new(p).map_err(|e| anyhow!("bad pattern: {e}"))?;
-                    if versions.is_none() {
-                        bail!("a pattern needs --versions");
-                    }
-                }
-                self.update(|c| {
-                    for (k, v) in set {
-                        match k.as_str() {
-                            "last" => c.retention.keep_last = v,
-                            "hourly" => c.retention.keep_hourly = v,
-                            "daily" => c.retention.keep_daily = v,
-                            "weekly" => c.retention.keep_weekly = v,
-                            "monthly" => c.retention.keep_monthly = v,
-                            _ => c.retention.keep_days = v,
-                        }
-                    }
-                    match (pattern, versions) {
-                        (Some(p), Some(n)) => {
-                            c.version_rules.retain(|r| r.pattern != p);
-                            if n > 0 {
-                                c.version_rules.push(VersionRule { pattern: p, max_versions: n });
-                            }
-                        }
-                        (None, Some(n)) => c.retention.max_versions = n,
-                        _ => {}
-                    }
-                })?;
-                out.say("saved; applied at the next `sdb prune` (the daemon prunes daily)");
-                Ok(())
-            }
+            Cmd::Every { name, minutes } => self.set_pace(name, minutes, out).await,
+            Cmd::DriveAdd { name, path } => self.add_drive(name, path, out).await,
+            Cmd::CloudAdd(c) => self.add_cloud(c, out).await,
+            Cmd::DestClean { name, dry_run } => self.clean_dest(&name, dry_run, out).await,
+            Cmd::DestKeep { name, set, clear } => self.keep_at_destination(name, set, clear, out).await,
+            Cmd::Overview => self.show_overview(out).await,
+            Cmd::Log => self.show_log(out).await,
+            Cmd::Hello => self.hello(out).await,
+            Cmd::Stop => self.stop(out).await,
+            Cmd::Config => self.show_config(out).await,
+            Cmd::SnapList { from } => self.show_snap_list(from, out).await,
+            Cmd::Tree { snap, from } => self.show_tree(snap, from, out).await,
+            Cmd::Keep { set, versions, pattern } => self.keep(set, versions, pattern, out).await,
         }
     }
 }
@@ -2703,6 +1927,46 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regular_jobs_come_due_by_the_clock_on_the_wall() {
+        let day = 86400;
+        assert!(Node::job_due(None, 1_000_000, day), "never run: due");
+        assert!(!Node::job_due(Some(1_000_000), 1_000_000 + day - 1, day));
+        assert!(Node::job_due(Some(1_000_000), 1_000_000 + day, day));
+        // The clock was set back since the job last ran: wait, do not delete by a wrong date.
+        assert!(!Node::job_due(Some(2_000_000), 1_000_000, day));
+    }
+
+    #[test]
+    fn chunk_use_is_kept_per_restore_point() {
+        let file = |name: &str, chunks: Vec<Id>| Entry {
+            path: name.as_bytes().to_vec(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            ino: 0,
+            kind: Kind::File { size: 1, chunks },
+        };
+        let dir = Entry { kind: Kind::Dir, ..file("d", vec![]) };
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let mut uses = Uses::default();
+        uses.set("one", &[dir.clone(), file("x", vec![a, b]), file("y", vec![b])]);
+        uses.set("two", &[file("x", vec![b, c])]);
+        assert!(uses.knows("one") && !uses.knows("three"));
+        assert_eq!(uses.ids.len(), 3, "a chunk shared by restore points is held once");
+        let mut live = HashSet::new();
+        uses.add_to("two", &mut live);
+        assert_eq!(live, HashSet::from([b, c]));
+        uses.add_to("three", &mut live);
+        assert_eq!(live.len(), 2);
+        // A thinned file list replaces the one recorded before.
+        uses.set("one", &[file("y", vec![b])]);
+        let mut live = HashSet::new();
+        uses.add_to("one", &mut live);
+        assert_eq!(live, HashSet::from([b]));
+    }
 
     #[test]
     fn text_from_others_cannot_forge_lines_or_escapes() {

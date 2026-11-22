@@ -7,7 +7,7 @@
 use crate::{
     config::{BackupSet, Config, Friend, is_builtin_list},
     control,
-    node::Cmd,
+    node::{CloudAdd, Cmd, SetEdit},
     snapshot::{human, when},
     tui::{Item, Listing, ago, list_dir, name, parse_listing, tilde, until},
 };
@@ -397,16 +397,7 @@ impl Gui {
     }
 
     fn set_edit(name: &str) -> Cmd {
-        Cmd::SetEdit {
-            name: name.to_string(),
-            to: None,
-            every: None,
-            hours: None,
-            days: None,
-            versions: None,
-            last: None,
-            delete: false,
-        }
+        Cmd::SetEdit(SetEdit { name: name.to_string(), ..Default::default() })
     }
 
     fn backup_page(&mut self, ui: &mut egui::Ui) {
@@ -723,6 +714,23 @@ impl Gui {
             }
         });
         ui.horizontal(|ui| {
+            // What is left out now stays in older restore points until it is taken out of them.
+            ui.weak("Older restore points:");
+            let prune = |dry_run| Cmd::Prune { dry_run, apply_exclusions: true, set: Some(set.name.clone()) };
+            if ui.button("What do they still hold?").clicked() {
+                self.spawn(&ctx, Job::Show("Left out now"), prune(true), Some("Looking through older restore points"));
+            }
+            let sure = self.fields.entry("apply-excl".into()).or_default();
+            ui.add(egui::TextEdit::singleline(sure).desired_width(40.0).hint_text("yes"));
+            if ui
+                .add_enabled(sure.trim().eq_ignore_ascii_case("yes"), egui::Button::new("Take it out of them"))
+                .clicked()
+            {
+                self.fields.remove("apply-excl");
+                self.spawn(&ctx, Job::Show("Prune"), prune(false), Some("Pruning"));
+            }
+        });
+        ui.horizontal(|ui| {
             ui.label("Search:");
             let text = self.fields.entry("filesearch".into()).or_default();
             let changed =
@@ -788,8 +796,8 @@ impl Gui {
                         self.status = "A set needs at least one destination.".into();
                     } else {
                         let mut cmd = Self::set_edit(&set.name);
-                        if let Cmd::SetEdit { to, .. } = &mut cmd {
-                            *to = Some(list);
+                        if let Cmd::SetEdit(e) = &mut cmd {
+                            e.to = Some(list);
                         }
                         self.save(&ctx, cmd);
                     }
@@ -845,16 +853,14 @@ impl Gui {
                 let d = days.parse::<u32>().ok().filter(|d| own_rules || *d != own.keep_days);
                 self.save(
                     &ctx,
-                    Cmd::SetEdit {
+                    Cmd::SetEdit(SetEdit {
                         name: set.name.clone(),
-                        to: None,
                         every: every.parse().ok(),
                         hours: Some(hours.clone()),
                         days: d,
                         versions: v,
-                        last: None,
-                        delete: false,
-                    },
+                        ..Default::default()
+                    }),
                 );
             }
         });
@@ -891,8 +897,8 @@ impl Gui {
                 let ok = sure.trim().eq_ignore_ascii_case("yes");
                 if ui.add_enabled(ok, egui::Button::new("Delete")).clicked() {
                     let mut cmd = Self::set_edit(&set.name);
-                    if let Cmd::SetEdit { delete, .. } = &mut cmd {
-                        *delete = true;
+                    if let Cmd::SetEdit(e) = &mut cmd {
+                        e.delete = true;
                     }
                     self.save(&ctx, cmd);
                     self.fields.remove("delete-sure");
@@ -1355,7 +1361,7 @@ impl Gui {
                     let ca_pem = if ca.is_empty() { Ok(None) } else { std::fs::read_to_string(ca.replacen('~', &home, 1)).map(Some) };
                     match ca_pem {
                         Ok(ca_pem) => {
-                            let cmd = Cmd::CloudAdd {
+                            let cmd = Cmd::CloudAdd(CloudAdd {
                                 name,
                                 endpoint,
                                 bucket,
@@ -1366,7 +1372,7 @@ impl Gui {
                                 path_style: None,
                                 create: false,
                                 ca_pem,
-                            };
+                            });
                             self.spawn(&ctx, Job::Show(CLOUD_JOB), cmd, Some("Checking the cloud storage"));
                         }
                         Err(e) => self.status = format!("Cannot read the CA certificate file {ca}: {e}"),

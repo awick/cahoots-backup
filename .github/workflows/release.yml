@@ -50,12 +50,12 @@ jobs:
       - name: Rust
         run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --target ${{ matrix.target }}
       - name: Package
         run: |
           dir=sdb-${{ needs.version.outputs.version }}-${{ matrix.name }}
           mkdir "$dir"
-          cp target/${{ matrix.target }}/release/sdb LICENSE README.md "$dir/"
+          cp target/${{ matrix.target }}/dist/sdb LICENSE README.md "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v4
         with:

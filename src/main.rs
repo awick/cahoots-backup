@@ -25,7 +25,7 @@ mod watch;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::{Config, Identity};
-use node::{Cmd, Node, Out};
+use node::{CloudAdd, Cmd, Node, Out, SetEdit};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
@@ -214,6 +214,13 @@ enum C {
     Prune {
         #[arg(long)]
         dry_run: bool,
+        /// Also take out of older restore points what the exclusion lists and skipped
+        /// folders now leave out (named restore points are left as they are)
+        #[arg(long)]
+        apply_exclusions: bool,
+        /// With --apply-exclusions: only this backup set
+        #[arg(long)]
+        set: Option<String>,
     },
     /// Delete one restore point
     Forget { snap: String },
@@ -645,7 +652,7 @@ async fn real_main() -> Result<()> {
             }
             Cmd::SetExclude { name, list }
         }
-        C::Set { name, to, every, hours, days, versions, last, delete, .. } => Cmd::SetEdit {
+        C::Set { name, to, every, hours, days, versions, last, delete, .. } => Cmd::SetEdit(SetEdit {
             name,
             to: to
                 .map(|t| -> Result<Vec<String>> {
@@ -667,7 +674,7 @@ async fn real_main() -> Result<()> {
             versions,
             last,
             delete,
-        },
+        }),
         C::Snapshots => Cmd::Snapshots,
         C::Ls { snap, path } => Cmd::Ls { snap, path: path.as_ref().map(abs).transpose()? },
         C::Diff { a, b } => Cmd::Diff { a, b },
@@ -720,9 +727,20 @@ async fn real_main() -> Result<()> {
                 Err(_) => rpassword::prompt_password("Secret key: ")?,
             };
             let path_style = path_style.then_some(true);
-            Cmd::CloudAdd { name, endpoint, bucket, region, prefix, access_key, secret_key, path_style, create, ca_pem }
+            Cmd::CloudAdd(CloudAdd {
+                name,
+                endpoint,
+                bucket,
+                region,
+                prefix,
+                access_key,
+                secret_key,
+                path_style,
+                create,
+                ca_pem,
+            })
         }
-        C::Prune { dry_run } => Cmd::Prune { dry_run },
+        C::Prune { dry_run, apply_exclusions, set } => Cmd::Prune { dry_run, apply_exclusions, set },
         C::Forget { snap } => Cmd::Forget { snap },
         C::Verify { full, local, set } => Cmd::Verify { full, local, set },
         C::Scrub => Cmd::Scrub,

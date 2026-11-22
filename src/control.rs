@@ -163,10 +163,7 @@ pub async fn serve(node: Arc<Node>, listener: UnixListener) {
             let cmd = serde_json::from_str::<Cmd>(&line);
             // Backups and pruning belong to the daemon: they carry on when the client that
             // asked for them goes away. Anything else stops with its client.
-            let detached = matches!(
-                cmd,
-                Ok(Cmd::Backup { .. } | Cmd::Prune { .. } | Cmd::Forget { .. } | Cmd::DestClean { dry_run: false, .. })
-            );
+            let detached = cmd.as_ref().is_ok_and(Cmd::detached);
             let job = tokio::spawn(async move {
                 match cmd {
                     Ok(cmd) => node.run(cmd, &Out(tx)).await,

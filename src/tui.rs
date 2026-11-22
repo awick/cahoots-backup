@@ -8,7 +8,7 @@
 use crate::{
     config::{BackupSet, Config, DEFAULT_SET, STANDARD, is_builtin_list},
     control,
-    node::Cmd,
+    node::{CloudAdd, Cmd, SetEdit},
     snapshot::{human, parse_when, when},
 };
 use anyhow::Result;
@@ -271,6 +271,7 @@ enum Prompt {
     ExAdd(String),
     ExDelete(String),
     CleanDest(String),
+    ApplyExclusions(String),
     /// A history rule ("days" or "last") for one destination.
     DestKeep(String, &'static str),
     Remove(String),
@@ -301,6 +302,8 @@ enum Act {
     AddDrive,
     AddCloud,
     SetExclude,
+    ExcludedLook,
+    ExcludedApply,
     ExNew,
     ExCopy,
     ExAdd,
@@ -609,16 +612,7 @@ impl App {
     }
 
     fn set_edit(&self, to: Option<Vec<String>>) -> Cmd {
-        Cmd::SetEdit {
-            name: self.set.clone(),
-            to,
-            every: None,
-            hours: None,
-            days: None,
-            versions: None,
-            last: None,
-            delete: false,
-        }
+        Cmd::SetEdit(SetEdit { name: self.set.clone(), to, ..Default::default() })
     }
 
     /// Switches whether the current set goes to a destination.
@@ -686,15 +680,8 @@ impl App {
         let num = text.parse::<u32>().ok();
         let always = ["always", "any time", "general"].iter().any(|w| text.eq_ignore_ascii_case(w));
         let hours = if always { String::new() } else { text.to_string() };
-        let edit = |every, hours, days, versions| Cmd::SetEdit {
-            name: self.set.clone(),
-            to: None,
-            every,
-            hours,
-            days,
-            versions,
-            last: None,
-            delete: false,
+        let edit = |every, hours, days, versions| {
+            Cmd::SetEdit(SetEdit { name: self.set.clone(), every, hours, days, versions, ..Default::default() })
         };
         let tune =
             |upload_kbps, hours, pause_hours, warn_days| Cmd::Tune { upload_kbps, hours, pause_hours, warn_days };
@@ -969,6 +956,8 @@ impl App {
                     ),
                     Act::SetExclude,
                 ),
+                act("What older restore points hold of what is now left out".into(), Act::ExcludedLook),
+                act("Take that out of older restore points".into(), Act::ExcludedApply),
                 act(format!("Hidden files: {}", if self.hidden { "shown" } else { "not shown" }), Act::Hidden),
                 act("Rename this set".into(), Act::RenameSet),
                 act("Delete this set".into(), Act::DeleteSet),
@@ -1272,6 +1261,13 @@ impl App {
                 let list = lists[(at + 1) % lists.len()].name.clone();
                 self.apply(Cmd::SetExclude { name: self.set.clone(), list }).await;
             }
+            Act::ExcludedLook => {
+                let cmd = Cmd::Prune { dry_run: true, apply_exclusions: true, set: Some(self.set.clone()) };
+                self.start("looking through older restore points", |ex, _| async move {
+                    Done::Popup(lines_or_error(ex.call(cmd).await))
+                });
+            }
+            Act::ExcludedApply => self.input = Some((Prompt::ApplyExclusions(self.set.clone()), String::new())),
             Act::ExNew => self.input = Some((Prompt::ExNew(STANDARD.into()), String::new())),
             Act::ExCopy | Act::ExAdd | Act::ExDelete | Act::ExRemove(_) => {
                 let Some((Kind::ExList(list), _)) = self.stack.last().cloned() else { return };
@@ -1620,17 +1616,7 @@ impl App {
             }
             Prompt::DeleteSet(name) => {
                 if text.eq_ignore_ascii_case("yes") {
-                    self.apply(Cmd::SetEdit {
-                        name,
-                        to: None,
-                        every: None,
-                        hours: None,
-                        days: None,
-                        versions: None,
-                        last: None,
-                        delete: true,
-                    })
-                    .await;
+                    self.apply(Cmd::SetEdit(SetEdit { name, delete: true, ..Default::default() })).await;
                     self.sets.select(Some(0));
                 }
             }
@@ -1676,7 +1662,7 @@ impl App {
                         }
                     }
                 };
-                let cmd = Cmd::CloudAdd {
+                let cmd = Cmd::CloudAdd(CloudAdd {
                     name,
                     endpoint,
                     bucket,
@@ -1687,7 +1673,7 @@ impl App {
                     path_style: None,
                     create: false,
                     ca_pem,
-                };
+                });
                 self.start("checking the cloud storage", |ex, _| async move {
                     Done::Popup(lines_or_error(ex.call(cmd).await))
                 });
@@ -1715,6 +1701,12 @@ impl App {
                 Ok(gb) => self.apply(Cmd::FriendQuota { name, gb }).await,
                 Err(_) => self.status = "type a number of GB".into(),
             },
+            Prompt::ApplyExclusions(set) => {
+                if text.eq_ignore_ascii_case("yes") {
+                    let cmd = Cmd::Prune { dry_run: false, apply_exclusions: true, set: Some(set) };
+                    self.start("pruning", |ex, pr| async move { Done::Popup(lines_or_error(ex.live(cmd, &pr).await)) });
+                }
+            }
             Prompt::CleanDest(name) => {
                 if text.eq_ignore_ascii_case("yes") {
                     let cmd = Cmd::DestClean { name, dry_run: false };
@@ -2354,6 +2346,9 @@ impl App {
                 }
                 Prompt::Quota(n) => format!(" GB that {n} may store on this computer "),
                 Prompt::InLimit(n) => format!(" Fastest {n} may send backups here, in KB/s (0 = unlimited) "),
+                Prompt::ApplyExclusions(n) => {
+                    format!(" Type yes to take what set {n} now leaves out from its older restore points ")
+                }
                 Prompt::CleanDest(n) => {
                     format!(" Type yes to delete from {n} the restore points of sets no longer sent there ")
                 }

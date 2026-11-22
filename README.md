@@ -77,6 +77,7 @@ restore point shortly after files stop changing.
 | `sdb keep --days 365 --versions 10` | maximum age and versions per file |
 | `sdb keep --versions 5 --pattern '**/*.iso'` | version limit for matching files only |
 | `sdb prune [--dry-run]` | apply the keep rules now (the daemon does it daily) |
+| `sdb prune --apply-exclusions [--set NAME] [--dry-run]` | also take out of older restore points what the exclusion lists and skipped folders now leave out |
 | `sdb add PATH --set NAME` | put a folder in a backup set (created if new) |
 | `sdb set NAME --to usb,barney --every 15 --hours 22-7 --versions 5 --days 90` | where a set goes, how often, when, and its own history rules |
 | `sdb sets` / `sdb backup --set NAME` | list sets / back up one set now |
@@ -238,7 +239,8 @@ default) names things nobody wants back: trash, caches, `node_modules`,
 release; to change one, copy it into a list of your own. `.git` is in neither.
 A folder you untick in the file picker is left out of that set only. Leaving
 something out does not remove it from restore points made so far; it ages out
-under the history rules.
+under the history rules, or `sdb prune --apply-exclusions` takes it out of them
+now (restore points you named stay as they are).
 
 **Quotas.** You set how many GB each friend may store on your computer; the
 store refuses anything beyond it. Because only the owner can tell which chunks
@@ -261,7 +263,9 @@ missing. `sdb verify` finds missing or damaged chunks and repairs them from
 another friend; what no friend has is uploaded again by the next backup if the
 file is still unchanged locally. `sdb verify --local` re-reads files whose size
 and mtime are unchanged and compares fingerprints with the last backup. The
-daemon runs a scrub and a sampled verify weekly.
+daemon runs a scrub and a sampled verify weekly, and prunes daily. It remembers
+when it last did each, so restarting it does not put them off, and it leaves
+both alone for the first ten minutes after it starts.
 
 **Format versions.** Every stored thing names its format so a later release can
 tell old from new: `format` and `created` in `config.toml`, `identity.key` and
@@ -327,7 +331,8 @@ Docker (macOS): `SDB_TEST_S3=emulator tests/cloud.sh target/release/sdb`.
 
 To publish a release, raise `version` in `Cargo.toml`, push, and run the
 `release` workflow on GitHub (`gh workflow run release`). It names the release
-after that version and attaches binaries for macOS and Linux.
+after that version and attaches binaries for macOS and Linux, built with the
+slower, smaller `dist` profile (`cargo build --profile dist`).
 
 The app icon is drawn in `assets/icon.svg`; `icon.png` (built into the window)
 and `icon.icns` (for a Mac app bundle) are made from it with `rsvg-convert` and

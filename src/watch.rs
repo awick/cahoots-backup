@@ -22,6 +22,9 @@ use tokio::sync::mpsc;
 /// A set's name, its folders and what it leaves out.
 type SetFilter = (String, Vec<PathBuf>, Option<Excludes>);
 
+/// How long after starting the daemon leaves its regular jobs alone.
+const SETTLE: Duration = Duration::from_secs(600);
+
 pub async fn run(node: Arc<Node>, out: Out) {
     let mut dirty_since = Some(Instant::now());
     let mut last_event = Instant::now() - Duration::from_secs(3600);
@@ -32,8 +35,7 @@ pub async fn run(node: Arc<Node>, out: Out) {
     let mut touched: Option<HashSet<String>> = None;
     let mut refill = true;
     let mut last_scan = Instant::now();
-    let mut last_prune = Instant::now();
-    let mut last_check = Instant::now();
+    let (started, mut last_jobs) = (Instant::now(), Instant::now());
     let mut last_alert = Instant::now() - Duration::from_secs(3000);
     let mut last_notice = Instant::now();
     let mut last_touch = Instant::now() - Duration::from_secs(280);
@@ -195,6 +197,32 @@ pub async fn run(node: Arc<Node>, out: Out) {
                     next.insert(format!("{}|{}", key.0, key.1), at);
                 }
             }
+            // These come before the backups, and whether or not one is due: an idle or paused node
+            // still has history to prune and data to check. The weekly check and the daily prune go by when they last ran, which is kept on
+            // disk, so restarting the daemon does not start the wait over. Neither runs in the
+            // first minutes after a start, while the network and the clock may still be settling.
+            let wall = chrono::Utc::now().timestamp();
+            if started.elapsed() > SETTLE && last_jobs.elapsed() > Duration::from_secs(60) {
+                last_jobs = Instant::now();
+                if node.job_last("check").is_none() {
+                    // A node that has never checked starts its week now, not with a check.
+                    node.job_mark("check");
+                } else if Node::job_due(node.job_last("check"), wall, 7 * 86400) {
+                    node.job_mark("check");
+                    let _ = node.scrub(&out).await;
+                    if let Err(e) = node.verify(false, None, &out).await {
+                        out.say(format!("verify: {e:#}"));
+                    }
+                }
+                if Node::job_due(node.job_last("prune"), wall, 86400) {
+                    // Marked whether or not it finishes: a destination that is away is tried again tomorrow.
+                    node.job_mark("prune");
+                    let _op = node.op.lock().await;
+                    if let Err(e) = node.prune(false, None, false, None, &out).await {
+                        out.say(format!("prune failed: {e:#}"));
+                    }
+                }
+            }
             if !settled || due.is_empty() {
                 continue;
             }
@@ -225,20 +253,6 @@ pub async fn run(node: Arc<Node>, out: Out) {
             }
             if pending.is_empty() {
                 dirty_since = None;
-            }
-            if last_check.elapsed() > Duration::from_secs(7 * 86400) {
-                last_check = Instant::now();
-                let _ = node.scrub(&out).await;
-                if let Err(e) = node.verify(false, None, &out).await {
-                    out.say(format!("verify: {e:#}"));
-                }
-            }
-            if last_prune.elapsed() > Duration::from_secs(86400) {
-                last_prune = Instant::now();
-                let _op = node.op.lock().await;
-                if let Err(e) = node.prune(false, None, &out).await {
-                    out.say(format!("prune failed: {e:#}"));
-                }
             }
         }
     }
