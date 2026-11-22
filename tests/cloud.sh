@@ -137,7 +137,7 @@ s destinations | grep -q s3 && fail "a destination that failed its check was sav
 step "add cloud storage"
 add_cloud --create | grep -q "s3 added" || fail "add"
 s destinations | grep -q "s3 .*cloud storage, bucket sdbtest" || fail "not listed"
-[ "$(stat -f %Lp home/config.toml 2>/dev/null || stat -c %a home/config.toml)" = 600 ] || fail "config is not private"
+[ "$(ls -l home/config.toml | cut -c1-10)" = "-rw-------" ] || fail "config is not private"
 s status | grep -q "$SDB_CLOUD_SECRET" && fail "status shows the secret key"
 
 step "backup, change, backup"
