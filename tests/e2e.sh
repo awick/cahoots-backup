@@ -11,7 +11,10 @@ step() { echo "  $1"; }
 a() { SDB_HOME=$T/alice "$SDB" "$@"; }
 b() { SDB_HOME=$T/bob "$SDB" "$@"; }
 m() { SDB_HOME=$T/mallory "$SDB" "$@"; }
+# Alice again, on the computer set up from her recovery kit.
+r() { SDB_HOME=$T/again "$SDB" "$@"; }
 cleanup() {
+    r stop >/dev/null 2>&1 || true
     a stop >/dev/null 2>&1 || true
     b stop >/dev/null 2>&1 || true
     m stop >/dev/null 2>&1 || true
@@ -161,6 +164,12 @@ SDB_PASSPHRASE=wrong-horse-9 SDB_HOME=$T/again "$SDB" recovery import "$T/kit.js
 SDB_PASSPHRASE=correct-horse SDB_HOME=$T/again "$SDB" recovery import "$T/kit.json" | grep -q 'Recovered "alice"' ||
     fail "recovery import"
 [ -f "$T/again/identity.key" ] || fail "the recovered folder has no identity"
+# The old computer is gone; the new one gets the files back from the friend alone.
+a stop >/dev/null
+r restore latest --set default --to recovered --from bob >/dev/null || fail "restore on the recovered computer"
+diff -r recovered/data data || fail "the recovered computer restored something else"
+r restore latest --set nosuchset --to recovered2 >/dev/null 2>&1 && fail "restore from a set that does not exist"
+r stop >/dev/null
 
 step "space for new friends and free space to keep"
 b default-quota 250 >/dev/null

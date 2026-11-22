@@ -151,6 +151,9 @@ enum C {
         /// Use only this friend or drive (default: any that has it, local drives first)
         #[arg(long)]
         from: Option<String>,
+        /// Look only among this backup set's restore points, so `latest` is that set's newest
+        #[arg(long)]
+        set: Option<String>,
     },
     /// Set how much history to keep
     Keep {
@@ -592,8 +595,17 @@ async fn real_main() -> Result<()> {
         }
         C::Recovery { cmd: RecoveryCmd::Import { file } } => {
             let config = recovery::import(&home, &passphrase(false)?, &file)?;
-            println!("Recovered \"{}\" with {} friends.", config.name, config.friends.len());
-            println!("Run `sdb snapshots`, then `sdb restore latest --to <folder>` (or --in-place).");
+            let sets: Vec<&str> = config.sets.iter().map(|b| b.name.as_str()).collect();
+            println!(
+                "Recovered \"{}\" with {} friends and {} backup sets ({}).",
+                config.name,
+                config.friends.len(),
+                sets.len(),
+                sets.join(", ")
+            );
+            println!("`sdb status` shows whether your destinations are reachable, `sdb snapshots` the restore points.");
+            println!("To put a set's files back where they were: sdb restore latest --set NAME --in-place");
+            println!("(or --to FOLDER to look first; `sdb gui` and `sdb tui` do the same from their Restore page).");
             return Ok(());
         }
         C::Add { paths, set } => {
@@ -689,8 +701,9 @@ async fn real_main() -> Result<()> {
         C::Ls { snap, path } => Cmd::Ls { snap, path: path.as_ref().map(abs).transpose()? },
         C::Diff { a, b } => Cmd::Diff { a, b },
         C::History { path } => Cmd::History { path: abs(&path)? },
-        C::Restore { snap, paths, to, in_place, from } => Cmd::Restore {
+        C::Restore { snap, paths, to, in_place, from, set } => Cmd::Restore {
             from,
+            set,
             snap,
             paths: paths.iter().map(abs).collect::<Result<_>>()?,
             to: if in_place { PathBuf::from("/") } else { std::path::absolute(to.unwrap())? },

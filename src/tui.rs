@@ -1823,7 +1823,7 @@ impl App {
                     return;
                 };
                 let paths = self.restore.picked.iter().cloned().collect();
-                let cmd = Cmd::Restore { snap, paths, to: PathBuf::from(text), from: self.source.clone() };
+                let cmd = Cmd::Restore { snap, paths, to: PathBuf::from(text), from: self.source.clone(), set: None };
                 self.start("restoring", |ex, pr| async move { Done::Popup(lines_or_error(ex.live(cmd, &pr).await)) });
             }
         }

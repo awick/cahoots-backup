@@ -58,11 +58,54 @@ sdb add ~/Documents ~/Pictures
 sdb invite                         # prints `sdb join sdb1...` to send to a friend
 sdb join sdb1...                   # what the friend runs (or you, with their invite)
 sdb service install                # run the daemon at login (launchd / systemd)
-sdb recovery export ~/sdb-kit.json # keep this file OFF this computer
+sdb recovery export ~/sdb-kit.json # keep this file OFF this computer: it is how you recover
 ```
 
 One invite pairs both directions. The daemon watches your folders and creates a
 restore point shortly after files stop changing.
+
+## Recovering on a new computer
+
+Your computer is lost, stolen or dead. Two things get your files back: the
+**recovery kit** with its passphrase, and any one destination that holds your
+backups. Nothing has to survive on the old computer: the list of files in every
+restore point is stored, encrypted, at the destinations along with the data.
+
+**Before it happens**, export the kit and keep it, and its passphrase, somewhere
+other than that computer (a password manager, a USB stick, a friend):
+
+```bash
+sdb recovery export ~/sdb-recovery-kit.json
+```
+
+In the GUI it is Settings, Essentials, Recovery kit, Export. Export it again
+after adding a friend, a drive or cloud storage, since a kit only knows the
+destinations that existed when it was written; `sdb status` and Settings say
+when it is out of date.
+
+**When it happens**, on the new computer:
+
+```bash
+sdb recovery import sdb-recovery-kit.json    # asks for the passphrase
+sdb status                                   # are your destinations reachable?
+sdb snapshots                                # the restore points, and the set each belongs to
+sdb restore latest --set default --in-place  # put that set's files back where they were
+sdb service install                          # carry on backing up from here
+```
+
+- The import makes the new computer the same one as far as your friends can
+  tell: same identity, same key, same friends, drives, cloud storage and backup
+  sets. Your friends do nothing.
+- Restore each backup set you have (`--set NAME`); `--to FOLDER` instead of
+  `--in-place` puts the files in a folder to look at first. `sdb gui` and
+  `sdb tui` do the same from their Restore page.
+- A drive has to be plugged in where it was before; a friend's computer has to
+  be on.
+- You get back what had been backed up. Changes made after the last backup are
+  gone.
+- Do not run the old computer and the new one at the same time.
+- Without the kit, or without its passphrase, the backups cannot be decrypted
+  by anyone.
 
 ## Everyday commands
 
@@ -73,7 +116,7 @@ restore point shortly after files stop changing.
 | `sdb snapshots` | list restore points |
 | `sdb history FILE` | every version of one file |
 | `sdb diff A B` / `sdb ls SNAP [PATH]` | what changed / what is inside |
-| `sdb restore SNAP [PATHS] --to DIR` | SNAP is an id, a tag, `latest`, or a date such as `2026-11-20` or `"2026-11-20 14:30"`; `~/Documents/a.txt` lands at `DIR/Documents/a.txt`; `--from NAME` uses one friend or drive only |
+| `sdb restore SNAP [PATHS] --to DIR` | SNAP is an id, a tag, `latest`, or a date such as `2026-11-20` or `"2026-11-20 14:30"`; `~/Documents/a.txt` lands at `DIR/Documents/a.txt`; `--from NAME` uses one friend or drive only; `--set NAME` makes `latest` that backup set's newest |
 | `sdb keep --days 365 --versions 10` | maximum age and versions per file |
 | `sdb keep --versions 5 --pattern '**/*.iso'` | version limit for matching files only |
 | `sdb prune [--dry-run]` | apply the keep rules now (the daemon does it daily) |
@@ -340,13 +383,12 @@ chunk files; `sdb1` on invites; and a versioned protocol name on the wire. A
 release that meets a newer format stops with an "upgrade sdb" message instead
 of guessing.
 
-**Losing your computer.** `sdb recovery export` writes your identity, master key
-and friend list encrypted with a passphrase (Argon2id). On a new machine:
-`sdb recovery import kit.json`, then `sdb restore latest --in-place`. Without
-the kit the backups cannot be decrypted by anyone. `sdb status` and the
-Settings page say whether a kit has been exported, and when it is older than
-your newest friend or drive and should be exported again; the GUI can write it
-from Settings.
+**The recovery kit.** `sdb recovery export` writes your identity, master key,
+settings and friend list into one file, encrypted with a key made from your
+passphrase (Argon2id, 64 MiB of memory, with a random salt). The master key
+itself is 256 random bits, not made from the passphrase, so the data at your
+friends cannot be guessed open; the passphrase only guards the kit file. See
+[Recovering on a new computer](#recovering-on-a-new-computer).
 
 ## Files
 

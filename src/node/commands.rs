@@ -394,9 +394,17 @@ impl Node {
         paths: Vec<String>,
         to: PathBuf,
         from: Option<String>,
+        set: Option<String>,
         out: &Out,
     ) -> Result<()> {
-        let snaps = self.snapshots_from(&from, out).await?;
+        let mut snaps = self.snapshots_from(&from, out).await?;
+        if let Some(set) = &set {
+            let cfg = self.cfg();
+            snaps.retain(|s| cfg.set_name_now(&s.m.set) == *set);
+            if snaps.is_empty() {
+                bail!("there are no restore points of a set named {set}; `sdb snapshots` lists them with their sets");
+            }
+        }
         let s = self.resolve(&snaps, &snap)?;
         let entries: Vec<Entry> = self.load_index(s).await?.into_iter().filter(|e| under(&e.path(), &paths)).collect();
         if entries.is_empty() {

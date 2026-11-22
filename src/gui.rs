@@ -1314,6 +1314,7 @@ impl Gui {
                         paths: self.picked.iter().cloned().collect(),
                         to: PathBuf::from(to),
                         from: self.source.clone(),
+                        set: None,
                     };
                     self.spawn(&ctx, Job::Show("Restore"), cmd, Some("Restoring"));
                 }

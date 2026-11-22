@@ -87,7 +87,7 @@ diff -r healed/data data || fail "the repaired drive restores something else"
 
 step "a damaged restore point record"
 R=$(records | head -1)
-printf 'X' | dd of="$R" bs=1 seek=20 conv=notrunc 2>/dev/null
+printf 'ROT' | dd of="$R" bs=1 seek=20 conv=notrunc 2>/dev/null
 a snapshots >snaps.out 2>&1 || fail "listing stopped at a damaged record"
 grep -q "is damaged" snaps.out || fail "the damaged record was not reported"
 a restore latest --to pastrecord >/dev/null || fail "a damaged record on one destination blocked restore"

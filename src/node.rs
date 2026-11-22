@@ -119,6 +119,9 @@ pub enum Cmd {
         paths: Vec<String>,
         to: PathBuf,
         from: Option<String>,
+        /// Look only among this set's restore points, so `latest` is that set's newest.
+        #[serde(default)]
+        set: Option<String>,
     },
     Prune {
         dry_run: bool,
@@ -1933,7 +1936,7 @@ impl Node {
             Cmd::Diff { a, b } => self.diff(a, b, out).await,
             Cmd::History { path } => self.history(path, out).await,
             Cmd::Versions { path, from } => self.show_versions(path, from, out).await,
-            Cmd::Restore { snap, paths, to, from } => self.restore(snap, paths, to, from, out).await,
+            Cmd::Restore { snap, paths, to, from, set } => self.restore(snap, paths, to, from, set, out).await,
             Cmd::Prune { dry_run, apply_exclusions, set } => self.run_prune(dry_run, apply_exclusions, set, out).await,
             Cmd::Forget { snap } => self.prune(false, Some(snap), false, None, out).await,
             Cmd::Verify { full, local, set } => self.run_verify(full, local, set, out).await,
