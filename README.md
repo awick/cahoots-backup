@@ -118,9 +118,9 @@ when each last got a backup), its schedule, and what it is doing right now.
 
 | Page | What is there |
 | --- | --- |
-| Backup | the backup sets and their status; create a set, choose its files, its destinations and its schedule and history rules, back up now |
-| Restore | browse files as of any restore point, search by name, step through time, list a file's versions, choose which destination to read from, restore |
-| Destinations | friends' computers, local drives and cloud storage: whether each is reachable and how, what you store there, what they store here; invite, accept an invite, add a drive or cloud storage, set pace, quota or cap, and how much history each keeps |
+| Backup | the backup sets and their status; create a set, choose its files, its destinations, its exclusion list and its schedule and history rules; back up now, verify, and take what the set now leaves out from its older restore points |
+| Restore | choose a backup set, then browse its files as of any restore point, search by name, step through time, list a file's versions, choose which destination to read from, restore |
+| Destinations | friends' computers, local drives and cloud storage: whether each is reachable and how, what you store there, what they store here; invite, accept an invite, add a drive or cloud storage, set pace, quota or cap, and how much history each keeps; clean up what sets no longer sent there left behind |
 | Settings | hours, pause, pace, upload limit, warnings and history rules that apply to every set; the exclusion lists |
 | History | what the daemon has done since it started |
 | Status | the full `sdb status` report |
@@ -203,8 +203,8 @@ different destinations.
 **Backup sets.** A set is a named group of folders with its own destinations,
 pace, hours and history rules; folders start in the `default` set, which goes to
 every destination. Each restore point belongs to one set. Sets share storage, so
-identical data in two sets is stored once per destination. In the TUI, `w`
-switches the set being edited and `n` creates one.
+identical data in two sets is stored once per destination. In the TUI and GUI
+the Backup page lists the sets and has an entry for making a new one.
 
 **Retention.** `keep_last / hourly / daily / weekly / monthly` choose which
 restore points survive, `keep_days` caps their age, and `max_versions` (global
@@ -248,10 +248,11 @@ belong to which restore point, the owner's node does the trimming: when it hits
 (or is over) a quota it removes its oldest restore points at that friend,
 never the newest of any set, and retries.
 
-**Going back in time.** The Restore page of `sdb tui` shows your files as of
-any restore point: `t` opens the timeline, `g` jumps to a date, `v` lists the
-versions of the highlighted file, and entries are marked *different now*,
-*deleted since* or *changes inside* relative to the latest restore point.
+**Going back in time.** Restore, in the TUI and the GUI, starts with the choice
+of backup set and then shows that set's files as of any restore point. Its menu
+goes back in time, jumps to a date and lists the versions of the highlighted
+file, and entries are marked *different now*, *deleted since* or *changes
+inside* relative to the latest restore point.
 
 **Corruption.** Every chunk is authenticated (AEAD) and its plaintext is
 re-hashed on restore, and the restored size must match, so damaged data is
