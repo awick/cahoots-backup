@@ -1852,6 +1852,10 @@ impl App {
         let d = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == name));
         match d.and_then(|d| d["state"].as_str()) {
             Some("online") if d.is_some_and(|d| d["closed"] == true) => ("●".into(), Color::Magenta),
+            // Through the relay: paler, and a different mark for eyes that do not separate two greens.
+            Some("online") if d.is_some_and(|d| d["link"].as_str().is_some_and(|l| l.contains("relay"))) => {
+                ("◉".into(), Color::LightGreen)
+            }
             Some("online") | Some("connected") => ("●".into(), Color::Green),
             Some("checking") => ("◌".into(), Color::Yellow),
             _ => ("○".into(), Color::Red),

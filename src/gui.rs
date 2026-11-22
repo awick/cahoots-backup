@@ -25,6 +25,10 @@ const GREEN: Color32 = Color32::from_rgb(60, 170, 80);
 const YELLOW: Color32 = Color32::from_rgb(200, 150, 30);
 const RED: Color32 = Color32::from_rgb(210, 70, 70);
 const BLUE: Color32 = Color32::from_rgb(70, 140, 210);
+/// A destination reached directly: a friend on a direct path, a connected drive, cloud storage.
+const DIRECT: Color32 = Color32::from_rgb(28, 128, 62);
+/// A friend reached only through the relay, which is slower.
+const RELAY: Color32 = Color32::from_rgb(160, 222, 172);
 /// A friend who is there but takes no backups from this computer.
 const PURPLE: Color32 = Color32::from_rgb(150, 105, 215);
 /// Width of the label column in a backup set's rows.
@@ -390,12 +394,17 @@ impl Gui {
         self.cfg.set(name).cloned().unwrap_or_else(|| BackupSet { name: name.to_string(), ..Default::default() })
     }
 
-    /// Draws a small status circle: filled when reachable, a ring when not.
+    /// Draws a small status circle: filled when reachable (pale with a dark rim when only
+    /// through the relay), a ring when not.
     fn dot(ui: &mut egui::Ui, (kind, color, meaning): (&'static str, Color32, &'static str)) {
         let (rect, over) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
         over.on_hover_text(meaning);
         if kind == "full" {
             ui.painter().circle_filled(rect.center(), 5.0, color);
+        } else if kind == "relay" {
+            // Told apart by shape as well as shade, for eyes that do not separate two greens.
+            ui.painter().circle_filled(rect.center(), 5.0, color);
+            ui.painter().circle_stroke(rect.center(), 4.4, egui::Stroke::new(1.3, DIRECT));
         } else {
             ui.painter().circle_stroke(rect.center(), 4.5, egui::Stroke::new(1.5, color));
         }
@@ -514,12 +523,21 @@ impl Gui {
     /// shows when the pointer rests on it.
     fn dest_dot(&self, name: &str) -> (&'static str, Color32, &'static str) {
         let d = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == name));
+        // For development: CAHOOTS_GUI_RELAY=NAME draws that friend as reached through the relay.
+        let relayed = cfg!(debug_assertions) && crate::config::env_text("GUI_RELAY").as_deref() == Some(name);
         match d.and_then(|d| d["state"].as_str()) {
             Some("online") if d.is_some_and(|d| d["closed"] == true) => {
                 ("full", PURPLE, "Purple: online, but it takes no backups from this computer")
             }
-            Some("online") => ("full", GREEN, "Green: online, backups can go there now"),
-            Some("connected") => ("full", GREEN, "Green: the drive is connected, backups can go there now"),
+            Some("online") if d.is_some_and(|d| d["link"].as_str().is_some_and(|l| l.contains("relay"))) || relayed => {
+                (
+                    "relay",
+                    RELAY,
+                    "Light green: online, but only through the relay, which is slower; it is still looking for a direct path",
+                )
+            }
+            Some("online") => ("full", DIRECT, "Dark green: online and reached directly, backups can go there now"),
+            Some("connected") => ("full", DIRECT, "Dark green: the drive is connected, backups can go there now"),
             Some("checking") => ("ring", YELLOW, "Yellow ring: not heard from yet, still checking"),
             Some("not connected") => {
                 ("ring", RED, "Red ring: the drive is not connected; it catches up when it is plugged in again")
