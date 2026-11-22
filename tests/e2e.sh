@@ -179,4 +179,46 @@ a destination rm usb | grep -q "now has no destination" || fail "no notice about
 a backup --set pics >stranded.out 2>&1 && fail "a set went somewhere after its only destination was removed"
 a set pics --to bob >/dev/null
 a backup --set pics | grep -q "created on bob" || fail "choosing a new destination"
+
+step "exclusion lists"
+mkdir -p data/proj/node_modules data/proj/target data/keepout
+echo x >data/proj/node_modules/a.js
+echo y >data/proj/target/b.o
+echo z >data/keepout/c.txt
+echo s >data/proj/main.rs
+a backup --set default >/dev/null
+a ls latest >ls.out
+grep -q node_modules ls.out && fail "node_modules was backed up under the Standard list"
+grep -q "target/b.o" ls.out || fail "the Standard list left out a build folder"
+a set default --exclude developer | grep -q '"Developer"' || fail "choosing a list"
+a backup --set default >/dev/null
+a ls latest | grep -q "proj/target" && fail "the Developer list did not leave out target"
+a exclude add Standard '*.o' >/dev/null 2>&1 && fail "a built-in list was changed"
+a exclude new mine --from Developer >/dev/null
+a exclude add mine keepout | grep -q '\*\*/keepout added' || fail "a bare name should mean that name anywhere"
+a exclude add mine '[' >/dev/null 2>&1 && fail "a broken pattern was accepted"
+a set default --exclude mine >/dev/null
+a skip data/sub >/dev/null
+a backup --set default >/dev/null
+a ls latest >ls.out
+grep -q keepout ls.out && fail "a pattern in my own list was ignored"
+grep -q "data/sub" ls.out && fail "a folder left out by hand was backed up"
+grep -q "proj/main.rs" ls.out || fail "too much was left out"
+a skip data/sub --remove >/dev/null
+a exclude delete mine | grep -q "now uses Standard" || fail "deleting a list in use"
+a backup --set default >/dev/null
+a ls latest >ls.out
+grep -q "target/b.o" ls.out || fail "the set did not go back to the Standard list"
+grep -q "sub/note.txt" ls.out || fail "a folder put back was not backed up"
+
+step "files put back as they were still get a new restore point"
+echo v1 >data/flip
+a backup --set default >/dev/null
+cp -p data/flip flip.saved
+echo v2 >data/flip
+a backup --set default >/dev/null
+cp -p flip.saved data/flip
+a backup --set default | grep -q "created on" || fail "going back to an earlier state made no restore point"
+a restore latest data/flip --to flipped >/dev/null
+[ "$(cat flipped/data/flip)" = v1 ] || fail "latest does not hold the files as they are now"
 echo "end-to-end test passed"

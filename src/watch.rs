@@ -10,6 +10,7 @@ use crate::{
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::{
     collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,6 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+
+/// A set's name, its folders and what it leaves out.
+type SetFilter = (String, Vec<PathBuf>, Option<Excludes>);
 
 pub async fn run(node: Arc<Node>, out: Out) {
     let mut dirty_since = Some(Instant::now());
@@ -40,13 +44,29 @@ pub async fn run(node: Arc<Node>, out: Out) {
         let (tx, mut rx) = mpsc::channel(4096);
         let flood = Arc::new(AtomicBool::new(false));
         let flooded = flood.clone();
-        let ex = Excludes::new(&cfg, &node.home).ok();
+        // Each set leaves out different things, so a change counts for the sets that back it up.
+        let filters: Arc<Vec<SetFilter>> = Arc::new(
+            cfg.sets
+                .iter()
+                .map(|b| (b.name.clone(), b.paths.clone(), Excludes::new(&cfg, b, &node.home).ok()))
+                .collect(),
+        );
+        let wanted = |filters: &[SetFilter], p: &Path| -> Vec<String> {
+            filters
+                .iter()
+                .filter(|(_, roots, ex)| {
+                    roots.iter().any(|r| p.starts_with(r) && ex.as_ref().is_none_or(|x| !x.covers(p, r)))
+                })
+                .map(|(name, _, _)| name.clone())
+                .collect()
+        };
+        let seen = filters.clone();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
             if matches!(ev.kind, EventKind::Access(_)) {
                 return;
             }
-            for p in ev.paths.into_iter().filter(|p| ex.as_ref().is_none_or(|x| !x.is_excluded(p))) {
+            for p in ev.paths.into_iter().filter(|p| !wanted(&seen, p).is_empty()) {
                 if tx.try_send(p).is_err() {
                     flooded.store(true, Ordering::Relaxed);
                 }
@@ -85,7 +105,7 @@ pub async fn run(node: Arc<Node>, out: Out) {
                     dirty_since.get_or_insert(last_event);
                     refill = true;
                     if let Some(t) = touched.as_mut() {
-                        t.extend(cfg.sets.iter().filter(|b| b.paths.iter().any(|p| path.starts_with(p))).map(|b| b.name.clone()));
+                        t.extend(wanted(&filters, &path));
                     }
                 }
                 _ = tick.tick() => {}
@@ -140,7 +160,7 @@ pub async fn run(node: Arc<Node>, out: Out) {
             if last_touch.elapsed() > Duration::from_secs(300) {
                 // Staying in touch keeps a working path open in both directions.
                 last_touch = Instant::now();
-                for f in cfg.friends.iter().filter(|f| f.path.is_none()) {
+                for f in cfg.friends.iter().filter(|f| f.is_friend()) {
                     let (node, f) = (node.clone(), f.clone());
                     tokio::spawn(async move {
                         let _ = node.peer(&f).await;

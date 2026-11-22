@@ -6,6 +6,7 @@
 #![allow(clippy::collapsible_if)]
 
 mod backup;
+mod cloud;
 mod config;
 mod control;
 mod crypto;
@@ -75,6 +76,9 @@ enum C {
         /// Always keep this many most recent restore points of this set
         #[arg(long)]
         last: Option<u32>,
+        /// The exclusion list this set uses, e.g. Standard or Developer (see `sdb exclude lists`)
+        #[arg(long)]
+        exclude: Option<String>,
         /// Give the set a new name (its restore points stay with it)
         #[arg(long)]
         rename: Option<String>,
@@ -84,9 +88,16 @@ enum C {
     },
     /// Stop backing up a folder
     Rm { path: PathBuf },
-    /// Add (or with --remove, drop) an exclude pattern such as '**/node_modules'
+    /// Exclusion lists: named lists of patterns for things not worth backing up
     Exclude {
-        pattern: String,
+        #[command(subcommand)]
+        cmd: ExcludeCmd,
+    },
+    /// Leave one folder or file out of the set that backs it up (--remove puts it back)
+    Skip {
+        path: PathBuf,
+        #[arg(long)]
+        set: Option<String>,
         #[arg(long)]
         remove: bool,
     },
@@ -171,6 +182,30 @@ enum C {
     Every { minutes: u32, name: Option<String> },
     /// Also back up to an external drive or folder
     Drive { name: String, path: PathBuf },
+    /// Also back up to cloud storage: any S3-compatible bucket (Amazon S3, Backblaze B2,
+    /// Cloudflare R2, Wasabi, MinIO). The secret key is asked for, never given here.
+    Cloud {
+        name: String,
+        /// The storage's address, e.g. https://s3.us-west-004.backblazeb2.com
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long)]
+        access_key: String,
+        /// Default us-east-1; Backblaze and others name it in the endpoint, e.g. us-west-004
+        #[arg(long)]
+        region: Option<String>,
+        /// Folder inside the bucket to keep everything under
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Always address the bucket as endpoint/bucket (normally found out by trying)
+        #[arg(long)]
+        path_style: bool,
+        /// Create the bucket if it is not there yet
+        #[arg(long)]
+        create: bool,
+    },
     /// Apply the keep rules now and reclaim space at your friends
     Prune {
         #[arg(long)]
@@ -232,6 +267,48 @@ enum FriendCmd {
         #[arg(action = clap::ArgAction::Set)]
         on: bool,
     },
+    /// How much history one destination keeps, instead of each set's own rules
+    Keep {
+        name: String,
+        /// Delete restore points there older than this many days (0 = no limit)
+        #[arg(long)]
+        days: Option<u32>,
+        #[arg(long)]
+        last: Option<u32>,
+        #[arg(long)]
+        hourly: Option<u32>,
+        #[arg(long)]
+        daily: Option<u32>,
+        #[arg(long)]
+        weekly: Option<u32>,
+        #[arg(long)]
+        monthly: Option<u32>,
+        /// Go back to each set's own rules
+        #[arg(long)]
+        default: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExcludeCmd {
+    /// Show every list, its patterns and the sets that use it
+    Lists,
+    /// Make a list of your own, starting as a copy of Standard
+    New {
+        name: String,
+        /// Copy this list instead
+        #[arg(long)]
+        from: Option<String>,
+        /// Start with no patterns
+        #[arg(long, conflicts_with = "from")]
+        empty: bool,
+    },
+    /// Add a pattern to one of your lists, such as '*.iso' or '**/build'
+    Add { list: String, pattern: String },
+    /// Take a pattern out of one of your lists
+    Rm { list: String, pattern: String },
+    /// Delete one of your lists; sets that used it go back to Standard
+    Delete { list: String },
 }
 
 #[derive(Subcommand)]
@@ -501,7 +578,18 @@ async fn real_main() -> Result<()> {
             Cmd::AddPaths { paths, set }
         }
         C::Rm { path } => Cmd::RemovePath { path: fs::canonicalize(&path).unwrap_or(std::path::absolute(&path)?) },
-        C::Exclude { pattern, remove } => Cmd::Exclude { pattern, remove },
+        C::Exclude { cmd } => match cmd {
+            ExcludeCmd::Lists => Cmd::ExcludeLists,
+            ExcludeCmd::New { name, from, empty } => {
+                Cmd::ExcludeNew { name, from: if empty { None } else { Some(from.unwrap_or("Standard".into())) } }
+            }
+            ExcludeCmd::Add { list, pattern } => Cmd::ExcludePattern { list, pattern, remove: false },
+            ExcludeCmd::Rm { list, pattern } => Cmd::ExcludePattern { list, pattern, remove: true },
+            ExcludeCmd::Delete { list } => Cmd::ExcludeDelete { name: list },
+        },
+        C::Skip { path, set, remove } => {
+            Cmd::Skip { path: fs::canonicalize(&path).unwrap_or(std::path::absolute(&path)?), set, remove }
+        }
         C::Invite => Cmd::Invite,
         C::Join { ticket } => Cmd::Join { ticket },
         C::Destinations => Cmd::Friends,
@@ -510,10 +598,40 @@ async fn real_main() -> Result<()> {
             FriendCmd::Quota { name, gb } => Cmd::FriendQuota { name, gb },
             FriendCmd::Limit { name, kbps } => Cmd::FriendLimit { name, kbps },
             FriendCmd::BackupTo { name, on } => Cmd::FriendBackupTo { name, on },
+            FriendCmd::Keep { name, days, last, hourly, daily, weekly, monthly, default } => {
+                let set: Vec<(String, u32)> = [
+                    ("days", days),
+                    ("last", last),
+                    ("hourly", hourly),
+                    ("daily", daily),
+                    ("weekly", weekly),
+                    ("monthly", monthly),
+                ]
+                .into_iter()
+                .filter_map(|(k, v)| Some((k.to_string(), v?)))
+                .collect();
+                if default != set.is_empty() {
+                    bail!("give either the rules to keep by (--days, --last, ...) or --default");
+                }
+                Cmd::DestKeep { name, set, clear: default }
+            }
         },
         C::Backup { tag, set } => Cmd::Backup { tag, set },
         C::Sets => Cmd::Sets,
         C::Set { name, rename: Some(to), .. } => Cmd::SetRename { name, to },
+        C::Set { name, exclude: Some(list), to, every, hours, days, versions, last, delete, .. } => {
+            if to.is_some()
+                || every.is_some()
+                || hours.is_some()
+                || days.is_some()
+                || versions.is_some()
+                || last.is_some()
+                || delete
+            {
+                bail!("give --exclude on its own");
+            }
+            Cmd::SetExclude { name, list }
+        }
         C::Set { name, to, every, hours, days, versions, last, delete, .. } => Cmd::SetEdit {
             name,
             to: to
@@ -578,6 +696,14 @@ async fn real_main() -> Result<()> {
         C::Every { minutes, name } => Cmd::Every { name, minutes },
         C::Drive { name, path } => {
             Cmd::DriveAdd { name, path: fs::canonicalize(&path).with_context(|| path.display().to_string())? }
+        }
+        C::Cloud { name, endpoint, bucket, access_key, region, prefix, path_style, create } => {
+            let secret_key = match std::env::var("SDB_CLOUD_SECRET") {
+                Ok(s) => s,
+                Err(_) => rpassword::prompt_password("Secret key: ")?,
+            };
+            let path_style = path_style.then_some(true);
+            Cmd::CloudAdd { name, endpoint, bucket, region, prefix, access_key, secret_key, path_style, create }
         }
         C::Prune { dry_run } => Cmd::Prune { dry_run },
         C::Forget { snap } => Cmd::Forget { snap },

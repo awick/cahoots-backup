@@ -6,7 +6,7 @@
 //! It is only a client: everything it shows and does goes through the daemon.
 
 use crate::{
-    config::{BackupSet, Config, DEFAULT_SET},
+    config::{BackupSet, Config, DEFAULT_SET, STANDARD, is_builtin_list},
     control,
     node::Cmd,
     snapshot::{human, parse_when, when},
@@ -264,6 +264,14 @@ enum Prompt {
     DeleteSet(String),
     RenameSet(String),
     Drive,
+    /// Adding cloud storage, one answer at a time: the answers so far.
+    Cloud(Vec<String>),
+    /// Name for a new exclusion list that starts as a copy of this one.
+    ExNew(String),
+    ExAdd(String),
+    ExDelete(String),
+    /// A history rule ("days" or "last") for one destination.
+    DestKeep(String, &'static str),
     Remove(String),
     Every(String),
     Quota(String),
@@ -290,6 +298,16 @@ enum Act {
     Invite,
     Accept,
     AddDrive,
+    AddCloud,
+    SetExclude,
+    ExNew,
+    ExCopy,
+    ExAdd,
+    ExRemove(usize),
+    ExDelete,
+    DestDays,
+    DestLast,
+    DestDefault,
     Pace,
     Quota,
     InLimit,
@@ -303,11 +321,21 @@ enum Act {
     Date,
     Versions,
     Source,
-    WhichSet,
     Older,
     Newer,
     Refresh,
 }
+
+/// What adding cloud storage asks for, in order; the secret key comes last and is not shown.
+const CLOUD_STEPS: [&str; 7] = [
+    "a name for this destination",
+    "endpoint, such as https://s3.us-west-004.backblazeb2.com",
+    "bucket",
+    "region",
+    "folder inside the bucket (blank = none)",
+    "access key (key id)",
+    "secret key",
+];
 
 /// Where "Files and folders" and "Destinations" sit in a set's menu.
 const SET_FILES: usize = 4;
@@ -328,6 +356,9 @@ enum Sub {
     Files,
     Dests,
     Rules,
+    Excludes,
+    /// Restore, before a backup set is chosen.
+    RestoreSets,
 }
 
 /// One level of the drill-down menu on the left.
@@ -338,9 +369,13 @@ enum Kind {
     Set(String),
     Rules(String),
     Restore,
+    /// Restoring from one backup set.
+    RestoreSet(String),
     Dests,
     Dest(String),
     Settings,
+    Excludes,
+    ExList(String),
 }
 
 /// What choosing a menu item does.
@@ -392,6 +427,10 @@ struct App {
     page: usize,
     in_menu: bool,
     sub: Sub,
+    /// The cursor in Restore's list of backup sets.
+    rsets: ListState,
+    /// The exclusion list shown on the right of Settings > Exclusion lists.
+    exlist: Option<String>,
     /// The backup set being looked at or edited.
     set: String,
     sets: ListState,
@@ -509,7 +548,7 @@ impl App {
     }
 
     fn excluded(&self, path: &str) -> bool {
-        self.cfg.exclude.contains(&globset::escape(path))
+        self.cur_set().skip.iter().any(|p| p == Path::new(path))
     }
 
     /// The other set that already backs up this exact folder, if any.
@@ -520,11 +559,11 @@ impl App {
 
     fn folder_mark(&self, path: &str) -> (&'static str, Color) {
         let p = Path::new(path);
-        let paths = self.cur_set().paths;
+        let BackupSet { paths, skip, .. } = self.cur_set();
         let inside = paths.iter().any(|x| p.starts_with(x));
         if paths.iter().any(|x| x == p) {
             ("[x]", Color::Green)
-        } else if inside && self.cfg.exclude.iter().any(|e| p.starts_with(e.replace('\\', ""))) {
+        } else if inside && skip.iter().any(|e| p.starts_with(e)) {
             ("[-]", Color::Red)
         } else if inside {
             ("[+]", Color::Green)
@@ -558,7 +597,7 @@ impl App {
         let cmd = if paths.contains(&p) {
             Cmd::RemovePath { path: p }
         } else if paths.iter().any(|x| p.starts_with(x)) {
-            Cmd::Exclude { pattern: globset::escape(&path), remove: self.excluded(&path) }
+            Cmd::Skip { path: p, set: Some(self.set.clone()), remove: self.excluded(&path) }
         } else {
             Cmd::AddPaths { paths: vec![p], set: Some(self.set.clone()) }
         };
@@ -767,7 +806,8 @@ impl App {
 
     /// Loads whatever the current page still needs.
     fn kick(&mut self) {
-        if self.busy.is_none() && self.page == RESTORE && !self.restore.loaded {
+        let chosen = matches!(self.stack.last(), Some((Kind::RestoreSet(_), _)));
+        if self.busy.is_none() && chosen && !self.restore.loaded {
             self.load_snaps();
         }
     }
@@ -918,6 +958,13 @@ impl App {
                 ("Files and folders".into(), Choice::Focus),
                 ("Destinations".into(), Choice::Focus),
                 go("Schedule and history", Kind::Rules(n.clone())),
+                act(
+                    format!(
+                        "Leaves out: {} list",
+                        self.cfg.set(n).map(|b| self.cfg.list_for(b).name).unwrap_or_default()
+                    ),
+                    Act::SetExclude,
+                ),
                 act(format!("Hidden files: {}", if self.hidden { "shown" } else { "not shown" }), Act::Hidden),
                 act("Rename this set".into(), Act::RenameSet),
                 act("Delete this set".into(), Act::DeleteSet),
@@ -928,7 +975,8 @@ impl App {
                 val("Max versions of a file", "set-versions"),
                 val("Max age in days", "set-days"),
             ],
-            Kind::Restore => {
+            Kind::Restore => self.cfg.sets.iter().map(|b| go(&b.name, Kind::RestoreSet(b.name.clone()))).collect(),
+            Kind::RestoreSet(_) => {
                 let rv = &self.restore;
                 let file = rv.tree.cur().filter(|r| !r.dir).map(|r| name(&r.path));
                 let mut v = vec![
@@ -947,9 +995,6 @@ impl App {
                     act(format!("Versions of {}", file.as_deref().unwrap_or("a file")), Act::Versions),
                     act(format!("Read from: {}", self.source.as_deref().unwrap_or("all destinations")), Act::Source),
                 ];
-                if self.cfg.sets.len() > 1 {
-                    v.push(act(format!("Backup set: {}", self.rset.as_deref().unwrap_or("newest")), Act::WhichSet));
-                }
                 v.push(act("Older restore point".into(), Act::Older));
                 v.push(act("Newer restore point".into(), Act::Newer));
                 v.push(act("Look again".into(), Act::Refresh));
@@ -960,6 +1005,7 @@ impl App {
                 v.push(act("+ Invite a friend".into(), Act::Invite));
                 v.push(act("+ Accept an invite".into(), Act::Accept));
                 v.push(act("+ Add a drive or folder".into(), Act::AddDrive));
+                v.push(act("+ Add cloud storage (S3, B2, ...)".into(), Act::AddCloud));
                 v
             }
             Kind::Dest(n) => {
@@ -968,10 +1014,31 @@ impl App {
                     act(format!("In use: {}", if f.backup_to { "yes" } else { "no" }), Act::UseDest),
                     act(format!("Back up here every: {} min", f.interval_secs(&self.cfg) / 60), Act::Pace),
                 ];
-                if f.path.is_none() {
+                if f.is_friend() {
                     v.push(act(format!("They may store here: {} GB", f.quota_gb), Act::Quota));
                     let speed = if f.max_in_kbps == 0 { "any".to_string() } else { format!("{} KB/s", f.max_in_kbps) };
                     v.push(act(format!("Their upload speed here: {speed}"), Act::InLimit));
+                }
+                if f.cloud.is_some() {
+                    let cap = if f.quota_gb == 0 { "no cap".to_string() } else { format!("{} GB", f.quota_gb) };
+                    v.push(act(format!("Store at most: {cap}"), Act::Quota));
+                    v.push(act("New keys or address".into(), Act::AddCloud));
+                }
+                let rule = |n: Option<u32>| match n {
+                    None => "each set's rule".to_string(),
+                    Some(0) => "unlimited".to_string(),
+                    Some(n) => n.to_string(),
+                };
+                v.push(act(
+                    format!("Max age in days here: {}", rule(f.retention.as_ref().map(|r| r.keep_days))),
+                    Act::DestDays,
+                ));
+                v.push(act(
+                    format!("Keep most recent here: {}", rule(f.retention.as_ref().map(|r| r.keep_last))),
+                    Act::DestLast,
+                ));
+                if f.retention.is_some() {
+                    v.push(act("Use each set's history rules here".into(), Act::DestDefault));
                 }
                 v.push(act("Remove this destination".into(), Act::RemoveDest));
                 v
@@ -996,7 +1063,34 @@ impl App {
                 val("Keep daily", "daily"),
                 val("Keep weekly", "weekly"),
                 val("Keep monthly", "monthly"),
+                go("Exclusion lists", Kind::Excludes),
             ],
+            Kind::Excludes => {
+                let mut v: Vec<_> = self
+                    .cfg
+                    .lists()
+                    .iter()
+                    .map(|l| {
+                        let label =
+                            if is_builtin_list(&l.name) { format!("{} (built in)", l.name) } else { l.name.clone() };
+                        go(&label, Kind::ExList(l.name.clone()))
+                    })
+                    .collect();
+                v.push(act("+ New list (starts as Standard)".into(), Act::ExNew));
+                v
+            }
+            Kind::ExList(n) => {
+                let mut v = vec![act("Copy to a new list".into(), Act::ExCopy)];
+                if !is_builtin_list(n) {
+                    v.push(act("+ Add a pattern".into(), Act::ExAdd));
+                    let list = self.cfg.lists().into_iter().find(|l| &l.name == n);
+                    for (i, p) in list.iter().flat_map(|l| l.patterns.iter()).enumerate() {
+                        v.push(act(format!("remove {p}"), Act::ExRemove(i)));
+                    }
+                    v.push(act("Delete this list".into(), Act::ExDelete));
+                }
+                v
+            }
         }
     }
 
@@ -1005,8 +1099,9 @@ impl App {
         // Leave levels whose subject no longer exists, such as a deleted set.
         loop {
             let alive = match &self.stack.last().expect("the root level is never removed").0 {
-                Kind::Set(n) | Kind::Rules(n) => self.cfg.set(n).is_some(),
+                Kind::Set(n) | Kind::Rules(n) | Kind::RestoreSet(n) => self.cfg.set(n).is_some(),
                 Kind::Dest(n) => self.cfg.friends.iter().any(|f| &f.name == n),
+                Kind::ExList(n) => self.cfg.lists().iter().any(|l| &l.name == n),
                 _ => true,
             };
             if alive || self.stack.len() == 1 {
@@ -1021,7 +1116,12 @@ impl App {
         let before = self.page;
         self.sub = Sub::Sets;
         match &kind {
-            Kind::Root => self.page = sel,
+            Kind::Root => {
+                self.page = sel;
+                if sel == RESTORE {
+                    self.sub = Sub::RestoreSets;
+                }
+            }
             Kind::Backup => {
                 self.page = BACKUP;
                 self.sets.select(Some(sel.min(self.cfg.sets.len())));
@@ -1042,7 +1142,18 @@ impl App {
                     self.sub = Sub::Dests;
                 }
             }
-            Kind::Restore => self.page = RESTORE,
+            Kind::Restore => {
+                self.page = RESTORE;
+                self.sub = Sub::RestoreSets;
+                self.rsets.select(Some(sel));
+            }
+            Kind::RestoreSet(n) => {
+                self.page = RESTORE;
+                if self.rset.as_ref() != Some(n) {
+                    self.rset = Some(n.clone());
+                    self.restore = RestoreView::default();
+                }
+            }
             Kind::Dests => {
                 self.page = DESTS;
                 self.dests.select(Some(sel.min(self.cfg.friends.len().saturating_sub(1))));
@@ -1055,6 +1166,20 @@ impl App {
                 self.page = SETTINGS;
                 // The first menu row is the start-at-login line, which has no row in the table.
                 self.settings.select(sel.checked_sub(1));
+                if sel > GENERAL.len() {
+                    self.sub = Sub::Excludes;
+                    self.exlist = None;
+                }
+            }
+            Kind::Excludes => {
+                self.page = SETTINGS;
+                self.sub = Sub::Excludes;
+                self.exlist = self.cfg.lists().get(sel).map(|l| l.name.clone());
+            }
+            Kind::ExList(n) => {
+                self.page = SETTINGS;
+                self.sub = Sub::Excludes;
+                self.exlist = Some(n.clone());
             }
         }
         if self.page != before {
@@ -1133,16 +1258,67 @@ impl App {
             }
             Act::Accept => self.input = Some((Prompt::Join, String::new())),
             Act::AddDrive => self.input = Some((Prompt::Drive, "/Volumes/".into())),
-            Act::Pace | Act::Quota | Act::InLimit | Act::RemoveDest | Act::UseDest => {
+            Act::SetExclude => {
+                // Enter moves the set on to the next list.
+                let lists = self.cfg.lists();
+                let now = self.cfg.list_for(&self.cur_set()).name;
+                let at = lists.iter().position(|l| l.name == now).unwrap_or(0);
+                let list = lists[(at + 1) % lists.len()].name.clone();
+                self.apply(Cmd::SetExclude { name: self.set.clone(), list }).await;
+            }
+            Act::ExNew => self.input = Some((Prompt::ExNew(STANDARD.into()), String::new())),
+            Act::ExCopy | Act::ExAdd | Act::ExDelete | Act::ExRemove(_) => {
+                let Some((Kind::ExList(list), _)) = self.stack.last().cloned() else { return };
+                match a {
+                    Act::ExCopy => self.input = Some((Prompt::ExNew(list), String::new())),
+                    Act::ExAdd => self.input = Some((Prompt::ExAdd(list), String::new())),
+                    Act::ExDelete => self.input = Some((Prompt::ExDelete(list), String::new())),
+                    Act::ExRemove(i) => {
+                        let pattern = self
+                            .cfg
+                            .lists()
+                            .into_iter()
+                            .find(|l| l.name == list)
+                            .and_then(|l| l.patterns.get(i).cloned());
+                        if let Some(pattern) = pattern {
+                            self.apply(Cmd::ExcludePattern { list, pattern, remove: true }).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Act::AddCloud => {
+                // From a cloud destination's own menu this replaces its details, keeping its name.
+                let at = matches!(self.stack.last(), Some((Kind::Dest(_), _)));
+                let known = self.picked_dest().filter(|f| at && f.cloud.is_some());
+                self.input = Some(match known {
+                    Some(f) => {
+                        let c = f.cloud.unwrap_or_else(|| unreachable!());
+                        (Prompt::Cloud(vec![f.name]), c.endpoint)
+                    }
+                    None => (Prompt::Cloud(vec![]), String::new()),
+                });
+            }
+            Act::Pace
+            | Act::Quota
+            | Act::InLimit
+            | Act::RemoveDest
+            | Act::UseDest
+            | Act::DestDays
+            | Act::DestLast
+            | Act::DestDefault => {
                 let Some(f) = self.picked_dest() else {
                     self.status = "there is no destination yet: invite a friend or add a drive".into();
                     return;
                 };
                 match a {
                     Act::Pace => self.input = Some((Prompt::Every(f.name), String::new())),
+                    Act::DestDays => self.input = Some((Prompt::DestKeep(f.name, "days"), String::new())),
+                    Act::DestLast => self.input = Some((Prompt::DestKeep(f.name, "last"), String::new())),
+                    Act::DestDefault => self.apply(Cmd::DestKeep { name: f.name, set: vec![], clear: true }).await,
                     Act::Quota if f.path.is_some() => self.status = "a drive has no quota".into(),
                     Act::Quota => self.input = Some((Prompt::Quota(f.name), String::new())),
-                    Act::InLimit if f.path.is_some() => self.status = "a drive has no speed limit".into(),
+                    Act::InLimit if !f.is_friend() => self.status = "only a friend has a speed limit".into(),
                     Act::InLimit => self.input = Some((Prompt::InLimit(f.name), String::new())),
                     Act::RemoveDest => self.input = Some((Prompt::Remove(f.name), String::new())),
                     _ => self.apply(Cmd::FriendBackupTo { name: f.name, on: !f.backup_to }).await,
@@ -1197,17 +1373,6 @@ impl App {
                     None => names.first().cloned(),
                     Some(cur) => names.iter().position(|n| n == cur).and_then(|i| names.get(i + 1)).cloned(),
                 };
-                self.load_snaps();
-            }
-            Act::WhichSet => {
-                let names: Vec<String> = self.cfg.sets.iter().map(|b| b.name.clone()).collect();
-                let i = self
-                    .rset
-                    .as_ref()
-                    .and_then(|c| names.iter().position(|n| n == c))
-                    .map(|i| (i + 1) % names.len().max(1))
-                    .unwrap_or(0);
-                self.rset = names.get(i).cloned();
                 self.load_snaps();
             }
             Act::Older if self.restore.cur > 0 => self.goto(self.restore.cur - 1),
@@ -1388,7 +1553,10 @@ impl App {
     }
 
     async fn submit(&mut self, prompt: Prompt, text: String) {
-        if text.is_empty() && !matches!(prompt, Prompt::Setting("pause")) {
+        // Blank is an answer for a pause, and for the optional folder inside a bucket.
+        let optional =
+            matches!(&prompt, Prompt::Setting("pause")) || matches!(&prompt, Prompt::Cloud(v) if v.len() == 4);
+        if text.is_empty() && !optional {
             return;
         }
         match prompt {
@@ -1417,7 +1585,9 @@ impl App {
                             // Follow the set to its new name so the menu stays where it was.
                             for level in self.stack.iter_mut() {
                                 match &mut level.0 {
-                                    Kind::Set(n) | Kind::Rules(n) if *n == name => *n = to.clone(),
+                                    Kind::Set(n) | Kind::Rules(n) | Kind::RestoreSet(n) if *n == name => {
+                                        *n = to.clone()
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1467,6 +1637,42 @@ impl App {
                     _ => self.status = format!("{typed} is not a folder that exists"),
                 }
             }
+            Prompt::Cloud(mut got) => {
+                got.push(text);
+                if got.len() < CLOUD_STEPS.len() {
+                    // The usual region is offered; the rest start empty.
+                    let start = if got.len() == 3 { "us-east-1" } else { "" };
+                    self.input = Some((Prompt::Cloud(got), start.into()));
+                    return;
+                }
+                let mut it = got.into_iter();
+                let mut next = || it.next().unwrap_or_default();
+                let cmd = Cmd::CloudAdd {
+                    name: next(),
+                    endpoint: next(),
+                    bucket: next(),
+                    region: Some(next()),
+                    prefix: Some(next()),
+                    access_key: next(),
+                    secret_key: next(),
+                    path_style: None,
+                    create: false,
+                };
+                self.start("checking the cloud storage", |ex, _| async move {
+                    Done::Popup(lines_or_error(ex.call(cmd).await))
+                });
+            }
+            Prompt::ExNew(from) => self.apply(Cmd::ExcludeNew { name: text, from: Some(from) }).await,
+            Prompt::ExAdd(list) => self.apply(Cmd::ExcludePattern { list, pattern: text, remove: false }).await,
+            Prompt::ExDelete(name) => {
+                if text.eq_ignore_ascii_case("yes") {
+                    self.apply(Cmd::ExcludeDelete { name }).await;
+                }
+            }
+            Prompt::DestKeep(name, key) => match text.parse::<u32>() {
+                Ok(n) => self.apply(Cmd::DestKeep { name, set: vec![(key.to_string(), n)], clear: false }).await,
+                Err(_) => self.status = "type a number (0 = unlimited)".into(),
+            },
             Prompt::Every(name) => match text.parse::<u32>() {
                 Ok(minutes) => self.apply(Cmd::Every { name: Some(name), minutes }).await,
                 Err(_) => self.status = "type a number of minutes".into(),
@@ -1670,7 +1876,7 @@ impl App {
             .map(|x| {
                 let mark =
                     if b.sends_to(x) { Span::styled("[x]", Style::new().fg(Color::Green)) } else { Span::raw("[ ]") };
-                let kind = if x.path.is_some() { "drive " } else { "friend" };
+                let kind = format!("{:<6}", x.kind());
                 let (dot, color) = self.dest_state(&x.name);
                 ListItem::new(Line::from(vec![
                     mark,
@@ -1708,6 +1914,59 @@ impl App {
         f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, st);
     }
 
+    /// The exclusion lists: one in full when it is chosen, otherwise all of them in short.
+    fn draw_excludes(&mut self, f: &mut Frame, area: Rect, focus: Style) {
+        let dim = Style::new().fg(Color::DarkGray);
+        let users = |name: &str| {
+            let v: Vec<&str> =
+                self.cfg.sets.iter().filter(|b| self.cfg.list_for(b).name == name).map(|b| b.name.as_str()).collect();
+            if v.is_empty() { "not used by any set".to_string() } else { format!("used by {}", v.join(", ")) }
+        };
+        let kind = |name: &str| if is_builtin_list(name) { "built in" } else { "yours" };
+        let mut lines: Vec<Line> = vec![];
+        let chosen = self.exlist.as_ref().and_then(|n| self.cfg.lists().into_iter().find(|l| &l.name == n));
+        match chosen {
+            Some(l) => {
+                lines.push(Line::from(vec![
+                    Span::styled(l.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("   {}, {}", kind(&l.name), users(&l.name))),
+                ]));
+                lines.push(Line::styled(
+                    if is_builtin_list(&l.name) {
+                        "Comes with sdb and may gain patterns in a later release. Copy it to make changes."
+                    } else {
+                        "A bare name such as build means that name anywhere; a path starting with / means that one place."
+                    },
+                    dim,
+                ));
+                lines.push(Line::raw(""));
+                lines.extend(l.patterns.iter().map(|p| Line::raw(format!("  {p}"))));
+                if l.patterns.is_empty() {
+                    lines.push(Line::raw("  (nothing: everything in the set's folders is backed up)"));
+                }
+            }
+            None => {
+                lines.push(Line::raw("Each backup set leaves out what one of these lists names."));
+                lines.push(Line::styled(
+                    "Choose a set's list under Backup > the set > Leaves out. Leaving a pattern out does not remove it from restore points made so far.",
+                    dim,
+                ));
+                for l in self.cfg.lists() {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::from(vec![
+                        Span::styled(l.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                        Span::raw(format!("   {}, {} patterns, {}", kind(&l.name), l.patterns.len(), users(&l.name))),
+                    ]));
+                    let short: Vec<String> =
+                        l.patterns.iter().map(|p| p.trim_start_matches("**/").to_string()).collect();
+                    lines.push(Line::styled(format!("  {}", short.join("  ")), dim));
+                }
+            }
+        }
+        let block = Block::bordered().title(" Settings > Exclusion lists ").border_style(focus);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
+    }
+
     fn draw_dests(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
         let dim = Style::new().fg(Color::DarkGray);
         let mut items: Vec<ListItem> = vec![];
@@ -1719,7 +1978,7 @@ impl App {
             let link = get("link").as_str().map(|l| format!(", {l}")).unwrap_or_default();
             let link = match get("version").as_str() {
                 Some(v) => format!("{link}, version {v}"),
-                None if x.path.is_none() && get("state") == "online" => format!("{link}, older version"),
+                None if x.is_friend() && get("state") == "online" => format!("{link}, older version"),
                 None => link,
             };
             let there = match (get("used_there").as_u64(), get("quota_there").as_u64()) {
@@ -1731,12 +1990,18 @@ impl App {
             let head = Line::from(vec![
                 Span::styled(format!("{dot} "), Style::new().fg(color)),
                 Span::styled(format!("{:<18}", x.name), Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{}   {state}{link}", if x.path.is_some() { "drive " } else { "friend" })),
+                Span::raw(format!("{:<6}   {state}{link}", x.kind())),
                 Span::styled(off, Style::new().fg(Color::Yellow)),
             ]);
-            let second = match &x.path {
-                Some(p) => format!("    {}   {there}", p.display()),
-                None => format!(
+            let second = match (&x.path, &x.cloud) {
+                (Some(p), _) => format!("    {}   {there}", p.display()),
+                (_, Some(c)) => format!(
+                    "    bucket {} at {}   {there}{}",
+                    c.bucket,
+                    c.endpoint,
+                    if x.quota_gb > 0 { "" } else { " (no cap)" }
+                ),
+                _ => format!(
                     "    {there}   they use {} of {} GB here{}, last backup from them {}",
                     human(get("used_here").as_u64().unwrap_or(0)),
                     x.quota_gb,
@@ -1744,16 +2009,23 @@ impl App {
                     ago(get("last_in").as_i64())
                 ),
             };
+            let keeps = match &x.retention {
+                Some(r) if r.keep_days > 0 => format!(", keeps {} days of history", r.keep_days),
+                Some(r) => format!(", keeps its own history (last {})", r.keep_last),
+                None => String::new(),
+            };
             let third = format!(
-                "    automatic backups every {} min, last sent {}",
+                "    automatic backups every {} min, last sent {}{keeps}",
                 x.interval_secs(&self.cfg) / 60,
                 ago(get("last_out").as_i64())
             );
             items.push(ListItem::new(Text::from(vec![head, Line::raw(second), Line::styled(third, dim)])));
         }
-        let block = Block::bordered().title(" Destinations: friends' computers and local drives ").border_style(focus);
+        let block = Block::bordered()
+            .title(" Destinations: friends' computers, local drives and cloud storage ")
+            .border_style(focus);
         if items.is_empty() {
-            let text = "No destinations yet.\n\n  i  invite a friend (you send them a one-time code)\n  a  accept an invite a friend sent you\n  d  add a local drive or folder";
+            let text = "No destinations yet.\n\n  i  invite a friend (you send them a one-time code)\n  a  accept an invite a friend sent you\n  d  add a local drive or folder\n\nCloud storage (S3, B2 and the like) is added from the menu on the left.";
             f.render_widget(Paragraph::new(text).block(block), area);
         } else {
             if self.dests.selected().is_none() {
@@ -1761,6 +2033,32 @@ impl App {
             }
             f.render_stateful_widget(Self::cards(items, block, hl != Style::new()), area, &mut self.dests);
         }
+    }
+
+    /// The backup sets to restore from: the first thing Restore shows.
+    fn draw_restore_sets(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
+        let dim = Style::new().fg(Color::DarkGray);
+        let mut items: Vec<ListItem> = vec![];
+        for b in &self.cfg.sets {
+            let o = self.ov["sets"].as_array().and_then(|a| a.iter().find(|s| s["name"] == b.name.as_str()));
+            let size = match o.and_then(|o| o["files"].as_u64()) {
+                Some(n) => format!("{n} files, {}", human(o.and_then(|o| o["bytes"].as_u64()).unwrap_or(0))),
+                None => "not backed up yet".into(),
+            };
+            let head = Line::from(vec![
+                Span::styled(format!("{:<18}", b.name), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(size),
+                Span::styled(format!("   last backup {}", ago(o.and_then(|o| o["last"].as_i64()))), dim),
+            ]);
+            let files = if b.paths.is_empty() {
+                "no folders chosen".to_string()
+            } else {
+                b.paths.iter().map(|p| tilde(&p.to_string_lossy())).collect::<Vec<_>>().join(", ")
+            };
+            items.push(ListItem::new(Text::from(vec![head, Line::styled(format!("  {files}"), dim)])));
+        }
+        let block = Block::bordered().title(" Restore: choose a backup set ").border_style(focus);
+        f.render_stateful_widget(Self::cards(items, block, hl != Style::new()), area, &mut self.rsets);
     }
 
     fn draw_restore(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
@@ -1920,8 +2218,11 @@ impl App {
                 Kind::Set(n) | Kind::Dest(n) => n.clone(),
                 Kind::Rules(_) => "Schedule".into(),
                 Kind::Restore => "Restore".into(),
+                Kind::RestoreSet(n) => n.clone(),
                 Kind::Dests => "Destinations".into(),
                 Kind::Settings => "Settings".into(),
+                Kind::Excludes => "Exclusions".into(),
+                Kind::ExList(n) => n.clone(),
             })
             .collect();
         let title = if crumbs.is_empty() {
@@ -1949,7 +2250,9 @@ impl App {
             (BACKUP, Sub::Dests) => {
                 self.draw_set_dests(f, body, page_focus, if self.in_menu { Style::new() } else { hl })
             }
+            (SETTINGS, Sub::Excludes) => self.draw_excludes(f, body, page_focus),
             (BACKUP, Sub::Rules) | (SETTINGS, _) => self.draw_values(f, body, page_focus, row_hl),
+            (RESTORE, Sub::RestoreSets) => self.draw_restore_sets(f, body, page_focus, row_hl),
             (RESTORE, _) => self.draw_restore(f, body, page_focus, if self.in_menu { Style::new() } else { hl }),
             (DESTS, _) => self.draw_dests(f, body, page_focus, row_hl),
             _ => self.draw_text(f, body, page_focus),
@@ -1995,7 +2298,21 @@ impl App {
                     " Show only names containing (arrows or Enter: go to the list, Esc: clear) ".into()
                 }
                 Prompt::Drive => " Folder on the drive to back up into ".into(),
+                Prompt::Cloud(got) => format!(
+                    " Cloud storage {}/{}: {} ",
+                    got.len() + 1,
+                    CLOUD_STEPS.len(),
+                    CLOUD_STEPS[got.len().min(CLOUD_STEPS.len() - 1)]
+                ),
+                Prompt::ExNew(from) => format!(" Name for the new list (a copy of {from}) "),
+                Prompt::ExAdd(l) => format!(" Pattern to leave out with {l}, such as *.iso or build or /Users/me/tmp "),
+                Prompt::ExDelete(l) => format!(" Type yes to delete the list {l} (sets using it go back to Standard) "),
+                Prompt::DestKeep(n, "days") => format!(" Days of history kept on {n} (0 = unlimited) "),
+                Prompt::DestKeep(n, _) => format!(" Most recent restore points always kept on {n} "),
                 Prompt::Every(n) => format!(" Minutes between automatic backups to {n} (0 = default) "),
+                Prompt::Quota(n) if self.cfg.friends.iter().any(|f| &f.name == n && f.cloud.is_some()) => {
+                    format!(" Most GB to keep on {n} (0 = no cap); the oldest restore points there go first ")
+                }
                 Prompt::Quota(n) => format!(" GB that {n} may store on this computer "),
                 Prompt::InLimit(n) => format!(" Fastest {n} may send backups here, in KB/s (0 = unlimited) "),
                 Prompt::Remove(n) => format!(" Type yes to remove {n} (data already stored is left in place) "),
@@ -2014,8 +2331,13 @@ impl App {
                 centered(f.area(), 84, 5)
             };
             f.render_widget(Clear, area);
+            // A secret key is not echoed.
+            let shown = match prompt {
+                Prompt::Cloud(got) if got.len() + 1 == CLOUD_STEPS.len() => "*".repeat(text.chars().count()),
+                _ => text.clone(),
+            };
             f.render_widget(
-                Paragraph::new(format!("{text}_")).wrap(Wrap { trim: false }).block(Block::bordered().title(title)),
+                Paragraph::new(format!("{shown}_")).wrap(Wrap { trim: false }).block(Block::bordered().title(title)),
                 area,
             );
         }
@@ -2142,6 +2464,8 @@ pub async fn run(home: PathBuf) -> Result<()> {
         cfg: Config::new(String::new()),
         ov: Value::Null,
         stack: vec![(Kind::Root, 0)],
+        exlist: None,
+        rsets: ListState::default(),
         page: BACKUP,
         in_menu: true,
         sub: Sub::Sets,

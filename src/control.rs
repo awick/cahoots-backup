@@ -191,7 +191,14 @@ pub async fn serve(node: Arc<Node>, listener: UnixListener) {
 }
 
 pub async fn client(stream: UnixStream, cmd: &Cmd) -> Result<()> {
-    request(stream, cmd, &mut |l| println!("{l}")).await
+    // Whoever reads our output may stop early (`sdb snapshots | head`): leave quietly then.
+    request(stream, cmd, &mut |l| {
+        use std::io::Write;
+        if writeln!(std::io::stdout(), "{l}").is_err() {
+            std::process::exit(0);
+        }
+    })
+    .await
 }
 
 pub async fn request(stream: UnixStream, cmd: &Cmd, line: &mut (dyn FnMut(String) + Send)) -> Result<()> {

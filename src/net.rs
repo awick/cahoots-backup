@@ -174,7 +174,13 @@ pub async fn connect(ep: &Endpoint, mut addr: EndpointAddr) -> Result<Connection
     }
     match tokio::time::timeout(Duration::from_secs(15), ep.connect(addr, ALPN)).await {
         Ok(Ok(c)) => Ok(c),
-        Ok(Err(e)) if format!("{e:#}").to_lowercase().contains("alpn") => {
+        // A node that does not speak our protocol version refuses the handshake with TLS alert
+        // 120 (no_application_protocol), which QUIC reports as "handshake failed: error 120".
+        Ok(Err(e))
+            if ["error 120", "application protocol", "alpn"]
+                .iter()
+                .any(|w| format!("{e:#}").to_lowercase().contains(w)) =>
+        {
             bail!(
                 "connect failed: the other side runs an incompatible version of sdb; both need the same release ({e})"
             )
@@ -189,6 +195,7 @@ pub async fn connect(ep: &Endpoint, mut addr: EndpointAddr) -> Result<Connection
 pub enum Link {
     Remote(Connection),
     Drive(Arc<Store>, String),
+    Cloud(Arc<crate::cloud::Bucket>),
 }
 
 #[derive(Clone)]
@@ -292,13 +299,25 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 impl Peer {
     fn quota(&self) -> u64 {
-        self.friend.quota_gb.saturating_mul(1 << 30)
+        self.friend.quota_bytes()
+    }
+
+    fn cloud(&self) -> Option<Arc<crate::cloud::Bucket>> {
+        match &self.link {
+            Link::Cloud(b) => Some(b.clone()),
+            _ => None,
+        }
+    }
+
+    /// Names the destination in front of whatever went wrong there.
+    fn named<T>(&self, r: Result<T>) -> Result<T> {
+        r.map_err(|e| anyhow!("{}: {e:#}", self.friend.name))
     }
 
     fn store(&self) -> Option<(Arc<Store>, String)> {
         match &self.link {
             Link::Drive(st, me) => Some((st.clone(), me.clone())),
-            Link::Remote(_) => None,
+            _ => None,
         }
     }
 
@@ -320,8 +339,10 @@ impl Peer {
 
     /// "direct to 1.2.3.4:5", "through the relay" or "local drive".
     pub async fn describe_link(&self) -> String {
-        let Link::Remote(conn) = &self.link else {
-            return "local drive".into();
+        let conn = match &self.link {
+            Link::Remote(conn) => conn,
+            Link::Drive(..) => return "local drive".into(),
+            Link::Cloud(b) => return format!("cloud storage ({})", b.place),
         };
         // A new connection starts on the relay; give it a moment to find a direct path.
         for _ in 0..12 {
@@ -340,8 +361,9 @@ impl Peer {
         }
     }
 
+    /// Reached over the network, so the upload speed limit applies.
     pub fn is_remote(&self) -> bool {
-        matches!(self.link, Link::Remote(_))
+        !matches!(self.link, Link::Drive(..))
     }
 
     async fn open(&self, req: &Req, p: &Progress) -> Result<(Watch<SendStream>, Watch<RecvStream>)> {
@@ -396,6 +418,9 @@ impl Peer {
             .await?;
             return if set.len() as u64 > MAX_IDS { Err(implausible()) } else { Ok(set) };
         }
+        if let Some(b) = self.cloud() {
+            return self.named(b.list_chunks().await);
+        }
         let p = Progress::new();
         self.within(&p, async {
             let (mut s, mut r) = self.open(&Req::ListChunks, &p).await?;
@@ -424,6 +449,9 @@ impl Peer {
 
     /// Uploads chunks, bumping `tick` as the friend reports each piece it has read.
     pub async fn put_chunks_ticking(&self, items: &[&(Id, Vec<u8>)], tick: Option<Arc<AtomicU64>>) -> Result<()> {
+        if let Some(b) = self.cloud() {
+            return self.named(b.put_chunks(items, self.quota(), tick).await);
+        }
         if let Some((st, me)) = self.store() {
             let (items, quota): (Vec<(Id, Vec<u8>)>, _) = (items.iter().map(|&i| i.clone()).collect(), self.quota());
             let name = self.friend.name.clone();
@@ -464,6 +492,9 @@ impl Peer {
             let ids = ids.to_vec();
             return blocking(move || ids.iter().map(|id| st.get_chunk(&me, id)).collect()).await;
         }
+        if let Some(b) = self.cloud() {
+            return self.named(b.get_chunks(ids).await);
+        }
         let p = Progress::new();
         self.within(&p, async {
             let (mut s, mut r) = self.open(&Req::GetChunks { ids: ids.to_vec() }, &p).await?;
@@ -483,6 +514,9 @@ impl Peer {
             let ids = ids.to_vec();
             return blocking(move || st.delete_chunks(&me, &ids)).await;
         }
+        if let Some(b) = self.cloud() {
+            return self.named(b.delete_chunks(ids).await);
+        }
         for batch in ids.chunks(MAX_DELETE) {
             self.simple(Req::DeleteChunks { ids: batch.to_vec() }).await?;
         }
@@ -494,12 +528,18 @@ impl Peer {
             let (id, quota) = (id.to_string(), self.quota());
             return blocking(move || st.put_snapshot(&me, &id, &data, quota)).await?;
         }
+        if let Some(b) = self.cloud() {
+            return self.named(b.put_snapshot(id, data, self.quota()).await);
+        }
         self.simple(Req::PutSnapshot { id: id.into(), data }).await.map(|_| ())
     }
 
     pub async fn list_snapshots(&self) -> Result<Vec<(String, Vec<u8>)>> {
         if let Some((st, me)) = self.store() {
             return blocking(move || st.list_snapshots(&me)).await?;
+        }
+        if let Some(b) = self.cloud() {
+            return self.named(b.list_snapshots().await);
         }
         match self.simple(Req::ListSnapshots).await? {
             // Ids are the friend's word until the record decrypts: keep only well formed ones.
@@ -515,12 +555,15 @@ impl Peer {
             let id = id.to_string();
             return blocking(move || st.delete_snapshot(&me, &id)).await?;
         }
+        if let Some(b) = self.cloud() {
+            return self.named(b.delete_snapshot(id).await);
+        }
         self.simple(Req::DeleteSnapshot { id: id.into() }).await.map(|_| ())
     }
 
     /// The sdb release the destination runs; None for a drive or a node too old to say.
     pub async fn version(&self) -> Option<String> {
-        if !self.is_remote() {
+        if !matches!(self.link, Link::Remote(_)) {
             return None;
         }
         match self.simple(Req::Version).await {
@@ -529,9 +572,23 @@ impl Peer {
         }
     }
 
+    /// Usage counted afresh, for deciding by it right after deleting: cloud storage's running
+    /// figure does not drop until its next listing.
+    pub async fn usage_exact(&self) -> Result<(u64, u64)> {
+        match self.cloud() {
+            Some(b) => Ok((self.named(b.recount().await)?, self.quota())),
+            None => self.usage().await,
+        }
+    }
+
     pub async fn usage(&self) -> Result<(u64, u64)> {
         if let Some((st, me)) = self.store() {
             return Ok((blocking(move || st.usage(&me)).await??, self.quota()));
+        }
+        if let Some(b) = self.cloud() {
+            // Counting a large bucket takes a while: it runs to the end even if this caller gives up.
+            let used = tokio::spawn(async move { b.usage().await }).await.map_err(|e| anyhow!("{e}"))?;
+            return Ok((self.named(used)?, self.quota()));
         }
         match self.simple(Req::Usage).await? {
             Resp::Usage { used, quota } => Ok((used, quota)),
@@ -620,7 +677,7 @@ impl ProtocolHandler for Handler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let node = &self.0;
         let remote = conn.remote_id().to_string();
-        let is_friend = |n: &Node| n.cfg().friends.iter().any(|f| f.id == remote && f.path.is_none());
+        let is_friend = |n: &Node| n.cfg().friends.iter().any(|f| f.id == remote && f.is_friend());
         if !is_friend(node) {
             // An unknown node gets nothing, except one small, short pairing attempt while an invite is open.
             node.guard.rejected.fetch_add(1, Ordering::Relaxed);

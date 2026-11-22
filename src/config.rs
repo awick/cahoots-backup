@@ -79,6 +79,34 @@ pub struct Friend {
     /// at the same place is not mistaken for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drive_key: Option<String>,
+    /// Set for a cloud destination: an S3-compatible bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<Cloud>,
+    /// History rules for what is kept at this destination (absent = each set's own rules).
+    /// The per-file version limit does not apply here; that stays with the set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<Retention>,
+}
+
+fn d_region() -> String {
+    "us-east-1".into()
+}
+
+/// Where a cloud destination lives. The keys are stored here, in the private config.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Cloud {
+    pub endpoint: String,
+    pub bucket: String,
+    #[serde(default = "d_region")]
+    pub region: String,
+    /// Folder inside the bucket; this node's data goes under `<prefix>/<node id>/`.
+    #[serde(default)]
+    pub prefix: String,
+    pub access_key: String,
+    pub secret_key: String,
+    /// Address the bucket as `endpoint/bucket` instead of `bucket.endpoint` (MinIO and some others).
+    #[serde(default)]
+    pub path_style: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -129,6 +157,58 @@ pub struct BackupSet {
     /// Names this set had before; restore points made under them still belong to it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_names: Vec<String>,
+    /// The exclusion list this set uses (empty = Standard).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub exclude_list: String,
+    /// Folders and files inside this set's folders that were left out by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<PathBuf>,
+}
+
+/// A named list of patterns for things not worth backing up. Each set uses one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ExcludeList {
+    pub name: String,
+    pub patterns: Vec<String>,
+}
+
+pub const STANDARD: &str = "Standard";
+pub const DEVELOPER: &str = "Developer";
+
+/// Left out everywhere, whatever list a set uses: our own half-written restore files.
+pub const ALWAYS_EXCLUDED: &str = "**/*.sdb-tmp";
+
+/// The lists that come with sdb. They cannot be edited, only copied, so a later release
+/// can improve them. Nothing here is irreplaceable: caches, trash, and things a tool
+/// downloads or builds again. `.git` is in neither, since it can hold unpushed work.
+pub fn builtin_lists() -> Vec<ExcludeList> {
+    let standard = [
+        "**/.DS_Store",
+        "**/.Trash",
+        "**/.Trashes",
+        "**/.Trash-*",
+        "**/.Spotlight-V100",
+        "**/.fseventsd",
+        "**/.TemporaryItems",
+        "**/.DocumentRevisions-V100",
+        "**/Thumbs.db",
+        "**/Library/Caches",
+        "**/.cache",
+        "**/node_modules",
+        "**/__pycache__",
+        "**/*.pyc",
+    ];
+    let developer =
+        ["**/target", "**/build", "**/dist", "**/.venv", "**/.tox", "**/.gradle", "**/.mypy_cache", "**/.pytest_cache"];
+    let own = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    vec![
+        ExcludeList { name: STANDARD.into(), patterns: own(&standard) },
+        ExcludeList { name: DEVELOPER.into(), patterns: [own(&standard), own(&developer)].concat() },
+    ]
+}
+
+pub fn is_builtin_list(name: &str) -> bool {
+    builtin_lists().iter().any(|l| l.name.eq_ignore_ascii_case(name))
 }
 
 impl BackupSet {
@@ -208,8 +288,12 @@ pub struct Config {
     /// Older configs listed folders here; they move into the default set on load.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<PathBuf>,
-    #[serde(default)]
+    /// Older configs kept one list of patterns for everything; it becomes lists on load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+    /// Exclusion lists made here, next to the built-in ones.
+    #[serde(default)]
+    pub exclude_lists: Vec<ExcludeList>,
     #[serde(default)]
     pub retention: Retention,
     #[serde(default)]
@@ -241,7 +325,8 @@ impl Config {
             upnp: true,
             store_dir: None,
             paths: vec![],
-            exclude: vec!["**/.DS_Store".into(), "**/.Trash".into(), "**/*.sdb-tmp".into()],
+            exclude: vec![],
+            exclude_lists: vec![],
             retention: Retention::default(),
             version_rules: vec![],
             sets: vec![BackupSet { name: DEFAULT_SET.into(), ..Default::default() }],
@@ -262,6 +347,7 @@ impl Config {
             let old = std::mem::take(&mut c.paths);
             c.sets[0].paths.extend(old);
         }
+        c.adopt_lists();
         if c.format > CONFIG_FORMAT {
             anyhow::bail!(
                 "{} is in format {} but this sdb only reads up to {CONFIG_FORMAT}; upgrade sdb",
@@ -379,6 +465,53 @@ impl Config {
     pub fn set(&self, name: &str) -> Option<&BackupSet> {
         self.sets.iter().find(|s| s.name == name)
     }
+
+    /// Every exclusion list: the built-in ones, then this node's own.
+    pub fn lists(&self) -> Vec<ExcludeList> {
+        let mut v = builtin_lists();
+        v.extend(self.exclude_lists.iter().filter(|l| !is_builtin_list(&l.name)).cloned());
+        v
+    }
+
+    /// The list a set uses; one that no longer exists falls back to Standard.
+    pub fn list_for(&self, set: &BackupSet) -> ExcludeList {
+        let mut all = self.lists();
+        let at = all.iter().position(|l| l.name == set.exclude_list).unwrap_or(0);
+        all.swap_remove(at)
+    }
+
+    /// Turns the single pattern list of older configs into what replaced it: every set
+    /// uses Standard, folders left out by hand stay left out of the sets that hold them,
+    /// and patterns typed in by hand are kept in a list of their own.
+    fn adopt_lists(&mut self) {
+        let old = std::mem::take(&mut self.exclude);
+        let known = builtin_lists();
+        let mut custom = vec![];
+        for p in old {
+            let plain = p.replace('\\', "");
+            if p == ALWAYS_EXCLUDED || known.iter().any(|l| l.patterns.contains(&p)) {
+                continue;
+            }
+            if plain.starts_with('/') && !plain.contains(['*', '?', '[', '{']) {
+                let path = PathBuf::from(plain);
+                for b in self.sets.iter_mut().filter(|b| b.paths.iter().any(|r| path.starts_with(r))) {
+                    if !b.skip.contains(&path) {
+                        b.skip.push(path.clone());
+                    }
+                }
+            } else {
+                custom.push(p);
+            }
+        }
+        if !custom.is_empty() && !self.exclude_lists.iter().any(|l| l.name == "Custom") {
+            let mut patterns = known[0].patterns.clone();
+            patterns.extend(custom);
+            self.exclude_lists.push(ExcludeList { name: "Custom".into(), patterns });
+            for b in self.sets.iter_mut().filter(|b| b.exclude_list.is_empty()) {
+                b.exclude_list = "Custom".into();
+            }
+        }
+    }
 }
 
 impl Friend {
@@ -389,6 +522,24 @@ impl Friend {
             (0, Some(_)) => cfg.min_interval_secs,
             (n, _) => n as u64 * 60,
         }
+    }
+
+    /// Another person's node, as opposed to a drive or cloud storage of our own.
+    pub fn is_friend(&self) -> bool {
+        self.path.is_none() && self.cloud.is_none()
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match (&self.path, &self.cloud) {
+            (Some(_), _) => "drive",
+            (_, Some(_)) => "cloud",
+            _ => "friend",
+        }
+    }
+
+    /// The most this node may store there, in bytes. A cloud destination with no cap has no limit.
+    pub fn quota_bytes(&self) -> u64 {
+        if self.cloud.is_some() && self.quota_gb == 0 { u64::MAX } else { self.quota_gb.saturating_mul(1 << 30) }
     }
 }
 
@@ -408,8 +559,34 @@ mod tests {
             every_minutes: 0,
             max_in_kbps: 0,
             drive_key: None,
+            cloud: None,
+            retention: None,
             path: drive.then(|| PathBuf::from("/tmp")),
         }
+    }
+
+    #[test]
+    fn an_old_pattern_list_becomes_lists() {
+        let mut c = Config::new("x".into());
+        c.sets[0].paths.push("/home/me/docs".into());
+        c.sets.push(BackupSet { name: "other".into(), paths: vec!["/srv".into()], ..Default::default() });
+        c.exclude =
+            vec!["**/.DS_Store".into(), "**/*.sdb-tmp".into(), "/home/me/docs/big\\ stuff".into(), "**/*.iso".into()];
+        c.adopt_lists();
+        assert!(c.exclude.is_empty());
+        assert_eq!(c.sets[0].skip, vec![PathBuf::from("/home/me/docs/big stuff")]);
+        assert!(c.sets[1].skip.is_empty());
+        let mine = c.list_for(&c.sets[1]);
+        assert_eq!(mine.name, "Custom");
+        assert!(
+            mine.patterns.contains(&"**/*.iso".to_string()) && mine.patterns.contains(&"**/node_modules".to_string())
+        );
+        // A set pointing at a list that is gone uses Standard; built-in names cannot be taken over.
+        c.sets[1].exclude_list = "gone".into();
+        assert_eq!(c.list_for(&c.sets[1]).name, STANDARD);
+        c.exclude_lists.push(ExcludeList { name: "standard".into(), patterns: vec![] });
+        assert!(!c.list_for(&BackupSet::default()).patterns.is_empty());
+        assert!(!builtin_lists().iter().any(|l| l.patterns.iter().any(|p| p.contains(".git"))));
     }
 
     #[test]

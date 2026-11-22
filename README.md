@@ -1,9 +1,41 @@
+<p align="center">
+  <img src="assets/logo.svg" width="150" alt="Super Duper Backup: a backup drive wearing a cape">
+</p>
+
 # Super Duper Backup
 
 Encrypted, deduplicated backups between friends. Each person runs `sdb` on their
 Mac or Linux computer; you add each other with one-time invites and your
-computers back up to one another, and optionally to a local drive as well.
-Friends only ever hold ciphertext.
+computers back up to one another, and optionally to a local drive or a cloud
+bucket as well. Friends, and the cloud, only ever hold ciphertext.
+
+## Why this exists
+
+We loved CrashPlan for Home. Its best trick had nothing to do with its cloud:
+you could back up to a friend's computer, or to a drive of your own, for free.
+Everything was encrypted before it left your machine, it ran quietly in the
+background, and restoring a file was boring, which is the highest praise a
+backup program can earn.
+
+Then, in 2017, its maker announced it was leaving the home market, and the
+following year the service was switched off. The friend-to-friend backup went
+with it, and we were devastated. Nothing since has quite filled the gap. The
+cloud services want a monthly fee for every computer, forever. The good
+open-source tools assume you already have a server or a bucket, and that you
+are happy living on the command line.
+
+I meant to write a replacement for years and never had the months it would
+take. What changed is AI. With an AI coding assistant doing most of the typing,
+and me doing the deciding, the reviewing and the breaking, a project that never
+fitted into the evenings suddenly did. Super Duper Backup is the result: the
+part of CrashPlan Home we missed most, rebuilt for today. Invite a friend, swap
+some disk space, and let your computers look after each other.
+
+Most important: it is open source, it has CLI, TUI and GUI interfaces, and it
+is written in Rust instead of Java!!!
+
+It is new software, so treat it that way for now: run it next to whatever
+protects your files today. It is not affiliated with CrashPlan or its makers.
 
 ## Quick start
 
@@ -44,14 +76,20 @@ restore point shortly after files stop changing.
 | `sdb set NAME --to usb,barney --every 15 --hours 22-7 --versions 5 --days 90` | where a set goes, how often, when, and its own history rules |
 | `sdb sets` / `sdb backup --set NAME` | list sets / back up one set now |
 | `sdb drive NAME PATH` | also back up to an external drive or folder (encrypted the same way; skipped while unplugged) |
+| `sdb cloud NAME --endpoint URL --bucket B --access-key K` | also back up to cloud storage: any S3-compatible bucket (Amazon S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO); the secret key is asked for, never typed on the command line |
+| `sdb destination keep NAME --days 30 --last 5` | how much history one destination keeps, instead of each set's rules (`--default` goes back) |
 | `sdb every MINUTES [NAME]` | how often automatic backups go to one destination (friends default to 60 minutes, a new drive to 15) |
 | `sdb limit KBPS` | cap upload speed across friends (0 = unlimited) |
 | `sdb schedule 22-7` / `sdb schedule always` | hours of the day automatic backups may run |
 | `sdb pause [HOURS]` / `sdb resume` | hold automatic backups |
 | `sdb warn-after DAYS` | warn when a backup, yours or a friend's to you, is this stale (default 3) |
 | `sdb destinations` | list friends and drives |
-| `sdb destination quota NAME GB` | how much a friend may store on your computer |
+| `sdb destination quota NAME GB` | how much a friend may store on your computer; for cloud storage, the most you keep there (0 = no cap) |
 | `sdb destination limit NAME KBPS` | fastest a friend may send backups to your computer (0 = unlimited) |
+| `sdb exclude lists` | the exclusion lists, their patterns and which sets use them |
+| `sdb set NAME --exclude Developer` | the exclusion list a set uses (`Standard` unless you choose) |
+| `sdb exclude new NAME [--from LIST]` / `sdb exclude add LIST PATTERN` / `sdb exclude rm LIST PATTERN` / `sdb exclude delete LIST` | make and change lists of your own |
+| `sdb skip PATH [--remove]` | leave one folder or file out of the set that backs it up |
 | `sdb set NAME --rename NEW` | rename a backup set; its restore points stay with it |
 | `sdb destination backup-to NAME false` | stop using a destination |
 | `sdb verify --set NAME` | the same checks for one backup set (also on each set in the TUI and GUI) |
@@ -75,8 +113,8 @@ when each last got a backup), its schedule, and what it is doing right now.
 | --- | --- |
 | Backup | the backup sets and their status; create a set, choose its files, its destinations and its schedule and history rules, back up now |
 | Restore | browse files as of any restore point, search by name, step through time, list a file's versions, choose which destination to read from, restore |
-| Destinations | friends' computers and local drives: whether each is reachable and how, what you store there, what they store here; invite, accept an invite, add a drive, set pace and quota |
-| Settings | hours, pause, pace, upload limit, warnings and history rules that apply to every set |
+| Destinations | friends' computers, local drives and cloud storage: whether each is reachable and how, what you store there, what they store here; invite, accept an invite, add a drive or cloud storage, set pace, quota or cap, and how much history each keeps |
+| Settings | hours, pause, pace, upload limit, warnings and history rules that apply to every set; the exclusion lists |
 | History | what the daemon has done since it started |
 | Status | the full `sdb status` report |
 
@@ -149,6 +187,8 @@ stored once per friend no matter how many files or restore points use them.
 **Restore points.** Each backup is a complete, independent view of your folders
 that shares chunks with the others. Every destination a set is sent to holds a
 full copy. One that was offline or unplugged catches up on the next backup.
+Files put back exactly as they were earlier still make a new restore point, so
+`latest` is always the files as they are now.
 Destinations are backed up at their own pace (friends hourly, a new drive every
 15 minutes, unless you change it), so the same state can carry different ids on
 different destinations.
@@ -163,7 +203,33 @@ switches the set being edited and `n` creates one.
 restore points survive, `keep_days` caps their age, and `max_versions` (global
 or per pattern) removes older versions of a file from older restore points.
 Tagged restore points are exempt. Pruning then deletes unreferenced chunks at
-each friend.
+each destination. A destination can have history rules of its own
+(`sdb destination keep`), so a drive can keep two years while a cloud bucket
+keeps thirty days; the per-file version limit stays with the set.
+
+**Cloud storage.** A cloud destination is an S3-compatible bucket. It gets
+exactly what a friend gets, encrypted chunks and restore point records, under
+`<folder>/<your node id>/`, so the provider sees object sizes and timing and
+nothing else. Adding one first proves the keys can write, list and delete. The
+keys live in `config.toml` (private to your user) and travel in the recovery
+kit. The bucket runs none of our code, so your own node prunes it: it deletes
+the restore points that the rules no longer keep, lists the bucket, and deletes
+every chunk nothing refers to. Do not add expiry (lifecycle) rules to the
+bucket; the provider cannot tell which chunks newer restore points still share.
+A cap in GB (`sdb destination quota`) works like a friend's quota: when it is
+reached the oldest restore points there go first, never the newest of a set.
+Restores read from a local drive first, then friends, then the cloud, since
+cloud downloads usually cost money. Plain `http://` endpoints are only accepted
+on this computer itself.
+
+**What is left out.** Each set uses one exclusion list. `Standard` (the
+default) names things nobody wants back: trash, caches, `node_modules`,
+`__pycache__` and the like. `Developer` adds build output such as `target`,
+`build`, `dist` and `.venv`. Both come with sdb and can gain patterns in a later
+release; to change one, copy it into a list of your own. `.git` is in neither.
+A folder you untick in the file picker is left out of that set only. Leaving
+something out does not remove it from restore points made so far; it ages out
+under the history rules.
 
 **Quotas.** You set how many GB each friend may store on your computer; the
 store refuses anything beyond it. Because only the owner can tell which chunks
@@ -205,8 +271,8 @@ the kit the backups cannot be decrypted by anyone.
 ## Files
 
 Everything lives in `~/.super-duper-backup` (override with `SDB_HOME`):
-`config.toml`, `identity.key` (secret), `store/` (friends' encrypted data, move
-it with `store_dir`), `cache/`.
+`config.toml` (also holds any cloud storage keys), `identity.key` (secret),
+`store/` (friends' encrypted data, move it with `store_dir`), `cache/`.
 
 ## Limits worth knowing
 
@@ -230,7 +296,17 @@ git config --local core.hooksPath .githooks/   # once per clone: run the checks 
 `check.sh` runs `cargo fmt --check`, clippy with warnings as errors, the unit
 tests, and `tests/e2e.sh`, which starts three local nodes and a drive (no
 internet needed) and exercises pairing, backup, restore, sets, a refused
-stranger, corruption detection and repair, and pruning.
+stranger, corruption detection and repair, pruning and exclusion lists.
+
+`tests/damage.sh` is run by `check.sh` too. It ruins things on purpose and
+checks what happens: truncated, emptied, swapped and missing chunks, damaged
+restore point records, caches and config, odd file names, a file that changes
+mid-backup, a daemon killed mid-backup, a restore stopped half way, a friend
+with no room, and pruning while a friend is away.
+
+`tests/cloud.sh target/release/sdb` tests cloud destinations against a local S3
+emulator. It is separate because it needs MinIO (the `minio` program, or
+Docker to run it).
 
 ## License
 

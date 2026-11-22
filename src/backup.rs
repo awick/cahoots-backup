@@ -64,16 +64,30 @@ pub struct Excludes {
 }
 
 impl Excludes {
-    pub fn new(cfg: &Config, home: &Path) -> Result<Self> {
+    /// What one set leaves out: its exclusion list, what was left out of it by hand,
+    /// and always sdb's own folders.
+    pub fn new(cfg: &Config, set: &BackupSet, home: &Path) -> Result<Self> {
         let mut b = GlobSetBuilder::new();
-        for p in &cfg.exclude {
+        let list = cfg.list_for(set);
+        for p in list.patterns.iter().map(String::as_str).chain([crate::config::ALWAYS_EXCLUDED]) {
             b.add(Glob::new(p).map_err(|e| anyhow!("bad exclude pattern {p}: {e}"))?);
         }
-        Ok(Excludes { globs: b.build()?, dirs: vec![home.to_path_buf(), cfg.store_dir(home)] })
+        let mut dirs = vec![home.to_path_buf(), cfg.store_dir(home)];
+        dirs.extend(set.skip.iter().cloned());
+        Ok(Excludes { globs: b.build()?, dirs })
     }
 
+    /// For a walk that never enters a folder it has left out.
     pub fn is_excluded(&self, p: &Path) -> bool {
         self.dirs.iter().any(|d| p.starts_with(d)) || self.globs.is_match(p)
+    }
+
+    /// For a path met on its own, such as a file change below `root`: left out itself, or inside
+    /// something the walk from `root` would skip. Folders above the root are not looked at, as
+    /// the walk never meets them.
+    pub fn covers(&self, p: &Path, root: &Path) -> bool {
+        self.dirs.iter().any(|d| p.starts_with(d))
+            || p.ancestors().take_while(|a| a.starts_with(root)).any(|a| self.globs.is_match(a))
     }
 }
 
@@ -442,9 +456,17 @@ struct Target {
     peer: Peer,
     known: Arc<HashSet<Id>>,
     added: Vec<Id>,
-    snaps: Vec<(Vec<Id>, String, Vec<u8>)>,
+    /// The newest restore point of this set that the destination holds.
+    newest: Option<Newest>,
     failed: Option<String>,
     full: bool,
+}
+
+struct Newest {
+    at: (i64, u32),
+    index: Vec<Id>,
+    id: String,
+    blob: Vec<u8>,
 }
 
 /// One destination's share of the upload, taken at its own pace so that a slow
@@ -555,7 +577,8 @@ async fn run_set(
             return Ok(());
         }
         for f in full {
-            out.say(format!("  {} is at the quota they gave you, removing your oldest restore points there", f.name));
+            let whose = if f.cloud.is_some() { "the cap you set" } else { "the quota they gave you" };
+            out.say(format!("  {} is at {whose}, removing your oldest restore points there", f.name));
             if !node.evict(&f, out).await.unwrap_or(false) {
                 out.say(format!("  {}: quota is too small for even one restore point, skipping them", f.name));
                 skip.insert(f.id);
@@ -596,6 +619,7 @@ async fn run_once(
     let mut targets = vec![];
     let mut full = vec![];
     // All destinations are contacted at once, so a slow or silent one does not hold up the rest.
+    let names = &cfg;
     let probes = futures::future::join_all(friends.iter().map(|f| async move {
         let peer = node.peer_patient(f).await?;
         let (used, quota) = peer.usage().await?;
@@ -603,14 +627,22 @@ async fn run_once(
             return Ok(None);
         }
         let known = node.known(&peer, false).await?;
-        let snaps = peer
+        let newest = peer
             .list_snapshots()
             .await?
             .into_iter()
             .filter(|(id, _)| !gone.contains(id) && !gone.contains(&format!("{}|{id}", f.id)))
-            .filter_map(|(id, blob)| Some((node.open_manifest(&id, &blob).ok()?.index, id, blob)))
-            .collect();
-        Ok::<_, anyhow::Error>(Some(Target { peer, known, added: vec![], snaps, failed: None, full: false }))
+            .filter_map(|(id, blob)| {
+                let m = node.open_manifest(&id, &blob).ok()?;
+                (names.set_name_now(&m.set) == set.name).then_some(Newest {
+                    at: (m.time, m.nanos),
+                    index: m.index,
+                    id,
+                    blob,
+                })
+            })
+            .max_by_key(|n| n.at);
+        Ok::<_, anyhow::Error>(Some(Target { peer, known, added: vec![], newest, failed: None, full: false }))
     }))
     .await;
     for (f, probe) in friends.iter().zip(probes) {
@@ -638,7 +670,7 @@ async fn run_once(
     };
     let prev: HashMap<Vec<u8>, Entry> =
         node.load_last_index(&set.name).into_iter().map(|e| (e.path.clone(), e)).collect();
-    let ex = Excludes::new(&cfg, &node.home)?;
+    let ex = Excludes::new(&cfg, set, &node.home)?;
     let (name, roots, out2) = (set.name.clone(), set.paths.clone(), out.clone());
     let job = tokio::task::spawn_blocking(move || scan(name, roots, ex, prev, scanner, out2));
 
@@ -774,13 +806,30 @@ async fn run_once(
         writer: env!("CARGO_PKG_VERSION").into(),
         set: set.name.clone(),
     };
-    // A friend that missed an identical restore point gets that one rather than a new id.
+    // A destination is up to date only when its newest restore point of this set is this
+    // very state: files put back the way they were once still make a new restore point.
+    let needy: Vec<usize> = (0..targets.len())
+        .filter(|&i| {
+            let t = &targets[i];
+            t.failed.is_none() && (tag.is_some() || t.newest.as_ref().is_none_or(|n| n.index != scan.index))
+        })
+        .collect();
+    // A destination that missed an identical restore point gets that one rather than a new
+    // id, provided it would be the newest there too and was not dropped there on purpose.
     let existing = match &tag {
         None => targets
             .iter()
-            .flat_map(|t| &t.snaps)
-            .find(|(idx, _, _)| *idx == scan.index)
-            .map(|(_, id, blob)| (id.clone(), blob.clone())),
+            .filter_map(|t| t.newest.as_ref())
+            .filter(|n| n.index == scan.index)
+            .max_by_key(|n| n.at)
+            .filter(|n| {
+                needy.iter().all(|&i| {
+                    let t = &targets[i];
+                    t.newest.as_ref().is_none_or(|o| o.at < n.at)
+                        && !gone.contains(&format!("{}|{}", t.peer.friend.id, n.id))
+                })
+            })
+            .map(|n| (n.id.clone(), n.blob.clone())),
         Some(_) => None,
     };
     let (snap_id, sealed) = match existing {
@@ -792,14 +841,13 @@ async fn run_once(
         }
     };
     let mut stored = vec![];
-    for t in targets.iter_mut().filter(|t| t.failed.is_none()) {
-        if tag.is_some() || !t.snaps.iter().any(|(idx, _, _)| *idx == scan.index) {
-            match t.peer.put_snapshot(&snap_id, sealed.clone()).await {
-                Ok(()) => stored.push(t.peer.friend.name.clone()),
-                Err(e) => {
-                    t.full = format!("{e:#}").contains("quota exceeded");
-                    t.failed = Some(format!("{e:#}"));
-                }
+    for i in needy {
+        let t = &mut targets[i];
+        match t.peer.put_snapshot(&snap_id, sealed.clone()).await {
+            Ok(()) => stored.push(t.peer.friend.name.clone()),
+            Err(e) => {
+                t.full = format!("{e:#}").contains("quota exceeded");
+                t.failed = Some(format!("{e:#}"));
             }
         }
     }
@@ -978,13 +1026,29 @@ mod tests {
     #[test]
     fn excludes() {
         let mut cfg = Config::new("n".into());
-        cfg.exclude.push("**/node_modules".into());
-        let ex = Excludes::new(&cfg, Path::new("/home/me/.super-duper-backup")).unwrap();
+        let home = Path::new("/home/me/.super-duper-backup");
+        let mut set = BackupSet { skip: vec!["/home/me/proj/big".into()], ..Default::default() };
+        let ex = Excludes::new(&cfg, &set, home).unwrap();
         assert!(ex.is_excluded(Path::new("/home/me/proj/node_modules")));
         assert!(ex.is_excluded(Path::new("/home/me/.DS_Store")));
         assert!(ex.is_excluded(Path::new("/home/me/.super-duper-backup/store/x")));
+        assert!(ex.is_excluded(Path::new("/home/me/proj/big/file")));
+        assert!(ex.is_excluded(Path::new("/home/me/proj/a.sdb-tmp")));
         assert!(!ex.is_excluded(Path::new("/home/me/proj/src/main.rs")));
-        cfg.exclude.push("[".into());
-        assert!(Excludes::new(&cfg, Path::new("/x")).is_err());
+        assert!(!ex.is_excluded(Path::new("/home/me/proj/target/debug")));
+        assert!(!ex.is_excluded(Path::new("/home/me/proj/.git/config")));
+        set.exclude_list = crate::config::DEVELOPER.into();
+        let dev = Excludes::new(&cfg, &set, home).unwrap();
+        assert!(dev.is_excluded(Path::new("/home/me/proj/target")));
+        let proj = Path::new("/home/me/proj");
+        assert!(dev.covers(Path::new("/home/me/proj/target/debug/a.o"), proj));
+        assert!(!dev.covers(Path::new("/home/me/proj/src/main.rs"), proj));
+        // A set whose folder sits inside one with a listed name is still watched.
+        let kept = Path::new("/srv/build/reports");
+        assert!(!dev.covers(Path::new("/srv/build/reports/q3.txt"), kept));
+        assert!(dev.covers(Path::new("/srv/build/reports/dist/x"), kept));
+        cfg.exclude_lists.push(crate::config::ExcludeList { name: "mine".into(), patterns: vec!["[".into()] });
+        set.exclude_list = "mine".into();
+        assert!(Excludes::new(&cfg, &set, home).is_err());
     }
 }

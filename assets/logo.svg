@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Super Duper Backup">
+  <title>Super Duper Backup</title>
+  <!-- Copyright Andy Wick. SPDX-License-Identifier: Apache-2.0 -->
+  <!-- cape -->
+  <path d="M104 62 C48 78 18 146 26 230 C46 208 62 208 78 226 C92 206 110 204 126 220 C140 204 152 204 164 214 L172 96 Z" fill="#d7263d"/>
+  <path d="M104 62 C70 96 58 160 62 214 C68 212 74 218 78 226 C74 168 84 110 122 80 Z" fill="#a61b2e"/>
+  <!-- drive -->
+  <rect x="88" y="44" width="144" height="160" rx="24" fill="#1f2a44"/>
+  <rect x="102" y="58" width="116" height="92" rx="14" fill="#2f3e63"/>
+  <!-- padlock -->
+  <path d="M142 100 v-10 a18 18 0 0 1 36 0 v10" fill="none" stroke="#ffd166" stroke-width="9" stroke-linecap="round"/>
+  <rect x="132" y="98" width="56" height="42" rx="9" fill="#ffd166"/>
+  <circle cx="160" cy="114" r="6" fill="#1f2a44"/>
+  <rect x="157" y="114" width="6" height="15" rx="3" fill="#1f2a44"/>
+  <!-- light and vents -->
+  <circle cx="116" cy="177" r="8" fill="#3ddc97"/>
+  <rect x="138" y="166" width="80" height="8" rx="4" fill="#44557f"/>
+  <rect x="138" y="180" width="80" height="8" rx="4" fill="#44557f"/>
+  <!-- cape clasp -->
+  <circle cx="104" cy="62" r="11" fill="#ffd166"/>
+</svg>
