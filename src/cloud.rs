@@ -284,8 +284,8 @@ impl Bucket {
                 bail!("anyone can list {}: use a private bucket of your own", self.place);
             }
         }
-        let key = format!("{}sdb-check", self.base);
-        self.put(&key, b"sdb").await?;
+        let key = format!("{}cahoots-check", self.base);
+        self.put(&key, b"cahoots").await?;
         self.delete(&key).await
     }
 

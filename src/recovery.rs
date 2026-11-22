@@ -57,13 +57,13 @@ pub(crate) fn mark(home: &Path, cfg: &Config) -> Result<()> {
     config::write_private(&home.join(MARKER), &serde_json::to_vec(&m)?)
 }
 
-/// The file a computer's kit goes in unless another is named: NAME.sdb-recovery-kit.
+/// The file a computer's kit goes in unless another is named: NAME.cahoots-recovery-kit.
 pub fn file_name(name: &str) -> String {
     let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect();
-    format!("{}.{EXT}", if safe.is_empty() { "sdb" } else { &safe })
+    format!("{}.{EXT}", if safe.is_empty() { "cahoots" } else { &safe })
 }
 
-pub const EXT: &str = "sdb-recovery-kit";
+pub const EXT: &str = "cahoots-recovery-kit";
 
 /// Where a kit is offered to be kept: on a Mac the Documents folder, which iCloud Drive
 /// carries off the computer when it is set to.

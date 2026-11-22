@@ -60,14 +60,14 @@ jobs:
         run: cargo build --profile dist --locked --target ${{ matrix.target }}
       - name: Package
         run: |
-          dir=sdb-${{ needs.version.outputs.version }}-${{ matrix.name }}
+          dir=cahoots-${{ needs.version.outputs.version }}-${{ matrix.name }}
           mkdir "$dir"
-          cp target/${{ matrix.target }}/dist/sdb LICENSE README.md "$dir/"
+          cp target/${{ matrix.target }}/dist/cahoots LICENSE README.md "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: sdb-*.tar.gz
+          path: cahoots-*.tar.gz
           if-no-files-found: error
 
   publish:
@@ -86,9 +86,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          sha256sum sdb-*.tar.gz >SHA256SUMS
+          sha256sum cahoots-*.tar.gz >SHA256SUMS
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Super Duper Backup $VERSION" --generate-notes sdb-*.tar.gz SHA256SUMS
+            --title "Cahoots Backup $VERSION" --generate-notes cahoots-*.tar.gz SHA256SUMS
 
   # One image per kind of processor, each built on a runner of that kind, then joined
   # under one name so `docker pull` picks the right one.

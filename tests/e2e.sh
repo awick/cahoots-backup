@@ -1,18 +1,18 @@
 #!/bin/sh
 # End-to-end test: three local nodes and a drive, no internet needed.
-# Usage: tests/e2e.sh path/to/sdb
+# Usage: tests/e2e.sh path/to/cahoots
 set -eu
-SDB=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-T=$(mktemp -d /tmp/sdb-e2e.XXXXXX)
-export SDB_OFFLINE=1
+CAHOOTS=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+T=$(mktemp -d /tmp/cahoots-e2e.XXXXXX)
+export CAHOOTS_OFFLINE=1
 fail() { echo "FAILED: $1" >&2; exit 1; }
 step() { echo "  $1"; }
 # Every command talks to that node's daemon, starting it when needed.
-a() { SDB_HOME=$T/alice "$SDB" "$@"; }
-b() { SDB_HOME=$T/bob "$SDB" "$@"; }
-m() { SDB_HOME=$T/mallory "$SDB" "$@"; }
+a() { CAHOOTS_HOME=$T/alice "$CAHOOTS" "$@"; }
+b() { CAHOOTS_HOME=$T/bob "$CAHOOTS" "$@"; }
+m() { CAHOOTS_HOME=$T/mallory "$CAHOOTS" "$@"; }
 # Alice again, on the computer set up from her recovery kit.
-r() { SDB_HOME=$T/again "$SDB" "$@"; }
+r() { CAHOOTS_HOME=$T/again "$CAHOOTS" "$@"; }
 cleanup() {
     r stop >/dev/null 2>&1 || true
     a stop >/dev/null 2>&1 || true
@@ -21,7 +21,7 @@ cleanup() {
     rm -rf "$T"
 }
 trap cleanup EXIT
-invite() { "$@" invite | grep -o 'sdb1[a-z0-9]*'; }
+invite() { "$@" invite | grep -o 'cahoots1[a-z0-9]*'; }
 
 cd "$T"
 mkdir -p data/sub photos drive
@@ -36,6 +36,9 @@ b status >/dev/null
 step "pairing"
 a join "$(invite b)" | grep -q "Paired with bob" || fail "pairing"
 b friends | grep -q alice || fail "pairing was not mutual"
+# Both ways at once: the side that made the invite reaches its new friend without a restart.
+a status | grep -q "^  bob  *online" || fail "the joining side cannot reach its new friend"
+b status | grep -q "^  alice  *online" || fail "the inviting side cannot reach its new friend"
 
 step "backup, change, backup"
 head -c 3000000 /dev/urandom >data/big
@@ -66,7 +69,7 @@ mv mallory/c2 mallory/config.toml
 m add data >/dev/null
 m backup >mallory.out 2>&1 && fail "a stranger was allowed to back up"
 grep -q "unreachable" mallory.out || fail "unexpected stranger result"
-m join "sdb1$(printf 'a%.0s' $(seq 1 90))" >/dev/null 2>&1 && fail "a bogus invite was accepted"
+m join "cahoots1$(printf 'a%.0s' $(seq 1 90))" >/dev/null 2>&1 && fail "a bogus invite was accepted"
 
 step "drive destination and a second set"
 a drive usb drive >/dev/null
@@ -163,14 +166,14 @@ a backup --set default | grep -q "created on .*bob" || fail "bob did not get the
 
 step "the recovery kit, and knowing whether there is one"
 a status | grep -q "recovery kit: never exported" || fail "a kit that was never written should say so"
-SDB_PASSPHRASE=correct-horse a recovery export "$T/kit.json" >/dev/null 2>&1 && fail "a short passphrase was accepted"
-SDB_PASSPHRASE="my horse eats batteries" a recovery export "$T/kit.json" >/dev/null || fail "recovery export"
-(mkdir "$T/cwd" && cd "$T/cwd" && SDB_PASSPHRASE="my horse eats batteries" a recovery export >/dev/null) || fail "export with no file named"
-[ -f "$T/cwd/alice.sdb-recovery-kit" ] || fail "the kit was not named for the computer"
+CAHOOTS_PASSPHRASE=correct-horse a recovery export "$T/kit.json" >/dev/null 2>&1 && fail "a short passphrase was accepted"
+CAHOOTS_PASSPHRASE="my horse eats batteries" a recovery export "$T/kit.json" >/dev/null || fail "recovery export"
+(mkdir "$T/cwd" && cd "$T/cwd" && CAHOOTS_PASSPHRASE="my horse eats batteries" a recovery export >/dev/null) || fail "export with no file named"
+[ -f "$T/cwd/alice.cahoots-recovery-kit" ] || fail "the kit was not named for the computer"
 a status | grep -q "recovery kit: exported .* up to date" || fail "status does not know the kit"
-SDB_PASSPHRASE=wrong-horse-9 SDB_HOME=$T/again "$SDB" recovery import "$T/kit.json" >/dev/null 2>&1 &&
+CAHOOTS_PASSPHRASE=wrong-horse-9 CAHOOTS_HOME=$T/again "$CAHOOTS" recovery import "$T/kit.json" >/dev/null 2>&1 &&
     fail "a wrong passphrase opened the kit"
-SDB_PASSPHRASE="my horse eats batteries" SDB_HOME=$T/again "$SDB" recovery import "$T/kit.json" | grep -q 'Recovered "alice"' ||
+CAHOOTS_PASSPHRASE="my horse eats batteries" CAHOOTS_HOME=$T/again "$CAHOOTS" recovery import "$T/kit.json" | grep -q 'Recovered "alice"' ||
     fail "recovery import"
 [ -f "$T/again/identity.key" ] || fail "the recovered folder has no identity"
 # The old computer is gone; the new one gets the files back from the friend alone.
@@ -182,32 +185,32 @@ r stop >/dev/null
 
 step "a copy of the kit kept up to date in a folder"
 mkdir synced
-SDB_PASSPHRASE=too-short a recovery copy-to synced >/dev/null 2>&1 && fail "a short passphrase was accepted for the copy"
-SDB_PASSPHRASE="my horse eats batteries" a recovery copy-to synced >/dev/null || fail "starting the copy"
-KIT=synced/alice.sdb-recovery-kit
+CAHOOTS_PASSPHRASE=too-short a recovery copy-to synced >/dev/null 2>&1 && fail "a short passphrase was accepted for the copy"
+CAHOOTS_PASSPHRASE="my horse eats batteries" a recovery copy-to synced >/dev/null || fail "starting the copy"
+KIT=synced/alice.cahoots-recovery-kit
 [ -f "$KIT" ] || fail "the copy is not named for the computer: $(ls synced)"
 grep -q '"data"' "$KIT" || fail "the copy is not a kit"
 grep -q "master" "$KIT" && fail "the copy is not sealed"
 a status | grep -q "a copy is kept in .*synced" || fail "status does not mention the copy"
 a name alice2 >/dev/null
 a recovery copy-to --now >/dev/null || fail "writing the copy again"
-[ -f synced/alice2.sdb-recovery-kit ] || fail "the copy did not follow the new name"
+[ -f synced/alice2.cahoots-recovery-kit ] || fail "the copy did not follow the new name"
 [ ! -e "$KIT" ] || fail "the copy under the old name was left behind"
 a name alice >/dev/null
 a recovery copy-to --now >/dev/null
 a recovery copy-to --now >/dev/null
 [ "$(ls synced | wc -l | tr -d ' ')" = 2 ] || fail "expected the kit and the one before it, found: $(ls synced | tr '\n' ' ')"
 [ -f "$KIT.before" ] || fail "the kit before this one was not kept"
-SDB_PASSPHRASE="my horse eats batteries" SDB_HOME=$T/fromcopy "$SDB" recovery import "$KIT" | grep -q 'Recovered "alice"' ||
+CAHOOTS_PASSPHRASE="my horse eats batteries" CAHOOTS_HOME=$T/fromcopy "$CAHOOTS" recovery import "$KIT" | grep -q 'Recovered "alice"' ||
     fail "recovering from the copy"
 # Bob, renamed to alice, shares the folder: his kit must not replace hers.
 b name alice >/dev/null
-SDB_PASSPHRASE="my horse eats batteries" b recovery copy-to synced >/dev/null || fail "a second computer of the same name"
-ls synced/alice-*.sdb-recovery-kit >/dev/null 2>&1 || fail "the second computer's kit has no name of its own: $(ls synced)"
-SDB_PASSPHRASE="my horse eats batteries" SDB_HOME=$T/fromcopy2 "$SDB" recovery import "$KIT" >/dev/null || fail "her kit was replaced"
+CAHOOTS_PASSPHRASE="my horse eats batteries" b recovery copy-to synced >/dev/null || fail "a second computer of the same name"
+ls synced/alice-*.cahoots-recovery-kit >/dev/null 2>&1 || fail "the second computer's kit has no name of its own: $(ls synced)"
+CAHOOTS_PASSPHRASE="my horse eats batteries" CAHOOTS_HOME=$T/fromcopy2 "$CAHOOTS" recovery import "$KIT" >/dev/null || fail "her kit was replaced"
 cmp -s "$T/fromcopy2/identity.key" "$T/alice/identity.key" || fail "her kit is no longer hers"
 b recovery copy-to --off >/dev/null
-rm -f synced/alice-*.sdb-recovery-kit*
+rm -f synced/alice-*.cahoots-recovery-kit*
 b name bob >/dev/null
 rmdir_test=$T/synced.gone
 mv synced "$rmdir_test"

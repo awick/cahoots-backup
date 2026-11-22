@@ -280,9 +280,9 @@ fn notify_desktop(text: &str) {
     let text = text.replace(['"', '\\'], "'");
     let _ = if cfg!(target_os = "macos") {
         std::process::Command::new("osascript")
-            .args(["-e", &format!("display notification \"{text}\" with title \"Super Duper Backup\"")])
+            .args(["-e", &format!("display notification \"{text}\" with title \"Cahoots Backup\"")])
             .output()
     } else {
-        std::process::Command::new("notify-send").args(["--", "Super Duper Backup", &text]).output()
+        std::process::Command::new("notify-send").args(["--", "Cahoots Backup", &text]).output()
     };
 }

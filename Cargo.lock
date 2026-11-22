@@ -480,6 +480,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
+name = "cahoots-backup"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "blake3",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "data-encoding",
+ "eframe",
+ "fastcdc",
+ "fs2",
+ "futures",
+ "globset",
+ "hex",
+ "iroh",
+ "notify",
+ "postcard",
+ "rand 0.10.4",
+ "ratatui",
+ "reqwest",
+ "rfd",
+ "rpassword",
+ "rustix 1.1.6",
+ "rustls",
+ "rusty-s3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "url",
+ "walkdir",
+ "zstd",
+]
+
+[[package]]
 name = "calloop"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5438,43 +5475,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "super-duper-backup"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "argon2",
- "blake3",
- "chacha20poly1305",
- "chrono",
- "clap",
- "data-encoding",
- "eframe",
- "fastcdc",
- "fs2",
- "futures",
- "globset",
- "hex",
- "iroh",
- "notify",
- "postcard",
- "rand 0.10.4",
- "ratatui",
- "reqwest",
- "rfd",
- "rpassword",
- "rustix 1.1.6",
- "rustls",
- "rusty-s3",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "url",
- "walkdir",
- "zstd",
-]
 
 [[package]]
 name = "syn"

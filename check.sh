@@ -12,7 +12,7 @@ if [ "${1:-}" = quick ]; then
     exit 0
 fi
 echo "== build" && cargo build --release --quiet
-echo "== end to end" && sh tests/e2e.sh target/release/sdb
-echo "== damage and failures" && sh tests/damage.sh target/release/sdb
-echo "== cloud storage" && SDB_TEST_S3=mini sh tests/cloud.sh target/release/sdb
+echo "== end to end" && sh tests/e2e.sh target/release/cahoots
+echo "== damage and failures" && sh tests/damage.sh target/release/cahoots
+echo "== cloud storage" && CAHOOTS_TEST_S3=mini sh tests/cloud.sh target/release/cahoots
 echo "all checks passed"

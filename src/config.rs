@@ -9,11 +9,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// A setting from the environment: CAHOOTS_<name>, or SDB_<name>, as it was called while
+/// the program was still Super Duper Backup (`sdb`).
+pub fn env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("CAHOOTS_{name}")).or_else(|| std::env::var_os(format!("SDB_{name}")))
+}
+
+/// The same, as text.
+pub fn env_text(name: &str) -> Option<String> {
+    env(name).and_then(|v| v.into_string().ok())
+}
+
+/// Where a node keeps itself unless told otherwise: ~/.cahoots, or the folder an install
+/// from before the rename already lives in.
+pub fn default_home() -> PathBuf {
+    let user = PathBuf::from(std::env::var_os("HOME").expect("HOME is not set"));
+    let (new, old) = (user.join(".cahoots"), user.join(".super-duper-backup"));
+    if !new.exists() && old.join("identity.key").exists() { old } else { new }
+}
+
 pub fn home() -> PathBuf {
-    if let Some(h) = std::env::var_os("SDB_HOME") {
-        return h.into();
+    match env("HOME") {
+        Some(h) => h.into(),
+        None => default_home(),
     }
-    PathBuf::from(std::env::var_os("HOME").expect("HOME is not set")).join(".super-duper-backup")
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -182,7 +201,7 @@ pub const DEVELOPER: &str = "Developer";
 /// Left out everywhere, whatever list a set uses: our own half-written restore files.
 pub const ALWAYS_EXCLUDED: &str = "**/*.sdb-tmp";
 
-/// The lists that come with sdb. They cannot be edited, only copied, so a later release
+/// The lists that come with cahoots. They cannot be edited, only copied, so a later release
 /// can improve them. Nothing here is irreplaceable: caches, trash, and things a tool
 /// downloads or builds again. `.git` is in neither, since it can hold unpushed work.
 pub fn builtin_lists() -> Vec<ExcludeList> {
@@ -349,8 +368,8 @@ impl Config {
 
     pub fn load(home: &Path) -> Result<Self> {
         let p = home.join("config.toml");
-        let s =
-            fs::read_to_string(&p).with_context(|| format!("cannot read {} (run `sdb init` first)", p.display()))?;
+        let s = fs::read_to_string(&p)
+            .with_context(|| format!("cannot read {} (run `cahoots init` first)", p.display()))?;
         let mut c: Config = toml::from_str(&s).with_context(|| format!("bad config {}", p.display()))?;
         if c.sets.is_empty() {
             c.sets.push(BackupSet { name: DEFAULT_SET.into(), ..Default::default() });
@@ -362,7 +381,7 @@ impl Config {
         c.adopt_lists();
         if c.format > CONFIG_FORMAT {
             anyhow::bail!(
-                "{} is in format {} but this sdb only reads up to {CONFIG_FORMAT}; upgrade sdb",
+                "{} is in format {} but this cahoots only reads up to {CONFIG_FORMAT}; upgrade cahoots",
                 p.display(),
                 c.format
             );

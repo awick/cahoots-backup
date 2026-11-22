@@ -429,7 +429,7 @@ impl Node {
     fn own_list(&self, name: &str) -> Result<String> {
         let c = self.cfg();
         let l = c.exclude_lists.iter().find(|l| l.name.eq_ignore_ascii_case(name.trim()));
-        Ok(l.ok_or_else(|| anyhow!("no exclusion list named {name}; see `sdb exclude lists`"))?.name.clone())
+        Ok(l.ok_or_else(|| anyhow!("no exclusion list named {name}; see `cahoots exclude lists`"))?.name.clone())
     }
 }
 
@@ -622,7 +622,7 @@ impl Node {
             return Ok(());
         }
         bail!(
-            "{}: the disk at {} is not the one that was added; to use this one run `sdb drive {} {}`",
+            "{}: the disk at {} is not the one that was added; to use this one run `cahoots drive {} {}`",
             f.name,
             dir.display(),
             f.name,
@@ -825,7 +825,7 @@ impl Node {
                             id,
                             &b.ok_or_else(|| {
                                 anyhow!(
-                                    "{} has a missing or damaged piece of this file (run `sdb verify` to repair)",
+                                    "{} has a missing or damaged piece of this file (run `cahoots verify` to repair)",
                                     f.name
                                 )
                             })?,
@@ -1095,7 +1095,7 @@ impl Node {
 
     /// Removes from one destination the restore points of sets that are no longer sent
     /// there, then the chunks nothing left there needs. Named restore points stay, as do
-    /// those of sets that no longer exist: `sdb forget` removes either.
+    /// those of sets that no longer exist: `cahoots forget` removes either.
     async fn clean_dest(&self, name: &str, dry_run: bool, out: &Out) -> Result<()> {
         let cfg = self.cfg();
         let f = cfg.friends.iter().find(|f| f.name == name).cloned();
@@ -1114,7 +1114,7 @@ impl Node {
                     held.push(Snap { id, m, peers: vec![(f.clone(), index)] });
                 }
                 // What cannot be read cannot be judged: nothing is deleted on a guess.
-                Err(_) => bail!("{name}: restore point {id} is damaged; run `sdb verify` first"),
+                Err(_) => bail!("{name}: restore point {id} is damaged; run `cahoots verify` first"),
             }
         }
         held.sort_by_key(|s| (s.m.time, s.m.nanos));
@@ -1138,7 +1138,9 @@ impl Node {
         }
         let named = stay.iter().filter(|s| s.m.tag.is_some() && !sent(s)).count();
         if named > 0 {
-            out.say(format!("  {named} named restore points of those sets stay on {name}; `sdb forget` removes one"));
+            out.say(format!(
+                "  {named} named restore points of those sets stay on {name}; `cahoots forget` removes one"
+            ));
         }
         if go.is_empty() {
             out.say(format!(
@@ -1562,7 +1564,7 @@ impl Node {
         }
         if lost > 0 {
             bail!(
-                "{lost} chunks could not be repaired from a friend. Run `sdb backup`: anything still unchanged on this computer is uploaded again. Then run `sdb verify` once more."
+                "{lost} chunks could not be repaired from a friend. Run `cahoots backup`: anything still unchanged on this computer is uploaded again. Then run `cahoots verify` once more."
             );
         }
         if !unchecked.is_empty() {
@@ -1616,7 +1618,7 @@ impl Node {
         // misbehaving than damaged; sending it all again, perhaps out of paid storage, waits for the user.
         if !full && bad.len() > MAX_SAMPLED_REPAIR {
             bail!(
-                "lists {} chunks, but {} of the {} it should hold are missing; nothing was copied. If it really lost them, `sdb verify --full` copies them back from another destination",
+                "lists {} chunks, but {} of the {} it should hold are missing; nothing was copied. If it really lost them, `cahoots verify --full` copies them back from another destination",
                 listed,
                 bad.len(),
                 refs.len()
@@ -1695,7 +1697,7 @@ impl Node {
         let (checked, bad) = tokio::task::spawn_blocking(move || backup::check_local(&keys, last, &out2)).await?;
         if bad > 0 {
             bail!(
-                "{bad} of {checked} unmodified files no longer match their backup. Restore good copies with `sdb restore latest <file> --to <dir>` before the next backup replaces them."
+                "{bad} of {checked} unmodified files no longer match their backup. Restore good copies with `cahoots restore latest <file> --to <dir>` before the next backup replaces them."
             );
         }
         out.say(format!("{checked} unmodified files re-read and fingerprinted, all match their backup"));
@@ -1977,11 +1979,11 @@ impl Node {
         if !c.all_paths().is_empty() && c.friends.iter().any(|f| f.backup_to) {
             match crate::recovery::state(&self.home, &c) {
                 crate::recovery::Kit::Never => w.push(
-                    "no recovery kit yet: without one, losing this computer loses your backups (sdb recovery export)"
+                    "no recovery kit yet: without one, losing this computer loses your backups (cahoots recovery export)"
                         .into(),
                 ),
                 crate::recovery::Kit::Stale(_) => w.push(
-                    "the recovery kit is older than your newest friend or drive: export it again (sdb recovery export)"
+                    "the recovery kit is older than your newest friend or drive: export it again (cahoots recovery export)"
                         .into(),
                 ),
                 crate::recovery::Kit::Current(_) => {}

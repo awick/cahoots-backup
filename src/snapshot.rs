@@ -54,7 +54,7 @@ pub struct Manifest {
     pub new_bytes: u64,
     pub tag: Option<String>,
     pub thinned: u64,
-    /// The sdb release that wrote this restore point.
+    /// The cahoots release that wrote this restore point.
     pub writer: String,
     /// The backup set this restore point belongs to.
     pub set: String,
@@ -108,7 +108,9 @@ pub fn decode_manifest(buf: &[u8]) -> Result<Manifest> {
             })
         }
         Some(v) => {
-            bail!("restore point is in format {v} but this sdb only reads up to format {MANIFEST_FORMAT}; upgrade sdb")
+            bail!(
+                "restore point is in format {v} but this cahoots only reads up to format {MANIFEST_FORMAT}; upgrade cahoots"
+            )
         }
         None => bail!("empty restore point"),
     }
@@ -129,7 +131,11 @@ pub fn decode_index(mut buf: &[u8]) -> Result<Vec<Entry>> {
         bail!("not a snapshot index");
     }
     if buf[4] != INDEX_MAGIC[4] {
-        bail!("snapshot index is in format {} but this sdb only reads format {}; upgrade sdb", buf[4], INDEX_MAGIC[4]);
+        bail!(
+            "snapshot index is in format {} but this cahoots only reads format {}; upgrade cahoots",
+            buf[4],
+            INDEX_MAGIC[4]
+        );
     }
     buf = &buf[5..];
     let mut out = Vec::new();

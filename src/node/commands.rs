@@ -82,7 +82,7 @@ impl Node {
         Ok(())
     }
 
-    /// Which build the running daemon is, so a newer `sdb` can tell it to make way.
+    /// Which build the running daemon is, so a newer `cahoots` can tell it to make way.
     pub(super) async fn hello(&self, out: &Out) -> Result<()> {
         out.say(crate::control::started_fingerprint());
         Ok(())
@@ -124,7 +124,7 @@ impl Node {
             if self.watching {
                 "running (watching for changes)"
             } else {
-                "not running (files are not watched; back up by hand or run `sdb service install`)"
+                "not running (files are not watched; back up by hand or run `cahoots service install`)"
             }
         ));
         out.say(if crate::service::in_container() {
@@ -132,7 +132,11 @@ impl Node {
         } else if crate::service::installed() {
             "at login: the daemon starts by itself (service installed)".to_string()
         } else {
-            "at login: the daemon is not started (run `sdb service install`)".to_string()
+            if crate::service::outdated() {
+                "at login: the service is from before the rename and starts the old program; run `cahoots service install` to replace it".to_string()
+            } else {
+                "at login: the daemon is not started (run `cahoots service install`)".to_string()
+            }
         });
         let (relay, addrs) = net::my_addrs(&self.endpoint);
         let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
@@ -154,7 +158,7 @@ impl Node {
             out.say(format!("max incoming: {} MB/s", mbps(c.incoming_kbps)));
         }
         if !c.accept_backups {
-            out.say("friends:  cannot back up to this computer (sdb accept on to allow it)");
+            out.say("friends:  cannot back up to this computer (cahoots accept on to allow it)");
         }
         out.say(format!("recovery kit: {}", crate::recovery::state(&self.home, &c).describe().0));
         if let Some(c) = crate::recovery::copy_load(&self.home) {
@@ -245,19 +249,20 @@ impl Node {
         }
         let (relay, addrs) = net::my_addrs(&self.endpoint);
         let t = Ticket { id: *self.endpoint.id().as_bytes(), relay, addrs, token };
-        let ticket = format!("sdb1{}", data_encoding::BASE32_NOPAD.encode(&postcard::to_stdvec(&t)?).to_lowercase());
+        let ticket =
+            format!("cahoots1{}", data_encoding::BASE32_NOPAD.encode(&postcard::to_stdvec(&t)?).to_lowercase());
         let waiter = self.paired.notified();
         tokio::pin!(waiter);
         waiter.as_mut().enable();
         out.say("Send this one-time invite to your friend (valid for 24 hours, treat it like a password):");
         out.say("");
-        out.say(format!("  sdb join {ticket}"));
+        out.say(format!("  cahoots join {ticket}"));
         out.say("");
         if self.daemon {
             out.say("The daemon will accept it whenever they join.");
         } else {
             out.say(
-                "Waiting for your friend to join (Ctrl-C to stop; run `sdb daemon` to accept in the background)...",
+                "Waiting for your friend to join (Ctrl-C to stop; run `cahoots daemon` to accept in the background)...",
             );
             if tokio::time::timeout(Duration::from_secs(86400), waiter).await.is_ok() {
                 let c = self.cfg();
@@ -268,7 +273,12 @@ impl Node {
     }
 
     pub(super) async fn join(&self, ticket: &str, out: &Out) -> Result<()> {
-        let raw = ticket.trim().strip_prefix("sdb1").ok_or_else(|| anyhow!("that is not an sdb invite"))?;
+        // Invites made before the rename began with "sdb1".
+        let text = ticket.trim();
+        let raw = text
+            .strip_prefix("cahoots1")
+            .or_else(|| text.strip_prefix("sdb1"))
+            .ok_or_else(|| anyhow!("that is not a cahoots invite"))?;
         let bytes =
             data_encoding::BASE32_NOPAD.decode(raw.to_uppercase().as_bytes()).map_err(|_| anyhow!("damaged invite"))?;
         let t: Ticket = postcard::from_bytes(&bytes).map_err(|_| anyhow!("damaged invite"))?;
@@ -301,6 +311,11 @@ impl Node {
         let theirs = peer.pair(Req::Pair { token: t.token, name: self.cfg().name, relay, addrs }).await?;
         let name = self.update(|c| add_friend(c, &id, &theirs, relay_hint, hints))?;
         self.store.allow(&id);
+        // The friend keeps this connection for its own requests to us, so they are answered on
+        // it from now on: without that it would see us as unreachable until one side restarted.
+        if let Some(me) = self.me.upgrade() {
+            tokio::spawn(net::serve_conn(me, conn.clone(), id.clone()));
+        }
         self.conns.lock().unwrap().insert(id, conn);
         out.say(format!("Paired with {name}. You now back up to each other."));
         Ok(())
@@ -389,7 +404,7 @@ impl Node {
             }
         }
         let n = list.iter().filter(|v| v.2.is_some()).count();
-        out.say(format!("{n} versions of {path}; restore one with `sdb restore <ID> {path} --to <dir>`"));
+        out.say(format!("{n} versions of {path}; restore one with `cahoots restore <ID> {path} --to <dir>`"));
         Ok(())
     }
 
@@ -407,7 +422,9 @@ impl Node {
             let cfg = self.cfg();
             snaps.retain(|s| cfg.set_name_now(&s.m.set) == *set);
             if snaps.is_empty() {
-                bail!("there are no restore points of a set named {set}; `sdb snapshots` lists them with their sets");
+                bail!(
+                    "there are no restore points of a set named {set}; `cahoots snapshots` lists them with their sets"
+                );
             }
         }
         let s = self.resolve(&snaps, &snap)?;
@@ -476,7 +493,7 @@ impl Node {
         self.drop_known(&f.id).await;
         for set in stranded {
             out.say(format!(
-                "set {set} went only to {name} and now has no destination: it is not backed up until you run `sdb set {set} --to NAME` (or `--to all`)"
+                "set {set} went only to {name} and now has no destination: it is not backed up until you run `cahoots set {set} --to NAME` (or `--to all`)"
             ));
         }
         if !f.is_friend() {
@@ -721,7 +738,7 @@ impl Node {
             bail!("no set named {name}");
         }
         let found = c.lists().into_iter().find(|l| l.name.eq_ignore_ascii_case(list.trim()));
-        let list = found.ok_or_else(|| anyhow!("no exclusion list named {list}; see `sdb exclude lists`"))?.name;
+        let list = found.ok_or_else(|| anyhow!("no exclusion list named {list}; see `cahoots exclude lists`"))?.name;
         self.update(|c| {
             if let Some(b) = c.sets.iter_mut().find(|b| b.name == name) {
                 b.exclude_list = if list == STANDARD { String::new() } else { list.clone() };
@@ -775,7 +792,7 @@ impl Node {
         let n = patterns.len();
         self.update(|c| c.exclude_lists.push(ExcludeList { name: name.clone(), patterns }))?;
         out.say(format!(
-            "list {name} created with {n} patterns; a set uses it after `sdb set NAME --exclude \"{name}\"`"
+            "list {name} created with {n} patterns; a set uses it after `cahoots set NAME --exclude \"{name}\"`"
         ));
         Ok(())
     }
@@ -819,7 +836,7 @@ impl Node {
         out: &Out,
     ) -> Result<()> {
         if is_builtin_list(&list) {
-            bail!("{list} is built in: copy it to change it, with `sdb exclude new NAME --from {list}`");
+            bail!("{list} is built in: copy it to change it, with `cahoots exclude new NAME --from {list}`");
         }
         let list = self.own_list(&list)?;
         // A bare name such as node_modules means that name anywhere, when adding and
@@ -942,7 +959,7 @@ impl Node {
 
     pub(super) async fn kit_copy_sync(&self, out: &Out) -> Result<()> {
         let Some(c) = crate::recovery::copy_load(&self.home) else {
-            bail!("no copy is kept anywhere (sdb recovery copy-to FOLDER)");
+            bail!("no copy is kept anywhere (cahoots recovery copy-to FOLDER)");
         };
         // The copy may sit on a slow or network disk: keep the file work off the async workers.
         let home = self.home.clone();
@@ -1061,7 +1078,7 @@ impl Node {
         })?;
         out.say(format!(
             "{name} added: backups also go to {place}, encrypted like everything else. \
-             Do not add expiry (lifecycle) rules to the bucket: sdb removes what is no longer needed itself."
+             Do not add expiry (lifecycle) rules to the bucket: cahoots removes what is no longer needed itself."
         ));
         Ok(())
     }
@@ -1096,7 +1113,7 @@ impl Node {
         })??;
         out.say(match r {
             Some(r) => format!(
-                "{name} keeps: last {}, hourly {}, daily {}, weekly {}, monthly {}, max age {}; applied at the next `sdb prune` (the daemon prunes daily)",
+                "{name} keeps: last {}, hourly {}, daily {}, weekly {}, monthly {}, max age {}; applied at the next `cahoots prune` (the daemon prunes daily)",
                 r.keep_last,
                 r.keep_hourly,
                 r.keep_daily,
@@ -1170,7 +1187,7 @@ impl Node {
                 _ => {}
             }
         })?;
-        out.say("saved; applied at the next `sdb prune` (the daemon prunes daily)");
+        out.say("saved; applied at the next `cahoots prune` (the daemon prunes daily)");
         Ok(())
     }
 }

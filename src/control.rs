@@ -22,16 +22,22 @@ use tokio::{
 
 const DONE: char = '\u{1}';
 
+/// The daemon's socket in its home folder.
+const SOCK: &str = "cahoots.sock";
+/// What it was called before the rename. A client still looks there, after the new name, so
+/// that it finds a daemon from before the rename and can replace it. To go in the next version.
+const OLD_SOCK: &str = "sdb.sock";
+
 /// Unix socket paths are limited to about 100 bytes, so a deep home puts the socket in a
 /// private folder elsewhere and records where in `sock-path`, which only this user can write.
 pub fn sock_path(home: &Path) -> PathBuf {
-    let p = home.join("sdb.sock");
+    let p = home.join(SOCK);
     if p.as_os_str().len() < 100 {
         return p;
     }
     match std::fs::read(pointer(home)) {
         Ok(b) if b.starts_with(b"/") => PathBuf::from(OsStr::from_bytes(b.trim_ascii_end())),
-        _ => PathBuf::from(format!("/tmp/sdb-{}/{}", rustix::process::getuid().as_raw(), sock_name(home))),
+        _ => PathBuf::from(format!("/tmp/cahoots-{}/{}", rustix::process::getuid().as_raw(), sock_name(home))),
     }
 }
 
@@ -81,15 +87,15 @@ fn private_sock(home: &Path) -> Result<PathBuf> {
         .map(PathBuf::from)
         .filter(|b| safe_base(b))
         .collect();
-    tries.extend(bases.iter().map(|b| (b.join(format!("sdb-{uid}")), false)));
-    tries.extend(bases.iter().map(|b| (b.join(format!("sdb-{uid}-{:016x}", rand::random::<u64>())), true)));
+    tries.extend(bases.iter().map(|b| (b.join(format!("cahoots-{uid}")), false)));
+    tries.extend(bases.iter().map(|b| (b.join(format!("cahoots-{uid}-{:016x}", rand::random::<u64>())), true)));
     for (dir, fresh) in tries {
         let p = dir.join(&name);
         if p.as_os_str().len() < 100 && private_dir(&dir, fresh) {
             return Ok(p);
         }
     }
-    bail!("found no private folder for the control socket; set SDB_HOME to a shorter path")
+    bail!("found no private folder for the control socket; set CAHOOTS_HOME to a shorter path")
 }
 
 /// Identifies a build by its executable's size and modification time, so a client can
@@ -111,28 +117,36 @@ pub fn started_fingerprint() -> String {
     STARTED.get_or_init(fingerprint).clone()
 }
 
-/// Where a client looks for the daemon: never a guessed name in a shared folder. A deep
-/// home's socket is only where the daemon recorded it, in a folder still private to this user.
-fn client_path(home: &Path) -> Option<PathBuf> {
-    let p = home.join("sdb.sock");
-    if p.as_os_str().len() < 100 {
-        return Some(p);
-    }
-    let b = std::fs::read(pointer(home)).ok()?;
-    let p = PathBuf::from(OsStr::from_bytes(b.trim_ascii_end()));
-    let private = |d: &Path| {
-        std::fs::symlink_metadata(d)
-            .is_ok_and(|md| md.is_dir() && md.uid() == rustix::process::getuid().as_raw() && md.mode() & 0o077 == 0)
+/// Where a client looks for the daemon, in order: never a guessed name in a shared folder. A
+/// deep home's socket is only where the daemon recorded it, in a folder still private to this
+/// user. The name from before the rename comes last (see OLD_SOCK).
+fn client_paths(home: &Path) -> Vec<PathBuf> {
+    let recorded = || {
+        let b = std::fs::read(pointer(home)).ok()?;
+        let p = PathBuf::from(OsStr::from_bytes(b.trim_ascii_end()));
+        let private = |d: &Path| {
+            std::fs::symlink_metadata(d)
+                .is_ok_and(|md| md.is_dir() && md.uid() == rustix::process::getuid().as_raw() && md.mode() & 0o077 == 0)
+        };
+        (p.is_absolute() && p.parent().is_some_and(private)).then_some(p)
     };
-    (p.is_absolute() && p.parent().is_some_and(private)).then_some(p)
+    let short = |name: &str| Some(home.join(name)).filter(|p| p.as_os_str().len() < 100);
+    let mut paths: Vec<PathBuf> = short(SOCK).or_else(recorded).into_iter().collect();
+    paths.extend(short(OLD_SOCK));
+    paths
 }
 
 /// Connects to the local daemon, but only one run by this user. The kernel says who is at
 /// the other end of the connection, whatever was at the path a moment before, so nothing
 /// is sent (passphrases and keys among it) to anyone else who got a socket there.
 pub async fn connect(home: &Path) -> Option<UnixStream> {
-    let s = UnixStream::connect(client_path(home)?).await.ok()?;
-    s.peer_cred().is_ok_and(|c| c.uid() == rustix::process::getuid().as_raw()).then_some(s)
+    for path in client_paths(home) {
+        let Ok(s) = UnixStream::connect(path).await else { continue };
+        if s.peer_cred().is_ok_and(|c| c.uid() == rustix::process::getuid().as_raw()) {
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// The same for a caller with no async runtime (the GUI). Done on a thread of its own, as
@@ -152,7 +166,9 @@ pub fn connect_blocking(home: &Path) -> Option<std::os::unix::net::UnixStream> {
 }
 
 pub fn listen(home: &Path) -> Result<UnixListener> {
-    let mut path = home.join("sdb.sock");
+    // This daemon holds the home, so a socket under the old name is nobody's any more.
+    let _ = std::fs::remove_file(home.join(OLD_SOCK));
+    let mut path = home.join(SOCK);
     if path.as_os_str().len() >= 100 {
         path = private_sock(home)?;
         crate::config::write_private(&pointer(home), path.as_os_str().as_bytes())?;
@@ -213,7 +229,7 @@ pub async fn serve(node: Arc<Node>, listener: UnixListener) {
 }
 
 pub async fn client(stream: UnixStream, cmd: &Cmd) -> Result<()> {
-    // Whoever reads our output may stop early (`sdb snapshots | head`): leave quietly then.
+    // Whoever reads our output may stop early (`cahoots snapshots | head`): leave quietly then.
     request(stream, cmd, &mut |l| {
         use std::io::Write;
         if writeln!(std::io::stdout(), "{l}").is_err() {

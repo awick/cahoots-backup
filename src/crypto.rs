@@ -36,7 +36,7 @@ fn decrypt(c: &XChaCha20Poly1305, aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
         bail!("ciphertext too short");
     }
     if blob[0] != BLOB_FORMAT {
-        bail!("data is in format {} but this sdb only reads format {BLOB_FORMAT}; upgrade sdb", blob[0]);
+        bail!("data is in format {} but this cahoots only reads format {BLOB_FORMAT}; upgrade cahoots", blob[0]);
     }
     let nonce: [u8; 24] = blob[1..25].try_into().unwrap();
     c.decrypt(&XNonce::from(nonce), Payload { msg: &blob[25..], aad })
@@ -122,7 +122,7 @@ pub fn kit_seal_key(key: &[u8; 32], salt: &[u8; 16], plain: &[u8], node: &str) -
 pub fn kit_open(pass: &str, kit: &str) -> Result<Vec<u8>> {
     let kit: Kit = serde_json::from_str(kit).map_err(|_| anyhow!("not a recovery kit"))?;
     if kit.format != "super-duper-backup recovery kit v1" {
-        bail!("this recovery kit ({}) needs a newer sdb", kit.format);
+        bail!("this recovery kit ({}) needs a newer cahoots", kit.format);
     }
     let key = kit_key(pass, &hex::decode(&kit.salt)?)?;
     decrypt(&cipher(&key), b"sdb-recovery-kit", &hex::decode(&kit.data)?)

@@ -43,7 +43,7 @@ use tokio::time::Instant;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn offline() -> bool {
-    std::env::var_os("SDB_OFFLINE").is_some()
+    crate::config::env("OFFLINE").is_some()
 }
 
 fn builder(secret: &SecretKey, upnp: bool) -> iroh::endpoint::Builder {
@@ -311,7 +311,7 @@ pub async fn connect(ep: &Endpoint, mut addr: EndpointAddr) -> Result<Connection
                 .any(|w| format!("{e:#}").to_lowercase().contains(w)) =>
         {
             bail!(
-                "connect failed: the other side runs an incompatible version of sdb; both need the same release ({e})"
+                "connect failed: the other side runs an incompatible version of cahoots; both need the same release ({e})"
             )
         }
         Ok(Err(e)) => bail!("connect failed: {e}"),
@@ -755,7 +755,7 @@ impl Peer {
         self.simple(Req::DeleteSnapshot { id: id.into() }).await.map(|_| ())
     }
 
-    /// The sdb release the destination runs; None for a drive or a node too old to say.
+    /// The cahoots release the destination runs; None for a drive or a node too old to say.
     pub async fn version(&self) -> Option<String> {
         if !matches!(self.link, Link::Remote(_)) {
             return None;

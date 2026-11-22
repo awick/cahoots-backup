@@ -31,7 +31,7 @@ use std::{fs, io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
-#[command(name = "sdb", version, about = "Super Duper Backup: encrypted, deduplicated backups between friends")]
+#[command(name = "cahoots", version, about = "Cahoots Backup: encrypted, deduplicated backups between friends")]
 struct Cli {
     #[command(subcommand)]
     cmd: C,
@@ -82,7 +82,7 @@ enum C {
         /// Always keep this many most recent restore points of this set
         #[arg(long)]
         last: Option<u32>,
-        /// The exclusion list this set uses, e.g. Standard or Developer (see `sdb exclude lists`)
+        /// The exclusion list this set uses, e.g. Standard or Developer (see `cahoots exclude lists`)
         #[arg(long)]
         exclude: Option<String>,
         /// Give the set a new name (its restore points stay with it)
@@ -189,13 +189,13 @@ enum C {
     Name { name: String },
     /// Hours automatic backups may run, e.g. 22-7, or 'always'
     Schedule { hours: String },
-    /// Hold automatic backups, for a number of hours or until `sdb resume`
+    /// Hold automatic backups, for a number of hours or until `cahoots resume`
     Pause { hours: Option<i64> },
     /// Let automatic backups run again
     Resume,
     /// Warn when a backup is this many days stale (0 = never)
     WarnAfter { days: u32 },
-    /// Whether friends may back up to this computer: `sdb accept off` makes it one that only
+    /// Whether friends may back up to this computer: `cahoots accept off` makes it one that only
     /// backs up to its friends
     Accept {
         #[arg(value_parser = ["on", "off"])]
@@ -205,7 +205,7 @@ enum C {
     DefaultQuota { gb: u64 },
     /// Stop taking friends' backups when this computer's disk has less than this many GB free
     KeepFree { gb: u64 },
-    /// How often automatic backups go out: `sdb every 60` for all, `sdb every 15 usb` for one destination
+    /// How often automatic backups go out: `cahoots every 60` for all, `cahoots every 15 usb` for one destination
     Every { minutes: u32, name: Option<String> },
     /// Also back up to an external drive or folder
     Drive { name: String, path: PathBuf },
@@ -363,7 +363,7 @@ enum ExcludeCmd {
 
 #[derive(Subcommand)]
 enum RecoveryCmd {
-    /// Write the kit to a file (NAME.sdb-recovery-kit here unless you name one); it asks for
+    /// Write the kit to a file (NAME.cahoots-recovery-kit here unless you name one); it asks for
     /// a passphrase
     Export { file: Option<PathBuf> },
     /// Set this computer up from a kit file; it asks for the kit's passphrase
@@ -391,7 +391,7 @@ enum ServiceCmd {
 /// Asks for the kit's passphrase. A new one has to be long enough and is typed twice; one
 /// for a kit that exists is taken as it is, since older kits allowed shorter ones.
 fn passphrase(new: bool) -> Result<String> {
-    if let Ok(p) = std::env::var("SDB_PASSPHRASE") {
+    if let Some(p) = config::env_text("PASSPHRASE") {
         if new {
             recovery::check_passphrase(&p)?;
         }
@@ -432,7 +432,7 @@ fn abs(p: &PathBuf) -> Result<String> {
 fn lock(home: &std::path::Path) -> Result<fs::File> {
     let f = fs::File::create(home.join("lock"))?;
     if fs2::FileExt::try_lock_exclusive(&f).is_err() {
-        bail!("another sdb command is running on {}; wait for it to finish and try again", home.display());
+        bail!("another cahoots command is running on {}; wait for it to finish and try again", home.display());
     }
     Ok(f)
 }
@@ -453,7 +453,7 @@ async fn daemon(home: PathBuf) -> Result<()> {
         }
     });
     let out = Out(tx);
-    out.say(format!("Super Duper Backup daemon started as {} ({})", node.cfg().name, node.id()));
+    out.say(format!("Cahoots Backup daemon started as {} ({})", node.cfg().name, node.id()));
     tokio::spawn(control::serve(node.clone(), control::listen(&home)?));
     tokio::spawn(watch::run(node.clone(), out));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -492,7 +492,7 @@ fn spawn_daemon(home: &std::path::Path) -> Result<()> {
         .stderr(log)
         .process_group(0)
         .spawn()
-        .context("cannot start the sdb daemon")?;
+        .context("cannot start the cahoots daemon")?;
     Ok(())
 }
 
@@ -537,7 +537,7 @@ async fn daemon_stream(home: &std::path::Path) -> Result<tokio::net::UnixStream>
         }
     }
     control::connect(home).await.ok_or_else(|| {
-        anyhow::anyhow!("the sdb daemon could not be started; see {}", home.join("daemon.log").display())
+        anyhow::anyhow!("the cahoots daemon could not be started; see {}", home.join("daemon.log").display())
     })
 }
 
@@ -573,7 +573,7 @@ async fn tui_main(home: PathBuf) -> Result<()> {
 #[tokio::main]
 async fn main() {
     if let Err(e) = real_main().await {
-        eprintln!("sdb: {}", node::clean(&format!("{e:#}")));
+        eprintln!("cahoots: {}", node::clean(&format!("{e:#}")));
         std::process::exit(1);
     }
 }
@@ -597,8 +597,12 @@ async fn real_main() -> Result<()> {
             cfg.store_dir = store.map(|s| std::path::absolute(&s)).transpose()?;
             cfg.save(&home)?;
             println!("Set up \"{}\" in {}", cfg.name, home.display());
-            println!("Next: `sdb add <folder>`, `sdb invite` (or `sdb join <invite>`), `sdb service install`.");
-            println!("Then run `sdb recovery export <file>` and keep that file somewhere other than this computer.");
+            println!(
+                "Next: `cahoots add <folder>`, `cahoots invite` (or `cahoots join <invite>`), `cahoots service install`."
+            );
+            println!(
+                "Then run `cahoots recovery export <file>` and keep that file somewhere other than this computer."
+            );
             return Ok(());
         }
         C::Daemon => return daemon(home).await,
@@ -615,12 +619,12 @@ async fn real_main() -> Result<()> {
             return gui::run(home);
         }
         #[cfg(not(feature = "gui"))]
-        C::Gui => bail!("this sdb was built without the graphical interface; use `sdb tui`"),
+        C::Gui => bail!("this cahoots was built without the graphical interface; use `cahoots tui`"),
         C::Service { cmd } => {
             return match cmd {
                 ServiceCmd::Install if service::in_container() => {
                     bail!(
-                        "sdb runs in a container here: the container starts the daemon, and its restart policy brings it back"
+                        "cahoots runs in a container here: the container starts the daemon, and its restart policy brings it back"
                     )
                 }
                 ServiceCmd::Install => {
@@ -670,9 +674,11 @@ async fn real_main() -> Result<()> {
                 sets.len(),
                 sets.join(", ")
             ));
-            say("`sdb status` shows whether your destinations are reachable, `sdb snapshots` the restore points.");
-            say("To put a set's files back where they were: sdb restore latest --set NAME --in-place");
-            say("(or --to FOLDER to look first; `sdb gui` and `sdb tui` do the same from their Restore page).");
+            say(
+                "`cahoots status` shows whether your destinations are reachable, `cahoots snapshots` the restore points.",
+            );
+            say("To put a set's files back where they were: cahoots restore latest --set NAME --in-place");
+            say("(or --to FOLDER to look first; `cahoots gui` and `cahoots tui` do the same from their Restore page).");
             return Ok(());
         }
         C::Add { paths, set } => {
@@ -817,9 +823,9 @@ async fn real_main() -> Result<()> {
                 Some(p) => Some(fs::read_to_string(p).with_context(|| p.display().to_string())?),
                 None => None,
             };
-            let secret_key = match std::env::var("SDB_CLOUD_SECRET") {
-                Ok(s) => s,
-                Err(_) => rpassword::prompt_password("Secret key: ")?,
+            let secret_key = match config::env_text("CLOUD_SECRET") {
+                Some(s) => s,
+                None => rpassword::prompt_password("Secret key: ")?,
             };
             let path_style = path_style.then_some(true);
             Cmd::CloudAdd(CloudAdd {

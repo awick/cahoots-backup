@@ -75,7 +75,7 @@ pub struct Excludes {
 
 impl Excludes {
     /// What one set leaves out: its exclusion list, what was left out of it by hand,
-    /// and always sdb's own folders.
+    /// and always cahoots's own folders.
     pub fn new(cfg: &Config, set: &BackupSet, home: &Path) -> Result<Self> {
         let mut b = GlobSetBuilder::new();
         let list = cfg.list_for(set);
@@ -741,7 +741,7 @@ pub async fn run(
     let sets: Vec<BackupSet> =
         cfg.sets.iter().filter(|s| set.is_none_or(|n| n == s.name) && !s.paths.is_empty()).cloned().collect();
     if sets.is_empty() {
-        bail!("nothing to back up yet: use `sdb add <path>`");
+        bail!("nothing to back up yet: use `cahoots add <path>`");
     }
     let label = sets.len() > 1 || cfg.sets.len() > 1;
     let mut failed = None;
@@ -820,7 +820,7 @@ async fn run_once(
         .cloned()
         .collect();
     if friends.is_empty() {
-        bail!("no friends to back up to yet: use `sdb invite` or `sdb join`");
+        bail!("no friends to back up to yet: use `cahoots invite` or `cahoots join`");
     }
     // A forgotten restore point is never reused for a new backup: the next listing deletes
     // it again, which would silently take the newest backup with it.
@@ -1335,12 +1335,12 @@ mod tests {
     #[test]
     fn excludes() {
         let mut cfg = Config::new("n".into());
-        let home = Path::new("/home/me/.super-duper-backup");
+        let home = Path::new("/home/me/.cahoots");
         let mut set = BackupSet { skip: vec!["/home/me/proj/big".into()], ..Default::default() };
         let ex = Excludes::new(&cfg, &set, home).unwrap();
         assert!(ex.is_excluded(Path::new("/home/me/proj/node_modules")));
         assert!(ex.is_excluded(Path::new("/home/me/.DS_Store")));
-        assert!(ex.is_excluded(Path::new("/home/me/.super-duper-backup/store/x")));
+        assert!(ex.is_excluded(Path::new("/home/me/.cahoots/store/x")));
         assert!(ex.is_excluded(Path::new("/home/me/proj/big/file")));
         assert!(ex.is_excluded(Path::new("/home/me/proj/a.sdb-tmp")));
         assert!(!ex.is_excluded(Path::new("/home/me/proj/src/main.rs")));

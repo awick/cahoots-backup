@@ -1,7 +1,7 @@
 // Copyright Andy Wick
 // SPDX-License-Identifier: Apache-2.0
 
-//! The graphical interface (`sdb gui`). Like the TUI it is only a client of the
+//! The graphical interface (`cahoots gui`). Like the TUI it is only a client of the
 //! daemon: every button sends a command over the local socket.
 
 use crate::{
@@ -33,7 +33,7 @@ const LABEL_WIDTH: f32 = 104.0;
 /// Sends one command to the daemon and waits for it to finish. Output lines go to
 /// `line` as they arrive; progress lines (starting "...") are passed on but not kept.
 fn call(home: &Path, cmd: &Cmd, mut line: impl FnMut(&str)) -> Result<Vec<String>, String> {
-    let gone = || "the daemon is not running; quit and start `sdb gui` again".to_string();
+    let gone = || "the daemon is not running; quit and start `cahoots gui` again".to_string();
     let mut s = control::connect_blocking(home).ok_or_else(gone)?;
     let text = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
     s.write_all(format!("{text}\n").as_bytes()).map_err(|e| e.to_string())?;
@@ -214,9 +214,9 @@ impl Gui {
         if let Some(c) = first(Cmd::Config).and_then(|l| serde_json::from_str(&l).ok()) {
             self.cfg = c;
         }
-        // For development: SDB_GUI_SHOW=restore|destinations|settings|kit|history|status|files|schedule
+        // For development: CAHOOTS_GUI_SHOW=restore|destinations|settings|kit|history|status|files|schedule
         // opens on that page with its data already loaded, so a screenshot shows it.
-        let show = std::env::var("SDB_GUI_SHOW").unwrap_or_default();
+        let show = crate::config::env_text("GUI_SHOW").unwrap_or_default();
         let first_set = self.cfg.sets.first().map(|b| b.name.clone()).unwrap_or_default();
         match show.as_str() {
             "restore" | "restore-old" => {
@@ -268,16 +268,16 @@ impl Gui {
         }
     }
 
-    /// For development: SDB_GUI_SHOT=file.ppm saves a picture of the window after it has
+    /// For development: CAHOOTS_GUI_SHOT=file.ppm saves a picture of the window after it has
     /// settled and exits, so the layout can be checked without a person looking.
     fn maybe_screenshot(&mut self, ctx: &egui::Context) {
         if !cfg!(debug_assertions) {
             return;
         }
-        let Ok(path) = std::env::var("SDB_GUI_SHOT") else { return };
+        let Some(path) = crate::config::env_text("GUI_SHOT") else { return };
         self.frames += 1;
         ctx.request_repaint();
-        if self.frames == std::env::var("SDB_GUI_SHOT_FRAME").ok().and_then(|f| f.parse().ok()).unwrap_or(20) {
+        if self.frames == crate::config::env_text("GUI_SHOT_FRAME").and_then(|f| f.parse().ok()).unwrap_or(20) {
             let done = egui::ScreenshotCallback::new(move |img: std::sync::Arc<egui::ColorImage>| {
                 let mut out = format!("P6\n{} {}\n255\n", img.size[0], img.size[1]).into_bytes();
                 for p in &img.pixels {
@@ -535,7 +535,7 @@ impl Gui {
             self.ov["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str()).map(String::from).collect();
         for w in &warnings {
             // What a terminal would be told to type is, in a window, a place to go.
-            let text = w.split_once(" (sdb ").map_or(w.as_str(), |(text, _)| text);
+            let text = w.split_once(" (cahoots ").map_or(w.as_str(), |(text, _)| text);
             ui.horizontal(|ui| {
                 ui.colored_label(RED, format!("! {text}"));
                 if w.contains("recovery kit") && ui.link("Fix it in Settings").clicked() {
@@ -1329,7 +1329,7 @@ impl Gui {
             ui.horizontal(|ui| {
                 ui.label(format!("{} picked. Restore into:", self.picked.len()));
                 let home = std::env::var("HOME").unwrap_or_default();
-                let to = self.fields.entry("restore-to".into()).or_insert_with(|| format!("{home}/sdb-restore"));
+                let to = self.fields.entry("restore-to".into()).or_insert_with(|| format!("{home}/cahoots-restore"));
                 ui.add(egui::TextEdit::singleline(to).desired_width(300.0));
                 let to = to.replacen('~', &home, 1);
                 if ui.add_enabled(!self.picked.is_empty() && !to.is_empty(), egui::Button::new("Restore")).clicked() {
@@ -1607,9 +1607,11 @@ impl Gui {
                 ui.weak("Their invite");
                 ui.horizontal(|ui| {
                     let text = self.fields.entry("join".into()).or_default();
-                    ui.add(egui::TextEdit::singleline(text).desired_width(360.0).hint_text("paste sdb1... here"));
-                    let ticket = text.trim().trim_start_matches("sdb join ").to_string();
-                    if ui.add_enabled(ticket.starts_with("sdb1"), egui::Button::new("Join")).clicked() {
+                    ui.add(egui::TextEdit::singleline(text).desired_width(360.0).hint_text("paste cahoots1... here"));
+                    let ticket =
+                        text.trim().trim_start_matches("cahoots join ").trim_start_matches("sdb join ").to_string();
+                    let invite = ticket.starts_with("cahoots1") || ticket.starts_with("sdb1");
+                    if ui.add_enabled(invite, egui::Button::new("Join")).clicked() {
                         self.fields.remove("join");
                         self.spawn(&ctx, Job::Show("Pairing"), Cmd::Join { ticket }, Some("Pairing"));
                     }
@@ -1832,7 +1834,7 @@ impl Gui {
                 } else {
                     ui.horizontal(|ui| {
                         ui.colored_label(YELLOW, "not started; to have it start by itself, run this in a terminal");
-                        Self::command(ui, "sdb service install");
+                        Self::command(ui, "cahoots service install");
                     });
                 }
                 ui.end_row();
@@ -2006,9 +2008,9 @@ impl Gui {
                 }
             } else {
                 ui.weak(if cfg!(target_os = "macos") {
-                    "optional: a folder that syncs, such as Documents with iCloud Drive; sdb keeps the kit there up to date"
+                    "optional: a folder that syncs, such as Documents with iCloud Drive; cahoots keeps the kit there up to date"
                 } else {
-                    "optional: a folder that a cloud drive syncs; sdb keeps the kit there up to date"
+                    "optional: a folder that a cloud drive syncs; cahoots keeps the kit there up to date"
                 });
                 if ui.button(if open { "Cancel" } else { "Keep a copy..." }).clicked() {
                     for k in ["kc-pass", "kc-again"] {
@@ -2194,7 +2196,7 @@ impl Gui {
             Self::status_card(ui, "This computer", |ui| {
                 Self::rows(ui, "st-this", |ui| {
                     ui.weak("Name");
-                    ui.label(format!("{} · sdb {}", c.name, ov["version"].as_str().unwrap_or(crate::net::VERSION)));
+                    ui.label(format!("{} · cahoots {}", c.name, ov["version"].as_str().unwrap_or(crate::net::VERSION)));
                     ui.end_row();
                     ui.weak("Id");
                     ui.horizontal(|ui| {
@@ -2216,7 +2218,7 @@ impl Gui {
                             ui.weak("· starts by itself at login");
                         } else {
                             ui.colored_label(YELLOW, "· not started at login: run this in a terminal");
-                            Self::command(ui, "sdb service install");
+                            Self::command(ui, "cahoots service install");
                         }
                     });
                     ui.end_row();
@@ -2363,7 +2365,7 @@ impl Gui {
                     });
                 });
             }
-            egui::CollapsingHeader::new("The full report, as `sdb status` prints it").id_salt("st-full").show(
+            egui::CollapsingHeader::new("The full report, as `cahoots status` prints it").id_salt("st-full").show(
                 ui,
                 |ui| {
                     if ui.button("Copy").clicked() {
@@ -2405,13 +2407,13 @@ impl Gui {
 }
 
 impl eframe::App for Gui {
-    /// For development: SDB_GUI_DRAG=x1,y1,x2,y2 drags the pointer from one point to the other
-    /// before the picture SDB_GUI_SHOT takes, to try things that only a drag shows.
+    /// For development: CAHOOTS_GUI_DRAG=x1,y1,x2,y2 drags the pointer from one point to the other
+    /// before the picture CAHOOTS_GUI_SHOT takes, to try things that only a drag shows.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         if !cfg!(debug_assertions) {
             return;
         }
-        let Ok(spec) = std::env::var("SDB_GUI_DRAG") else { return };
+        let Some(spec) = crate::config::env_text("GUI_DRAG") else { return };
         let n: Vec<f32> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
         let [x1, y1, x2, y2] = n[..] else { return };
         let (from, to) = (egui::pos2(x1, y1), egui::pos2(x2, y2));
@@ -2441,9 +2443,9 @@ impl eframe::App for Gui {
             // A panel only keeps the width it is dragged to if what is in it uses that width.
             ui.take_available_width();
             ui.add_space(6.0);
-            ui.label(RichText::new("Super Duper Backup").strong());
+            ui.label(RichText::new("Cahoots Backup").strong());
             ui.weak(format!(
-                "{} · sdb {}",
+                "{} · cahoots {}",
                 self.ov["name"].as_str().unwrap_or(&self.cfg.name),
                 self.ov["version"].as_str().unwrap_or(crate::net::VERSION)
             ));
@@ -2511,10 +2513,9 @@ impl eframe::App for Gui {
 }
 
 pub fn run(home: PathBuf) -> anyhow::Result<()> {
-    // For development: SDB_GUI_TALL makes the window tall enough to picture a long page whole.
-    let height = if cfg!(debug_assertions) && std::env::var("SDB_GUI_TALL").is_ok() { 1500.0 } else { 700.0 };
-    let mut viewport =
-        egui::ViewportBuilder::default().with_inner_size([1080.0, height]).with_title("Super Duper Backup");
+    // For development: CAHOOTS_GUI_TALL makes the window tall enough to picture a long page whole.
+    let height = if cfg!(debug_assertions) && crate::config::env("GUI_TALL").is_some() { 1500.0 } else { 700.0 };
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1080.0, height]).with_title("Cahoots Backup");
     // The window's icon, which on a Mac is also the one in the Dock.
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(icon);
@@ -2522,7 +2523,9 @@ pub fn run(home: PathBuf) -> anyhow::Result<()> {
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     let mut gui = Gui::new(home);
     gui.first_load();
-    eframe::run_native("Super Duper Backup", options, Box::new(|_cc| Ok(Box::new(gui)))).map_err(|e| {
-        anyhow::anyhow!("the window could not be opened (is there a desktop session? `sdb tui` works without one): {e}")
+    eframe::run_native("Cahoots Backup", options, Box::new(|_cc| Ok(Box::new(gui)))).map_err(|e| {
+        anyhow::anyhow!(
+            "the window could not be opened (is there a desktop session? `cahoots tui` works without one): {e}"
+        )
     })
 }

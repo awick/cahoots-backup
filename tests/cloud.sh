@@ -6,29 +6,29 @@
 #             signatures are checked. Needs the AWS CLI and the `aws-emulator` program
 #             (Linux) or Docker (macOS; the image AWS documents is built here). GitHub
 #             runs this one too.
-# Usage: [SDB_TEST_S3=mini|emulator] tests/cloud.sh path/to/sdb
+# Usage: [CAHOOTS_TEST_S3=mini|emulator] tests/cloud.sh path/to/cahoots
 # With nothing chosen, the emulator is used where it can run.
 set -eu
-SDB=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+CAHOOTS=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 HERE=$(cd "$(dirname "$0")" && pwd)
-T=$(cd "$(mktemp -d /tmp/sdb-cloud.XXXXXX)" && pwd -P)
-PORT=${SDB_TEST_S3_PORT:-19391}
-export SDB_OFFLINE=1 SDB_HOME=$T/home
+T=$(cd "$(mktemp -d /tmp/cahoots-cloud.XXXXXX)" && pwd -P)
+PORT=${CAHOOTS_TEST_S3_PORT:-19391}
+export CAHOOTS_OFFLINE=1 CAHOOTS_HOME=$T/home
 fail() { echo "FAILED: $1" >&2; exit 1; }
 step() { echo "  $1"; }
-s() { "$SDB" "$@"; }
+s() { "$CAHOOTS" "$@"; }
 EMU=
 MINI=
 cleanup() {
     s stop >/dev/null 2>&1 || true
     [ -z "$EMU" ] || kill "$EMU" 2>/dev/null || true
     [ -z "$MINI" ] || { kill "$MINI" && wait "$MINI"; } 2>/dev/null || true
-    [ "$MODE" != emulator ] || docker rm -f "sdb-cloud-test-$$" >/dev/null 2>&1 || true
+    [ "$MODE" != emulator ] || docker rm -f "cahoots-cloud-test-$$" >/dev/null 2>&1 || true
     rm -rf "$T"
 }
 trap cleanup EXIT
 
-MODE=${SDB_TEST_S3:-}
+MODE=${CAHOOTS_TEST_S3:-}
 if [ -z "$MODE" ]; then
     MODE=mini
     if command -v aws >/dev/null 2>&1 && { command -v aws-emulator || command -v docker; } >/dev/null 2>&1; then
@@ -52,7 +52,7 @@ if [ "$MODE" = mini ]; then
     ENDPOINT=$CAPURL
     KEY=sdbtestkey
     CAOPT=
-    export SDB_CLOUD_SECRET=sdbtestsecret
+    export CAHOOTS_CLOUD_SECRET=sdbtestsecret
     listing() { mini_list "$ENDPOINT" sdbtest; }
     remove() { curl -s -o /dev/null -X DELETE "$ENDPOINT/sdbtest/$1"; }
     dump() {
@@ -80,7 +80,7 @@ ENTRYPOINT ["aws-emulator"]
 EOF
             docker build -q -t aws-emulator "$T/image" >/dev/null
         fi
-        docker run -d --rm --name "sdb-cloud-test-$$" --memory=2g --user "$(id -u):$(id -g)" \
+        docker run -d --rm --name "cahoots-cloud-test-$$" --memory=2g --user "$(id -u):$(id -g)" \
             -p "127.0.0.1:$PORT:$PORT" -e HOME="$T/emu" -v "$T/emu/.aws/emulator:$T/emu/.aws/emulator" \
             aws-emulator -p "$PORT" --telemetry off >/dev/null
     else
@@ -97,8 +97,8 @@ EOF
     [ -f "$E/emulator_credentials" ] || fail "the emulator did not start"
     # The emulator makes up its own keys at every start.
     KEY=$(sed -n 's/^aws_access_key_id *= *//p' "$E/emulator_credentials")
-    SDB_CLOUD_SECRET=$(sed -n 's/^aws_secret_access_key *= *//p' "$E/emulator_credentials")
-    export SDB_CLOUD_SECRET AWS_CONFIG_FILE=$E/config AWS_SHARED_CREDENTIALS_FILE=$E/emulator_credentials
+    CAHOOTS_CLOUD_SECRET=$(sed -n 's/^aws_secret_access_key *= *//p' "$E/emulator_credentials")
+    export CAHOOTS_CLOUD_SECRET AWS_CONFIG_FILE=$E/config AWS_SHARED_CREDENTIALS_FILE=$E/emulator_credentials
     listing() { aws s3api list-objects-v2 --bucket sdbtest --output text --query 'Contents[].[Size,Key]'; }
     remove() { aws s3api delete-object --bucket sdbtest --key "$1" >/dev/null; }
     dump() { aws s3 sync s3://sdbtest "$1" --quiet; }
@@ -119,7 +119,7 @@ s pause >/dev/null
 
 if [ "$MODE" = emulator ]; then
     step "bad keys and an unknown certificate are refused"
-    env SDB_CLOUD_SECRET=wrong "$SDB" cloud s3 --endpoint "$ENDPOINT" --bucket sdbtest --access-key "$KEY" $CAOPT --create \
+    env CAHOOTS_CLOUD_SECRET=wrong "$CAHOOTS" cloud s3 --endpoint "$ENDPOINT" --bucket sdbtest --access-key "$KEY" $CAOPT --create \
         >bad.out 2>&1 && fail "a wrong secret key was accepted"
     grep -q "check the access key" bad.out || fail "no hint about the keys"
     s cloud s3 --endpoint "$ENDPOINT" --bucket sdbtest --access-key "$KEY" --create >nocert.out 2>&1 &&
@@ -138,7 +138,7 @@ step "add cloud storage"
 add_cloud --create | grep -q "s3 added" || fail "add"
 s destinations | grep -q "s3 .*cloud storage, bucket sdbtest" || fail "not listed"
 [ "$(ls -l home/config.toml | cut -c1-10)" = "-rw-------" ] || fail "config is not private"
-s status | grep -q "$SDB_CLOUD_SECRET" && fail "status shows the secret key"
+s status | grep -q "$CAHOOTS_CLOUD_SECRET" && fail "status shows the secret key"
 
 step "backup, change, backup"
 head -c 3000000 /dev/urandom >data/big

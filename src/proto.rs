@@ -10,6 +10,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Bumped whenever the messages change in a way an older node would misread (version 2
 /// streams chunk listings and reports upload progress), so mismatched nodes refuse each
 /// other at connect time instead of failing halfway through a request.
+/// It keeps the program's first name (as do the key and kit labels in crypto.rs and the
+/// `sdb-` file names on drives): changing any of them would cut off every node and backup
+/// made before the rename.
 pub const ALPN: &[u8] = b"super-duper-backup/2";
 pub const MAX_BLOB: usize = 6 << 20;
 pub const MAX_MSG: usize = 64 << 20;
@@ -53,7 +56,7 @@ pub enum Req {
         id: String,
     },
     Usage,
-    /// Which sdb release the other side runs. Added after the first release, so it stays
+    /// Which cahoots release the other side runs. Added after the first release, so it stays
     /// last: an older node answers it with an error, which reads as "unknown".
     Version,
     /// Whether this node takes the asker's backups at all. Newer still, so it stays last:

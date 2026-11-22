@@ -1,10 +1,11 @@
 [package]
-name = "super-duper-backup"
+name = "cahoots-backup"
 version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Encrypted, deduplicated backups between friends"
-repository = "https://github.com/awick/super-duper-backup"
+repository = "https://github.com/awick/cahoots-backup"
+homepage = "https://cahootsbackup.com"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -40,7 +41,7 @@ walkdir = "2.5.0"
 zstd = "0.14.4"
 
 [[bin]]
-name = "sdb"
+name = "cahoots"
 path = "src/main.rs"
 
 [profile.release]
@@ -57,5 +58,5 @@ codegen-units = 1
 
 [features]
 default = ["gui"]
-# The graphical interface (`sdb gui`). Build with --no-default-features to leave it out.
+# The graphical interface (`cahoots gui`). Build with --no-default-features to leave it out.
 gui = ["dep:eframe", "dep:rfd"]

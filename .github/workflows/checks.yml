@@ -75,7 +75,7 @@ jobs:
       - name: Build without the window
         run: cargo build --release --no-default-features
       - name: Cloud destination test
-        run: SDB_TEST_S3=emulator sh tests/cloud.sh target/release/sdb
+        run: CAHOOTS_TEST_S3=emulator sh tests/cloud.sh target/release/cahoots
 
   # The image is only published with a release, but it is built and tried on every push so
   # that it still works when the time comes.
@@ -86,6 +86,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build
-        run: docker build -t sdb .
+        run: docker build -t cahoots .
       - name: The daemon starts, answers and stops
-        run: sh tests/docker.sh sdb
+        run: sh tests/docker.sh cahoots

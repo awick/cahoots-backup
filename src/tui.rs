@@ -47,7 +47,7 @@ impl Exec {
         };
         let stream = control::connect(&self.0)
             .await
-            .ok_or_else(|| anyhow::anyhow!("the daemon is not running; quit and start sdb again"))?;
+            .ok_or_else(|| anyhow::anyhow!("the daemon is not running; quit and start cahoots again"))?;
         if let Err(e) = control::request(stream, &cmd, &mut seen).await {
             lines.push(format!("{e:#}"));
             anyhow::bail!("{}", lines.join("\n"));
@@ -1305,12 +1305,13 @@ impl App {
                     "The kit is this computer's identity, key and settings in one passphrase-protected file.".into(),
                     "With it and the passphrase you can restore everything on a new computer.".into(),
                     String::new(),
-                    "To write it, quit and run:  sdb recovery export".into(),
+                    "To write it, quit and run:  cahoots recovery export".into(),
                     "Then keep the file somewhere other than this computer.".into(),
                     String::new(),
                     match self.ov["kit_copy"]["folder"].as_str() {
                         Some(f) => format!("A copy is also kept in {f}, and written again when it changes."),
-                        None => "sdb can also keep a copy in a folder that syncs:  sdb recovery copy-to FOLDER".into(),
+                        None => "cahoots can also keep a copy in a folder that syncs:  cahoots recovery copy-to FOLDER"
+                            .into(),
                     },
                 ]);
             }
@@ -1318,22 +1319,22 @@ impl App {
                 let on = self.ov["service"].as_bool() == Some(true);
                 self.popup = Some(if self.ov["container"] == true {
                     vec![
-                        "sdb runs in a container here, and the container runs the daemon.".into(),
+                        "cahoots runs in a container here, and the container runs the daemon.".into(),
                         "Its restart policy (such as `restart: unless-stopped`) brings it back after a reboot.".into(),
                     ]
                 } else if on {
                     vec![
                         "The background service is installed: the daemon starts by itself when you log in.".into(),
                         String::new(),
-                        "To remove it, quit and run:  sdb service uninstall".into(),
+                        "To remove it, quit and run:  cahoots service uninstall".into(),
                     ]
                 } else {
                     vec![
                         "The background service is not installed.".into(),
-                        "The daemon runs now because sdb started it, but after a restart of this computer".into(),
-                        "nothing is backed up, and friends cannot back up to you, until you run sdb again.".into(),
+                        "The daemon runs now because cahoots started it, but after a restart of this computer".into(),
+                        "nothing is backed up, and friends cannot back up to you, until you run cahoots again.".into(),
                         String::new(),
-                        "To have it start at login, quit and run:  sdb service install".into(),
+                        "To have it start at login, quit and run:  cahoots service install".into(),
                     ]
                 });
             }
@@ -1447,7 +1448,7 @@ impl App {
                     self.status = "pick files or folders with space first".into();
                 } else {
                     let home = std::env::var("HOME").unwrap_or_default();
-                    self.input = Some((Prompt::RestoreTo, format!("{home}/sdb-restore")));
+                    self.input = Some((Prompt::RestoreTo, format!("{home}/cahoots-restore")));
                 }
             }
             Act::Search => self.input = Some((Prompt::Filter, self.restore.filter.clone())),
@@ -1829,7 +1830,7 @@ impl App {
                 }
             }
             Prompt::Join => {
-                let ticket = text.trim_start_matches("sdb join ").to_string();
+                let ticket = text.trim_start_matches("cahoots join ").trim_start_matches("sdb join ").to_string();
                 self.start("pairing", |ex, _| async move {
                     Done::Paired(lines_or_error(ex.call(Cmd::Join { ticket }).await))
                 });
@@ -2107,7 +2108,7 @@ impl App {
                 ]));
                 lines.push(Line::styled(
                     if is_builtin_list(&l.name) {
-                        "Comes with sdb and may gain patterns in a later release. Copy it to make changes."
+                        "Comes with cahoots and may gain patterns in a later release. Copy it to make changes."
                     } else {
                         "A bare name such as build means that name anywhere; a path starting with / means that one place."
                     },
@@ -2425,7 +2426,7 @@ impl App {
             .collect();
         let title = if crumbs.is_empty() {
             format!(
-                " {} · sdb {} ",
+                " {} · cahoots {} ",
                 self.ov["name"].as_str().unwrap_or(&self.cfg.name),
                 self.ov["version"].as_str().unwrap_or(crate::net::VERSION)
             )

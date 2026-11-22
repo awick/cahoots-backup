@@ -2,15 +2,15 @@
 # Damage and failure test: what happens when stored data, records, caches or the
 # source files go wrong, or a run is cut short. Two local nodes and a drive, no
 # internet needed.
-# Usage: tests/damage.sh path/to/sdb
+# Usage: tests/damage.sh path/to/cahoots
 set -eu
-SDB=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-T=$(cd "$(mktemp -d /tmp/sdb-damage.XXXXXX)" && pwd -P)
-export SDB_OFFLINE=1
+CAHOOTS=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+T=$(cd "$(mktemp -d /tmp/cahoots-damage.XXXXXX)" && pwd -P)
+export CAHOOTS_OFFLINE=1
 fail() { echo "FAILED: $1" >&2; exit 1; }
 step() { echo "  $1"; }
-a() { SDB_HOME=$T/alice "$SDB" "$@"; }
-b() { SDB_HOME=$T/bob "$SDB" "$@"; }
+a() { CAHOOTS_HOME=$T/alice "$CAHOOTS" "$@"; }
+b() { CAHOOTS_HOME=$T/bob "$CAHOOTS" "$@"; }
 cleanup() {
     a stop >/dev/null 2>&1 || true
     b stop >/dev/null 2>&1 || true
@@ -18,7 +18,7 @@ cleanup() {
     rm -rf "$T"
 }
 trap cleanup EXIT
-invite() { "$@" invite | grep -o 'sdb1[a-z0-9]*'; }
+invite() { "$@" invite | grep -o 'cahoots1[a-z0-9]*'; }
 # The stored copies on the drive, largest first.
 chunks() { find drive/sdb-store -path '*chunks*' -type f -exec ls -S {} +; }
 records() { find drive/sdb-store -path '*snapshots*' -type f; }
@@ -33,7 +33,7 @@ daemon_pid() {
     if command -v lsof >/dev/null 2>&1; then
         lsof -t "$T/$1/lock" 2>/dev/null | head -1
     else
-        grep -lsa "SDB_HOME=$T/$1" /proc/[0-9]*/environ | head -1 | cut -d/ -f3
+        grep -lsa "CAHOOTS_HOME=$T/$1" /proc/[0-9]*/environ | head -1 | cut -d/ -f3
     fi
 }
 
@@ -127,12 +127,12 @@ cp alice/config.toml config.keep
 echo 'name = [broken' >alice/config.toml
 a status >broken.out 2>&1 && fail "a broken config was accepted"
 grep -q "bad config" broken.out || fail "the broken config was not named"
-grep -qi "panicked" broken.out && fail "a broken config crashed sdb"
+grep -qi "panicked" broken.out && fail "a broken config crashed cahoots"
 cp config.keep alice/config.toml
 cp alice/identity.key identity.keep
 head -c 20 identity.keep >alice/identity.key
 a status >broken.out 2>&1 && fail "a cut-off key file was accepted"
-grep -qi "panicked" broken.out && fail "a cut-off key file crashed sdb"
+grep -qi "panicked" broken.out && fail "a cut-off key file crashed cahoots"
 cp identity.keep alice/identity.key
 a status >/dev/null || fail "status after putting the files back"
 
