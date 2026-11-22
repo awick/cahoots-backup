@@ -2,12 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Publishes a GitHub release named after the version in Cargo.toml, with binaries for
-# macOS and Linux. Started by hand (Actions > release > Run workflow, or
+# macOS and Linux, and Docker images of the daemon for amd64 and arm64 at
+# ghcr.io/<owner>/<repository>. Started by hand (Actions > release > Run workflow, or
 # `gh workflow run release`): raise the version in Cargo.toml, push, then run it.
+# `gh workflow run release -f dry_run=true` builds and tests it all and publishes nothing.
 name: release
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and test everything, but publish nothing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,7 +33,7 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ -n "$version" ] || { echo "no version in Cargo.toml"; exit 1; }
-          if gh release view "v$version" >/dev/null 2>&1; then
+          if [ "${{ inputs.dry_run }}" != true ] && gh release view "v$version" >/dev/null 2>&1; then
             echo "v$version is already released: raise the version in Cargo.toml first"
             exit 1
           fi
@@ -65,6 +72,7 @@ jobs:
 
   publish:
     name: publish
+    if: ${{ !inputs.dry_run }}
     needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
@@ -81,3 +89,51 @@ jobs:
           sha256sum sdb-*.tar.gz >SHA256SUMS
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Super Duper Backup $VERSION" --generate-notes sdb-*.tar.gz SHA256SUMS
+
+  # One image per kind of processor, each built on a runner of that kind, then joined
+  # under one name so `docker pull` picks the right one.
+  image:
+    name: docker image (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, os: ubuntu-24.04 }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, try and push
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          TOKEN: ${{ github.token }}
+        run: |
+          image=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          docker build -t "$image:$VERSION-$ARCH" .
+          sh tests/docker.sh "$image:$VERSION-$ARCH"
+          if [ "${{ inputs.dry_run }}" = true ]; then exit 0; fi
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$image:$VERSION-$ARCH"
+
+  image-manifest:
+    name: docker image (both)
+    if: ${{ !inputs.dry_run }}
+    needs: [version, image]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Join them under the version and latest
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TOKEN: ${{ github.token }}
+        run: |
+          image=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create -t "$image:$VERSION" -t "$image:latest" \
+            "$image:$VERSION-amd64" "$image:$VERSION-arm64"

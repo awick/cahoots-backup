@@ -397,26 +397,29 @@ enum Choice {
     Value(&'static str),
 }
 
+/// The general settings, in the two groups the screens show them in: the first
+/// `AUTOMATIC` are about automatic backups, the rest about how much history is kept.
 const GENERAL: [(&str, &str); 12] = [
-    ("hours", "Hours automatic backups may run, such as 22-7 ('always' for any time)"),
-    ("pause", "Automatic backups (enter: pause for a number of hours; 0 resumes)"),
-    ("every", "Minutes between automatic backups to local drives (friends default to 60)"),
-    ("limit", "Upload speed limit in KB/s across friends (0 = unlimited)"),
-    ("warn", "Warn when a backup is this many days old (0 = never)"),
-    ("versions", "Max versions kept of each file (0 = unlimited)"),
-    ("days", "Delete restore points older than this many days (0 = never)"),
-    ("last", "Always keep this many most recent restore points"),
-    ("hourly", "Keep one per hour for this many hours"),
-    ("daily", "Keep one per day for this many days"),
-    ("weekly", "Keep one per week for this many weeks"),
-    ("monthly", "Keep one per month for this many months"),
+    ("hours", "Only between these hours, such as 22-7 ('always' for any time)"),
+    ("pause", "Right now (enter: pause for a number of hours; 0 resumes)"),
+    ("every", "Minutes between backups to a local drive (friends and cloud storage default to 60)"),
+    ("limit", "Upload limit in KB/s across friends and cloud storage (0 = unlimited)"),
+    ("warn", "Warn after this many days without a backup (0 = never)"),
+    ("versions", "Keep this many versions of each file (0 = all of them)"),
+    ("days", "Keep restore points for this many days (0 = for ever)"),
+    ("last", "Always the last this many restore points, whatever their age"),
+    ("hourly", "Hourly: one restore point an hour is kept for this many hours"),
+    ("daily", "Daily: one a day is kept for this many days"),
+    ("weekly", "Weekly: one a week is kept for this many weeks"),
+    ("monthly", "Monthly: one a month is kept for this many months"),
 ];
+const AUTOMATIC: usize = 5;
 
 const RULES: [(&str, &str); 4] = [
-    ("set-every", "Minutes between automatic backups of this set (0 = each destination's own pace)"),
-    ("set-hours", "Hours this set may back up, such as 22-7 ('always' = the general hours)"),
-    ("set-versions", "Max versions kept of each file in this set (0 = unlimited)"),
-    ("set-days", "Delete this set's restore points older than this many days (0 = never)"),
+    ("set-every", "Back up every this many minutes (0 = each destination's own pace)"),
+    ("set-hours", "Only between these hours, such as 22-7 ('always' = the general hours)"),
+    ("set-versions", "Keep this many versions of each file in this set (0 = all of them)"),
+    ("set-days", "Keep this set's restore points for this many days (0 = for ever)"),
 ];
 
 struct App {
@@ -963,10 +966,10 @@ impl App {
                 act("Delete this set".into(), Act::DeleteSet),
             ],
             Kind::Rules(_) => vec![
-                val("Minutes between backups", "set-every"),
-                val("Backup hours", "set-hours"),
-                val("Max versions of a file", "set-versions"),
-                val("Max age in days", "set-days"),
+                val("Back up every (min)", "set-every"),
+                val("Only between (hours)", "set-hours"),
+                val("Keep versions", "set-versions"),
+                val("Keep for (days)", "set-days"),
             ],
             Kind::Restore => self.cfg.sets.iter().map(|b| go(&b.name, Kind::RestoreSet(b.name.clone()))).collect(),
             Kind::RestoreSet(_) => {
@@ -1005,16 +1008,16 @@ impl App {
                 let Some(f) = self.cfg.friends.iter().find(|f| &f.name == n) else { return vec![] };
                 let mut v = vec![
                     act(format!("In use: {}", if f.backup_to { "yes" } else { "no" }), Act::UseDest),
-                    act(format!("Back up here every: {} min", f.interval_secs(&self.cfg) / 60), Act::Pace),
+                    act(format!("Back up every: {} min", f.interval_secs(&self.cfg) / 60), Act::Pace),
                 ];
                 if f.is_friend() {
-                    v.push(act(format!("They may store here: {} GB", f.quota_gb), Act::Quota));
+                    v.push(act(format!("Their quota: {} GB", f.quota_gb), Act::Quota));
                     let speed = if f.max_in_kbps == 0 { "any".to_string() } else { format!("{} KB/s", f.max_in_kbps) };
-                    v.push(act(format!("Their upload speed here: {speed}"), Act::InLimit));
+                    v.push(act(format!("Their speed: {speed}"), Act::InLimit));
                 }
                 if f.cloud.is_some() {
                     let cap = if f.quota_gb == 0 { "no cap".to_string() } else { format!("{} GB", f.quota_gb) };
-                    v.push(act(format!("Store at most: {cap}"), Act::Quota));
+                    v.push(act(format!("Cap: {cap}"), Act::Quota));
                     v.push(act("New keys or address".into(), Act::AddCloud));
                 }
                 let rule = |n: Option<u32>| match n {
@@ -1023,11 +1026,11 @@ impl App {
                     Some(n) => n.to_string(),
                 };
                 v.push(act(
-                    format!("Max age in days here: {}", rule(f.retention.as_ref().map(|r| r.keep_days))),
+                    format!("Keep days of history: {}", rule(f.retention.as_ref().map(|r| r.keep_days))),
                     Act::DestDays,
                 ));
                 v.push(act(
-                    format!("Keep most recent here: {}", rule(f.retention.as_ref().map(|r| r.keep_last))),
+                    format!("Always the last: {}", rule(f.retention.as_ref().map(|r| r.keep_last))),
                     Act::DestLast,
                 ));
                 if f.retention.is_some() {
@@ -1041,23 +1044,23 @@ impl App {
             Kind::Settings => vec![
                 act(
                     format!(
-                        "Start at login: {}",
-                        if self.ov["service"].as_bool() == Some(true) { "yes" } else { "no" }
+                        "At login: {}",
+                        if self.ov["service"].as_bool() == Some(true) { "starts by itself" } else { "not started" }
                     ),
                     Act::ServiceInfo,
                 ),
-                val("Backup hours", "hours"),
-                val("Automatic backups", "pause"),
-                val("Minutes between drive backups", "every"),
-                val("Upload limit KB/s", "limit"),
-                val("Warn after days", "warn"),
-                val("Max versions of a file", "versions"),
-                val("Max age in days", "days"),
-                val("Keep most recent", "last"),
-                val("Keep hourly", "hourly"),
-                val("Keep daily", "daily"),
-                val("Keep weekly", "weekly"),
-                val("Keep monthly", "monthly"),
+                val("Only between (hours)", "hours"),
+                val("Right now", "pause"),
+                val("Drives every (min)", "every"),
+                val("Upload limit (KB/s)", "limit"),
+                val("Warn after (days)", "warn"),
+                val("Keep versions", "versions"),
+                val("Keep for (days)", "days"),
+                val("Always the last", "last"),
+                val("Hourly (hours)", "hourly"),
+                val("Daily (days)", "daily"),
+                val("Weekly (weeks)", "weekly"),
+                val("Monthly (months)", "monthly"),
                 go("Exclusion lists", Kind::Excludes),
             ],
             Kind::Excludes => {
@@ -1764,6 +1767,30 @@ impl App {
         }
     }
 
+    /// Rows of a card: a dim label in a column of its own, then what it holds; further lines
+    /// of the same row line up under the first.
+    fn labelled<'a>(label: &str, lines: Vec<Line<'a>>) -> Vec<Line<'a>> {
+        let dim = Style::new().fg(Color::DarkGray);
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let lead = if i == 0 { format!("  {label:<14}") } else { " ".repeat(16) };
+                let mut spans = vec![Span::styled(lead, dim)];
+                spans.extend(line.spans);
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    /// The folders of a set, one to a line.
+    fn folder_lines(b: &BackupSet) -> Vec<Line<'static>> {
+        if b.paths.is_empty() {
+            return vec![Line::raw("nothing chosen yet")];
+        }
+        b.paths.iter().map(|p| Line::raw(tilde(&p.display().to_string()))).collect()
+    }
+
     fn draw_sets(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
         let warnings: Vec<String> = self.ov["warnings"]
             .as_array()
@@ -1798,60 +1825,62 @@ impl App {
                     head.push(Span::styled(format!("   last backup {}", ago(o.and_then(|o| o["last"].as_i64()))), dim))
                 }
             }
-            let files = if b.paths.is_empty() {
-                "nothing chosen yet".to_string()
-            } else {
-                b.paths.iter().map(|p| tilde(&p.display().to_string())).collect::<Vec<_>>().join(", ")
-            };
-            let mut dests = vec![Span::styled("  Destinations  ", dim)];
+            let mut lines = vec![Line::from(head)];
+            lines.extend(Self::labelled("Files", Self::folder_lines(b)));
+            // One destination to a line, in columns: where, when it last got a backup, what is next.
             let list: Vec<_> = self.cfg.friends.iter().filter(|x| b.sends_to(x)).collect();
-            if list.is_empty() {
-                dests.push(Span::raw("none yet"));
-            }
-            for x in list {
+            let wide = list.iter().map(|x| x.name.chars().count()).max().unwrap_or(0);
+            let mut dests: Vec<Line> = vec![];
+            for x in &list {
                 let d =
                     o.and_then(|o| o["dests"].as_array()).and_then(|a| a.iter().find(|d| d["name"] == x.name.as_str()));
                 let last = d.and_then(|d| d["last"].as_i64());
                 // When the daemon will next send to this destination, if anything is waiting.
                 let next = match d {
-                    Some(d) if d["held"].as_bool() == Some(true) => ", next: held".to_string(),
+                    Some(d) if d["held"].as_bool() == Some(true) => "next: held".to_string(),
                     Some(d) => match d["next"].as_i64() {
-                        Some(t) => format!(", next {}", until(t)),
-                        None if last.is_some() => ", up to date".to_string(),
+                        Some(t) => format!("next {}", until(t)),
+                        None if last.is_some() => "up to date".to_string(),
                         None => String::new(),
                     },
                     None => String::new(),
                 };
                 let (dot, color) = self.dest_state(&x.name);
-                let stale = last.is_none_or(|t| now - t > warn_secs);
-                dests.push(Span::styled(format!("{dot} "), Style::new().fg(color)));
-                dests.push(Span::raw(x.name.clone()));
-                dests.push(Span::styled(
-                    format!(" {}{next}    ", ago(last)),
-                    if stale && !b.paths.is_empty() { Style::new().fg(Color::Yellow) } else { dim },
-                ));
+                let stale = last.is_none_or(|t| now - t > warn_secs) && !b.paths.is_empty();
+                dests.push(Line::from(vec![
+                    Span::styled(format!("{dot} "), Style::new().fg(color)),
+                    Span::raw(format!("{:<wide$}  ", x.name)),
+                    Span::styled(
+                        format!("{:<12}", ago(last)),
+                        if stale { Style::new().fg(Color::Yellow) } else { dim },
+                    ),
+                    Span::styled(next, dim),
+                ]));
             }
+            if dests.is_empty() {
+                dests.push(Line::raw("none yet"));
+            }
+            lines.extend(Self::labelled("Destinations", dests));
             let pace = if b.every_minutes > 0 {
                 format!("every {} min", b.every_minutes)
             } else {
                 "each destination's own pace".into()
             };
-            let hours = if b.hours.is_empty() { "general hours".to_string() } else { format!("hours {}", b.hours) };
+            let hours = if b.hours.is_empty() { "default hours".to_string() } else { format!("hours {}", b.hours) };
             let keep = match &b.retention {
                 Some(r) if r.max_versions > 0 || r.keep_days > 0 => {
-                    format!("own history rules (versions {}, days {})", r.max_versions, r.keep_days)
+                    format!(" · own history rules (versions {}, days {})", r.max_versions, r.keep_days)
                 }
-                _ => "general history rules".into(),
+                _ => String::new(),
             };
-            items.push(ListItem::new(Text::from(vec![
-                Line::from(head),
-                Line::from(vec![Span::styled("  Files         ", dim), Span::raw(files)]),
-                Line::from(dests),
-                Line::from(vec![
-                    Span::styled("  Schedule      ", dim),
-                    Span::raw(format!("{pace} · {hours} · {keep}")),
-                ]),
-            ])));
+            lines.extend(Self::labelled("Schedule", vec![Line::raw(format!("{pace} · {hours}{keep}"))]));
+            let skipped = match b.skip.len() {
+                0 => String::new(),
+                n => format!(" · {n} left out by hand"),
+            };
+            let list = format!("{} list{skipped}", self.cfg.list_for(b).name);
+            lines.extend(Self::labelled("Leaves out", vec![Line::raw(list)]));
+            items.push(ListItem::new(Text::from(lines)));
         }
         items.push(ListItem::new(Line::styled("+ New backup set", Style::new().fg(Color::Green))));
         if self.sets.selected().is_none() {
@@ -1930,19 +1959,30 @@ impl App {
     }
 
     fn draw_values(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
-        let (rows, title): (&[(&str, &str)], String) = if self.page == SETTINGS {
-            (&GENERAL, " Defaults: backup sets can override ".into())
-        } else {
-            (&RULES, format!(" Backup > {} > Schedule and history rules ", self.set))
-        };
-        let items: Vec<ListItem> =
-            rows.iter().map(|(k, label)| ListItem::new(format!("{:>18}   {label}", self.setting_text(k)))).collect();
-        let st = if self.page == SETTINGS { &mut self.settings } else { &mut self.rules };
-        if st.selected().is_none() {
-            st.select(Some(0));
+        let row = |me: &Self, k: &str, label: &str| ListItem::new(format!("{:>18}   {label}", me.setting_text(k)));
+        if self.page != SETTINGS {
+            let items: Vec<ListItem> = RULES.iter().map(|(k, label)| row(self, k, label)).collect();
+            if self.rules.selected().is_none() {
+                self.rules.select(Some(0));
+            }
+            let title = format!(" Backup > {} > Schedule and history ", self.set);
+            let block = Block::bordered().title(title).border_style(focus);
+            f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, &mut self.rules);
+            return;
         }
-        let block = Block::bordered().title(title).border_style(focus);
-        f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, st);
+        // Two groups under their headings, as the window shows them. The headings are rows of
+        // the list too, so the chosen setting sits a little further down than its number.
+        let heading =
+            |text: &str| ListItem::new(Line::styled(text.to_string(), Style::new().add_modifier(Modifier::BOLD)));
+        let mut items = vec![heading("Automatic backups")];
+        items.extend(GENERAL[..AUTOMATIC].iter().map(|(k, label)| row(self, k, label)));
+        items.push(ListItem::new(""));
+        items.push(heading("History kept"));
+        items.extend(GENERAL[AUTOMATIC..].iter().map(|(k, label)| row(self, k, label)));
+        let chosen = self.settings.selected().map(|i| if i < AUTOMATIC { i + 1 } else { i + 3 });
+        let mut st = ListState::default().with_selected(chosen);
+        let block = Block::bordered().title(" Settings: for every set that has none of its own ").border_style(focus);
+        f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, &mut st);
     }
 
     /// The exclusion lists: one in full when it is chosen, otherwise all of them in short.
@@ -2013,44 +2053,46 @@ impl App {
                 None => link,
             };
             let there = match (get("used_there").as_u64(), get("quota_there").as_u64()) {
-                (Some(u), Some(q)) => format!("you use {} of {} there", human(u), human(q)),
-                (Some(u), None) => format!("you use {} there", human(u)),
-                _ => String::new(),
+                (Some(u), Some(q)) => format!("{} of {} there", human(u), human(q)),
+                (Some(u), None) => format!("{} there", human(u)),
+                _ => "not known yet".to_string(),
             };
             let off = if x.backup_to { "" } else { "   NOT IN USE" };
-            let head = Line::from(vec![
+            let mut lines = vec![Line::from(vec![
                 Span::styled(format!("{dot} "), Style::new().fg(color)),
-                Span::styled(format!("{:<18}", x.name), Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{:<6}   {state}{link}", x.kind())),
+                Span::styled(format!("{:<16}", x.name), Style::new().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{} · {state}{}", x.kind(), link.replacen(", ", " · ", 9)), dim),
                 Span::styled(off, Style::new().fg(Color::Yellow)),
-            ]);
-            let second = match (&x.path, &x.cloud) {
-                (Some(p), _) => format!("    {}   {there}", p.display()),
-                (_, Some(c)) => format!(
-                    "    bucket {} at {}   {there}{}",
-                    c.bucket,
-                    c.endpoint,
-                    if x.quota_gb > 0 { "" } else { " (no cap)" }
+            ])];
+            let sent = format!("{there} · last sent {}", ago(get("last_out").as_i64()));
+            lines.extend(Self::labelled("You use", vec![Line::raw(sent)]));
+            lines.extend(match (&x.path, &x.cloud) {
+                (Some(p), _) => Self::labelled("Folder", vec![Line::raw(p.display().to_string())]),
+                (_, Some(c)) => Self::labelled("Bucket", vec![Line::raw(format!("{} at {}", c.bucket, c.endpoint))]),
+                _ => Self::labelled(
+                    "They use",
+                    vec![Line::raw(format!(
+                        "{} of {} GB here · last backup from them {}",
+                        human(get("used_here").as_u64().unwrap_or(0)),
+                        x.quota_gb,
+                        ago(get("last_in").as_i64())
+                    ))],
                 ),
-                _ => format!(
-                    "    {there}   they use {} of {} GB here{}, last backup from them {}",
-                    human(get("used_here").as_u64().unwrap_or(0)),
-                    x.quota_gb,
-                    if x.max_in_kbps > 0 { format!(" at up to {} KB/s", x.max_in_kbps) } else { String::new() },
-                    ago(get("last_in").as_i64())
-                ),
-            };
-            let keeps = match &x.retention {
-                Some(r) if r.keep_days > 0 => format!(", keeps {} days of history", r.keep_days),
-                Some(r) => format!(", keeps its own history (last {})", r.keep_last),
-                None => String::new(),
-            };
-            let third = format!(
-                "    automatic backups every {} min, last sent {}{keeps}",
-                x.interval_secs(&self.cfg) / 60,
-                ago(get("last_out").as_i64())
-            );
-            items.push(ListItem::new(Text::from(vec![head, Line::raw(second), Line::styled(third, dim)])));
+            });
+            let mut rules = vec![format!("every {} min", x.interval_secs(&self.cfg) / 60)];
+            if x.is_friend() && x.max_in_kbps > 0 {
+                rules.push(format!("their speed {} KB/s", x.max_in_kbps));
+            }
+            if x.cloud.is_some() {
+                rules.push(if x.quota_gb > 0 { format!("cap {} GB", x.quota_gb) } else { "no cap".into() });
+            }
+            match &x.retention {
+                Some(r) if r.keep_days > 0 => rules.push(format!("keeps {} days of history", r.keep_days)),
+                Some(r) => rules.push(format!("always keeps the last {}", r.keep_last)),
+                None => {}
+            }
+            lines.extend(Self::labelled("Back up", vec![Line::styled(rules.join(" · "), dim)]));
+            items.push(ListItem::new(Text::from(lines)));
         }
         let block = Block::bordered()
             .title(" Destinations: friends' computers, local drives and cloud storage ")
@@ -2076,17 +2118,16 @@ impl App {
                 Some(n) => format!("{n} files, {}", human(o.and_then(|o| o["bytes"].as_u64()).unwrap_or(0))),
                 None => "not backed up yet".into(),
             };
-            let head = Line::from(vec![
-                Span::styled(format!("{:<18}", b.name), Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(size),
+            let mut lines = vec![Line::from(vec![
+                Span::styled(b.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("   {size}")),
                 Span::styled(format!("   last backup {}", ago(o.and_then(|o| o["last"].as_i64()))), dim),
-            ]);
-            let files = if b.paths.is_empty() {
-                "no folders chosen".to_string()
-            } else {
-                b.paths.iter().map(|p| tilde(&p.to_string_lossy())).collect::<Vec<_>>().join(", ")
-            };
-            items.push(ListItem::new(Text::from(vec![head, Line::styled(format!("  {files}"), dim)])));
+            ])];
+            lines.extend(Self::labelled("Files", Self::folder_lines(b)));
+            let on: Vec<&str> = self.cfg.friends.iter().filter(|x| b.sends_to(x)).map(|x| x.name.as_str()).collect();
+            let kept = if on.is_empty() { "no destination yet".to_string() } else { on.join(", ") };
+            lines.extend(Self::labelled("Kept on", vec![Line::raw(kept)]));
+            items.push(ListItem::new(Text::from(lines)));
         }
         let block = Block::bordered().title(" Restore: choose a backup set ").border_style(focus);
         f.render_stateful_widget(Self::cards(items, block, hl != Style::new()), area, &mut self.rsets);

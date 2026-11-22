@@ -128,7 +128,8 @@ when each last got a backup), its schedule, and what it is doing right now.
 ## The GUI
 
 `sdb gui` opens the same thing in a window: the backup sets with their status,
-restore with a timeline, destinations, defaults, history and status. It is
+restore with a timeline, destinations, settings, history and status. A backup
+set opens on the page, with tabs for its files, destinations and schedule. It is
 another client of the daemon, built with egui into the same binary. It needs a
 desktop session only when you run it; everything else works without one. Build
 with `cargo build --release --no-default-features` to leave it out.
@@ -141,6 +142,56 @@ that talk to it over a private local socket. The first command starts it if it
 is not running, and replaces it if it was started by an older build;
 `sdb stop` stops it and `sdb service install` starts it at login. Its log is
 `~/.super-duper-backup/daemon.log`.
+
+## Running the daemon in Docker
+
+For a machine that only needs the daemon, such as a server that stores friends'
+backups, there is an image for amd64 and arm64 Linux. It has no window; the
+command line and the TUI are both in it.
+
+```bash
+docker run -d --name sdb --restart unless-stopped --network host \
+  -e SDB_NAME=myserver \
+  -v /srv/sdb/config:/config -v /bigdisk/sdb:/backups \
+  ghcr.io/awick/super-duper-backup
+```
+
+The first start sets the node up. It keeps two folders:
+
+| In the container | What is there |
+| --- | --- |
+| `/config` | the node's identity, its settings and its caches: small, and the part to look after |
+| `/backups` | what friends store on this node: mount the disk with the room here |
+
+The daemon runs as user 1000, which must be able to write to both
+(`chown 1000` them, or add `--user "$(id -u):$(id -g)"` to run as yourself).
+
+Every `sdb` command works through `docker exec`:
+
+```bash
+docker exec sdb sdb invite                        # a code to send to a friend
+docker exec sdb sdb join sdb1...                  # or accept theirs
+docker exec sdb sdb destination quota andy 500    # how much a friend may store
+docker exec sdb sdb status
+docker exec -it sdb sdb tui                       # the interface in the terminal
+```
+
+To back up folders of the machine itself, mount them and add them:
+`-v /home/me/photos:/backup/photos:ro`, then
+`docker exec sdb sdb add /backup/photos`. Keep the recovery kit outside the
+container: `docker exec -it sdb sdb recovery export /config/kit.json`, then
+move that file somewhere else.
+
+`--network host` lets friends reach the node directly and lets it ask the
+router to forward its port. Without it, give the node a fixed port the first
+time it starts and publish that: `-e SDB_PORT=45000 -p 45000:45000/udp`. It
+works either way, since nodes fall back to the relay, only more slowly.
+
+`:latest` is the newest release and each release also has its own tag. Friends
+need a release that speaks the same protocol version, so update both ends
+together: `docker pull`, then remove and start the container again; the node
+lives in the two folders, not in the container. To build the image yourself, run
+`docker build -t sdb .` in a checkout.
 
 ## How it works
 
@@ -333,7 +384,10 @@ Docker (macOS): `SDB_TEST_S3=emulator tests/cloud.sh target/release/sdb`.
 To publish a release, raise `version` in `Cargo.toml`, push, and run the
 `release` workflow on GitHub (`gh workflow run release`). It names the release
 after that version and attaches binaries for macOS and Linux, built with the
-slower, smaller `dist` profile (`cargo build --profile dist`).
+slower, smaller `dist` profile (`cargo build --profile dist`). It also pushes the
+Docker images to `ghcr.io/awick/super-duper-backup`. GitHub builds and tries
+the image on every push (`tests/docker.sh`), without publishing it. To rehearse a
+release without publishing anything, run it with `-f dry_run=true`.
 
 The app icon is drawn in `assets/icon.svg`; `icon.png` (built into the window)
 and `icon.icns` (for a Mac app bundle) are made from it with `rsvg-convert` and

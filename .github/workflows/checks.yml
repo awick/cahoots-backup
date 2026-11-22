@@ -76,3 +76,16 @@ jobs:
         run: cargo build --release --no-default-features
       - name: Cloud destination test
         run: SDB_TEST_S3=emulator sh tests/cloud.sh target/release/sdb
+
+  # The image is only published with a release, but it is built and tried on every push so
+  # that it still works when the time comes.
+  image:
+    name: docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t sdb .
+      - name: The daemon starts, answers and stops
+        run: sh tests/docker.sh sdb

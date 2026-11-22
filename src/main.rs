@@ -43,6 +43,12 @@ enum C {
     Init {
         #[arg(long)]
         name: Option<String>,
+        /// UDP port to listen on (default: one picked at random, then kept)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Folder for what friends store on this computer (default: inside the node's own folder)
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
     /// Run in the background: store friends' backups, watch your files, back up changes
     Daemon,
@@ -509,7 +515,7 @@ async fn main() {
 async fn real_main() -> Result<()> {
     let home = config::home();
     let cmd = match Cli::parse().cmd {
-        C::Init { name } => {
+        C::Init { name, port, store } => {
             if home.join("identity.key").exists() {
                 bail!("{} is already set up", home.display());
             }
@@ -520,7 +526,9 @@ async fn real_main() -> Result<()> {
             fs::create_dir_all(&home)?;
             fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
             Identity::generate().save(&home)?;
-            let cfg = Config::new(name);
+            let mut cfg = Config::new(name);
+            cfg.port = port.unwrap_or(cfg.port);
+            cfg.store_dir = store.map(|s| std::path::absolute(&s)).transpose()?;
             cfg.save(&home)?;
             println!("Set up \"{}\" in {}", cfg.name, home.display());
             println!("Next: `sdb add <folder>`, `sdb invite` (or `sdb join <invite>`), `sdb service install`.");

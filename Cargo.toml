@@ -26,6 +26,7 @@ postcard = { version = "1.1.3", features = ["use-std"] }
 rand = "0.10.4"
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"], optional = true }
 rpassword = "7.5.5"
 rustix = { version = "1.1.6", features = ["fs", "process", "system"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
@@ -57,4 +58,4 @@ codegen-units = 1
 [features]
 default = ["gui"]
 # The graphical interface (`sdb gui`). Build with --no-default-features to leave it out.
-gui = ["dep:eframe"]
+gui = ["dep:eframe", "dep:rfd"]
