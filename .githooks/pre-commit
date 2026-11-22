@@ -1,3 +1,4 @@
 #!/bin/sh
 # Enable with: git config --local core.hooksPath .githooks/
-exec "$(git rev-parse --show-toplevel)/check.sh"
+# The quick checks only; the slow tests run on GitHub for every push.
+exec "$(git rev-parse --show-toplevel)/check.sh" quick

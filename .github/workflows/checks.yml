@@ -1,0 +1,78 @@
+# Copyright Andy Wick
+# SPDX-License-Identifier: Apache-2.0
+
+# Everything check.sh covers, on Linux and macOS, plus the cloud test against MinIO.
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MINIO: v0.0.0-20260212201848-7aac2a2c5b7c
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: check-${{ runner.os }}-
+      - name: Format, lints, unit tests, end-to-end and damage tests
+        run: ./check.sh
+
+  cloud:
+    name: cloud storage (MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: rustup update stable && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cloud-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cloud-${{ runner.os }}-
+      # MinIO is only published as source now, so it is built once and kept.
+      - uses: actions/cache@v4
+        id: minio
+        with:
+          path: ~/go/bin/minio
+          key: minio-${{ runner.os }}-${{ env.MINIO }}
+      - name: Build MinIO
+        if: steps.minio.outputs.cache-hit != 'true'
+        run: go install github.com/minio/minio@${{ env.MINIO }}
+      - name: Build without the window
+        run: cargo build --release --no-default-features
+      - name: Cloud destination test
+        run: |
+          export PATH="$HOME/go/bin:$PATH"
+          command -v minio
+          sh tests/cloud.sh target/release/sdb

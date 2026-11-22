@@ -1,0 +1,83 @@
+# Copyright Andy Wick
+# SPDX-License-Identifier: Apache-2.0
+
+# Publishes a GitHub release named after the version in Cargo.toml, with binaries for
+# macOS and Linux. Started by hand (Actions > release > Run workflow, or
+# `gh workflow run release`): raise the version in Cargo.toml, push, then run it.
+name: release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: version from Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$version" ] || { echo "no version in Cargo.toml"; exit 1; }
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "v$version is already released: raise the version in Cargo.toml first"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - { name: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { name: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin }
+          # The older Ubuntu, so the binaries also run on systems with an older C library.
+          - { name: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          dir=sdb-${{ needs.version.outputs.version }}-${{ matrix.name }}
+          mkdir "$dir"
+          cp target/${{ matrix.target }}/release/sdb LICENSE README.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: sdb-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          sha256sum sdb-*.tar.gz >SHA256SUMS
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Super Duper Backup $VERSION" --generate-notes sdb-*.tar.gz SHA256SUMS

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Cloud destination test against a local S3 emulator (MinIO). Not part of check.sh:
-# it needs the `minio` program, or Docker to run it.
+# it needs the `minio` program (MinIO no longer publishes a Docker image).
 # Usage: tests/cloud.sh path/to/sdb
 set -eu
 SDB=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -15,7 +15,6 @@ MINIO=
 cleanup() {
     s stop >/dev/null 2>&1 || true
     [ -z "$MINIO" ] || kill "$MINIO" 2>/dev/null || true
-    docker rm -f "sdb-cloud-test-$$" >/dev/null 2>&1 || true
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -25,11 +24,8 @@ if command -v minio >/dev/null 2>&1; then
     MINIO_ROOT_USER=$KEY MINIO_ROOT_PASSWORD=$SDB_CLOUD_SECRET \
         minio server --address "127.0.0.1:$PORT" --console-address "127.0.0.1:$((PORT + 1))" "$T/minio" >"$T/minio.log" 2>&1 &
     MINIO=$!
-elif command -v docker >/dev/null 2>&1; then
-    docker run -d --rm --name "sdb-cloud-test-$$" -p "127.0.0.1:$PORT:9000" \
-        -e MINIO_ROOT_USER=$KEY -e MINIO_ROOT_PASSWORD="$SDB_CLOUD_SECRET" minio/minio server /data >/dev/null
 else
-    echo "skipped: neither minio nor docker is installed"
+    echo "skipped: the minio program is not installed"
     exit 0
 fi
 for _ in $(seq 1 40); do

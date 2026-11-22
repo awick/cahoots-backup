@@ -1617,10 +1617,13 @@ impl eframe::App for Gui {
 }
 
 pub fn run(home: PathBuf) -> anyhow::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1080.0, 700.0]).with_title("Super Duper Backup"),
-        ..Default::default()
-    };
+    let mut viewport =
+        egui::ViewportBuilder::default().with_inner_size([1080.0, 700.0]).with_title("Super Duper Backup");
+    // The window's icon, which on a Mac is also the one in the Dock.
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     let mut gui = Gui::new(home);
     gui.first_load();
     eframe::run_native("Super Duper Backup", options, Box::new(|_cc| Ok(Box::new(gui)))).map_err(|e| {

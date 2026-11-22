@@ -28,7 +28,14 @@ heals() {
     grep -q "repaired from another friend" verify.out || fail "$1: not noticed or not repaired ($(tail -1 verify.out))"
     a verify --full | grep -q "all good" || fail "$1: still wrong after the repair"
 }
-daemon_pid() { lsof -t "$T/$1/lock" 2>/dev/null | head -1; }
+# The daemon holds its home's lock file open; where lsof is missing, /proc says whose home is whose.
+daemon_pid() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -t "$T/$1/lock" 2>/dev/null | head -1
+    else
+        grep -lsa "SDB_HOME=$T/$1" /proc/[0-9]*/environ | head -1 | cut -d/ -f3
+    fi
+}
 
 cd "$T"
 mkdir -p data/sub drive

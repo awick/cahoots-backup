@@ -39,8 +39,13 @@ protects your files today. It is not affiliated with CrashPlan or its makers.
 
 ## Quick start
 
+Download `sdb` for macOS or Linux from the
+[releases page](https://github.com/awick/super-duper-backup/releases), or build
+it yourself with `cargo build --release` (the binary is `target/release/sdb`).
+The downloads are not signed, so a Mac asks before running one the first time;
+`xattr -d com.apple.quarantine sdb` tells it you trust it.
+
 ```bash
-cargo build --release              # binary is target/release/sdb
 sdb tui                            # interactive: backup sets, restore, destinations, settings
 sdb gui                            # the same in a window
 ```
@@ -289,24 +294,34 @@ Everything lives in `~/.super-duper-backup` (override with `SDB_HOME`):
 ## Development
 
 ```bash
-git config --local core.hooksPath .githooks/   # once per clone: run the checks before every commit
-./check.sh                                     # or run them by hand
+git config --local core.hooksPath .githooks/   # once per clone: quick checks before every commit
+./check.sh quick                               # what that hook runs: formatting, lints, unit tests
+./check.sh                                     # those plus the end-to-end and damage tests
 ```
 
-`check.sh` runs `cargo fmt --check`, clippy with warnings as errors, the unit
-tests, and `tests/e2e.sh`, which starts three local nodes and a drive (no
-internet needed) and exercises pairing, backup, restore, sets, a refused
-stranger, corruption detection and repair, pruning and exclusion lists.
+GitHub runs the full `./check.sh` on Linux and macOS for every push and pull
+request, and the cloud test as well, so a commit only waits for the quick part.
 
-`tests/damage.sh` is run by `check.sh` too. It ruins things on purpose and
-checks what happens: truncated, emptied, swapped and missing chunks, damaged
-restore point records, caches and config, odd file names, a file that changes
-mid-backup, a daemon killed mid-backup, a restore stopped half way, a friend
-with no room, and pruning while a friend is away.
+`tests/e2e.sh` starts three local nodes and a drive (no internet needed) and
+exercises pairing, backup, restore, sets, a refused stranger, corruption
+detection and repair, pruning and exclusion lists.
+
+`tests/damage.sh` ruins things on purpose and checks what happens: truncated,
+emptied, swapped and missing chunks, damaged restore point records, caches and
+config, odd file names, a file that changes mid-backup, a daemon killed
+mid-backup, a restore stopped half way, a friend with no room, and pruning
+while a friend is away.
 
 `tests/cloud.sh target/release/sdb` tests cloud destinations against a local S3
-emulator. It is separate because it needs MinIO (the `minio` program, or
-Docker to run it).
+emulator. It needs the `minio` program.
+
+To publish a release, raise `version` in `Cargo.toml`, push, and run the
+`release` workflow on GitHub (`gh workflow run release`). It names the release
+after that version and attaches binaries for macOS and Linux.
+
+The app icon is drawn in `assets/icon.svg`; `icon.png` (built into the window)
+and `icon.icns` (for a Mac app bundle) are made from it with `rsvg-convert` and
+`iconutil`.
 
 ## License
 
