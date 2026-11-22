@@ -235,6 +235,9 @@ impl Gui {
                     }
                 }
             }
+            "result" => {
+                self.popup = Some(("Status".into(), call(&self.home, &Cmd::Status, |_| {}).unwrap_or_default()));
+            }
             "destinations" => self.page = Page::Destinations,
             "settings" => self.page = Page::Settings,
             "history" | "status" => {
@@ -1261,13 +1264,19 @@ impl Gui {
                             }
                             self.fields.retain(|k, _| !k.ends_with(&format!("-{}", f.name)));
                         }
-                        let sure = self.fields.entry(format!("remove-{}", f.name)).or_default();
                         ui.separator();
+                        // What sets no longer sent here left behind: look first, then remove.
+                        let clean = |dry_run| Cmd::DestClean { name: f.name.clone(), dry_run };
+                        if ui.button("Leftovers?").on_hover_text("Shows what sets no longer sent here left behind").clicked() {
+                            self.spawn(&ctx, Job::Show("Leftovers"), clean(true), Some("Looking for leftovers"));
+                        }
+                        let sure = self.fields.entry(format!("remove-{}", f.name)).or_default();
                         ui.add(egui::TextEdit::singleline(sure).desired_width(40.0).hint_text("yes"));
-                        if ui
-                            .add_enabled(sure.trim().eq_ignore_ascii_case("yes"), egui::Button::new("Remove"))
-                            .clicked()
-                        {
+                        let yes = sure.trim().eq_ignore_ascii_case("yes");
+                        if ui.add_enabled(yes, egui::Button::new("Clean up")).clicked() {
+                            self.fields.remove(&format!("remove-{}", f.name));
+                            self.spawn(&ctx, Job::Show("Clean up"), clean(false), Some("Cleaning up"));
+                        } else if ui.add_enabled(yes, egui::Button::new("Remove")).clicked() {
                             self.save(&ctx, Cmd::FriendRemove { name: f.name.clone(), purge: false });
                         }
                     });
@@ -1324,6 +1333,7 @@ impl Gui {
                         ("cloud-bucket", "Bucket", "", false),
                         ("cloud-region", "Region", "us-east-1", false),
                         ("cloud-prefix", "Folder inside the bucket (optional)", "", false),
+                        ("cloud-ca", "CA certificate file (only for storage with its own)", "", false),
                         ("cloud-access", "Access key (key id)", "", false),
                         ("cloud-secret", "Secret key", "", true),
                     ];
@@ -1336,22 +1346,31 @@ impl Gui {
                     }
                 });
                 // Region and folder may stay blank.
-                let ready = [0, 1, 2, 5, 6].iter().all(|i| !got[*i].is_empty());
+                let ready = [0, 1, 2, 6, 7].iter().all(|i| !got[*i].is_empty());
                 if ui.add_enabled(ready, egui::Button::new("Check and add")).clicked() {
                     let mut it = got.into_iter();
                     let mut next = || it.next().unwrap_or_default();
-                    let cmd = Cmd::CloudAdd {
-                        name: next(),
-                        endpoint: next(),
-                        bucket: next(),
-                        region: Some(next()),
-                        prefix: Some(next()),
-                        access_key: next(),
-                        secret_key: next(),
-                        path_style: None,
-                        create: false,
-                    };
-                    self.spawn(&ctx, Job::Show(CLOUD_JOB), cmd, Some("Checking the cloud storage"));
+                    let (name, endpoint, bucket, region, prefix, ca) = (next(), next(), next(), next(), next(), next());
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let ca_pem = if ca.is_empty() { Ok(None) } else { std::fs::read_to_string(ca.replacen('~', &home, 1)).map(Some) };
+                    match ca_pem {
+                        Ok(ca_pem) => {
+                            let cmd = Cmd::CloudAdd {
+                                name,
+                                endpoint,
+                                bucket,
+                                region: Some(region),
+                                prefix: Some(prefix),
+                                access_key: next(),
+                                secret_key: next(),
+                                path_style: None,
+                                create: false,
+                                ca_pem,
+                            };
+                            self.spawn(&ctx, Job::Show(CLOUD_JOB), cmd, Some("Checking the cloud storage"));
+                        }
+                        Err(e) => self.status = format!("Cannot read the CA certificate file {ca}: {e}"),
+                    }
                 }
             });
         });
@@ -1582,6 +1601,31 @@ impl eframe::App for Gui {
                 }
             });
         });
+        // What a command answered sits under the page it was started from, where it can be
+        // read, selected and copied without covering anything.
+        if let Some((title, lines)) = self.popup.clone() {
+            egui::Panel::bottom("result").resizable(true).default_size(230.0).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(&title);
+                    if ui.button("Copy").clicked() {
+                        ctx.copy_text(lines.join("\n"));
+                        self.status = "Copied.".into();
+                    }
+                    if ui.button("Close").clicked() {
+                        self.popup = None;
+                    }
+                });
+                egui::ScrollArea::vertical().id_salt("result").show(ui, |ui| {
+                    // A text box so any part can be selected; what is typed into it is not kept.
+                    let mut text = lines.join("\n");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| match self.page {
             Page::Backup => self.backup_page(ui),
             Page::Restore => self.restore_page(ui),
@@ -1593,26 +1637,6 @@ impl eframe::App for Gui {
             Page::Status => self.text_page(ui, "Status"),
         });
         self.edit_window(&ctx);
-
-        if let Some((title, lines)) = self.popup.clone() {
-            let mut open = true;
-            egui::Window::new(title).collapsible(false).open(&mut open).show(&ctx, |ui| {
-                for l in &lines {
-                    ui.label(l);
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Copy").clicked() {
-                        ctx.copy_text(lines.join("\n"));
-                    }
-                    if ui.button("Close").clicked() {
-                        self.popup = None;
-                    }
-                });
-            });
-            if !open {
-                self.popup = None;
-            }
-        }
     }
 }
 

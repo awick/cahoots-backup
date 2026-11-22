@@ -81,7 +81,7 @@ restore point shortly after files stop changing.
 | `sdb set NAME --to usb,barney --every 15 --hours 22-7 --versions 5 --days 90` | where a set goes, how often, when, and its own history rules |
 | `sdb sets` / `sdb backup --set NAME` | list sets / back up one set now |
 | `sdb drive NAME PATH` | also back up to an external drive or folder (encrypted the same way; skipped while unplugged) |
-| `sdb cloud NAME --endpoint URL --bucket B --access-key K` | also back up to cloud storage: any S3-compatible bucket (Amazon S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO); the secret key is asked for, never typed on the command line |
+| `sdb cloud NAME --endpoint URL --bucket B --access-key K` | also back up to cloud storage: any S3-compatible bucket (Amazon S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO); the secret key is asked for, never typed on the command line; `--ca-file FILE` is for storage with a certificate of its own |
 | `sdb destination keep NAME --days 30 --last 5` | how much history one destination keeps, instead of each set's rules (`--default` goes back) |
 | `sdb every MINUTES [NAME]` | how often automatic backups go to one destination (friends default to 60 minutes, a new drive to 15) |
 | `sdb limit KBPS` | cap upload speed across friends (0 = unlimited) |
@@ -97,6 +97,7 @@ restore point shortly after files stop changing.
 | `sdb skip PATH [--remove]` | leave one folder or file out of the set that backs it up |
 | `sdb set NAME --rename NEW` | rename a backup set; its restore points stay with it |
 | `sdb destination backup-to NAME false` | stop using a destination |
+| `sdb destination clean NAME [--dry-run]` | after taking a destination off a set: delete that set's restore points there and the chunks only they used |
 | `sdb verify --set NAME` | the same checks for one backup set (also on each set in the TUI and GUI) |
 | `sdb verify [--full]` | check friends still hold your data and it decrypts; repairs damage from another friend |
 | `sdb verify --local` | fingerprint your unmodified files against the last backup to catch silent disk corruption |
@@ -225,7 +226,10 @@ A cap in GB (`sdb destination quota`) works like a friend's quota: when it is
 reached the oldest restore points there go first, never the newest of a set.
 Restores read from a local drive first, then friends, then the cloud, since
 cloud downloads usually cost money. Plain `http://` endpoints are only accepted
-on this computer itself.
+on this computer itself. Storage whose certificate no public authority vouches
+for (a private server, an emulator) is refused unless you name its certificate
+with `--ca-file`; that certificate, and nothing else, is then trusted for that
+one destination.
 
 **What is left out.** Each set uses one exclusion list. `Standard` (the
 default) names things nobody wants back: trash, caches, `node_modules`,
@@ -296,11 +300,11 @@ Everything lives in `~/.super-duper-backup` (override with `SDB_HOME`):
 ```bash
 git config --local core.hooksPath .githooks/   # once per clone: quick checks before every commit
 ./check.sh quick                               # what that hook runs: formatting, lints, unit tests
-./check.sh                                     # those plus the end-to-end and damage tests
+./check.sh                                     # those plus the end-to-end, damage and cloud tests
 ```
 
 GitHub runs the full `./check.sh` on Linux and macOS for every push and pull
-request, and the cloud test as well, so a commit only waits for the quick part.
+request, so a commit only waits for the quick part.
 
 `tests/e2e.sh` starts three local nodes and a drive (no internet needed) and
 exercises pairing, backup, restore, sets, a refused stranger, corruption
@@ -312,8 +316,14 @@ config, odd file names, a file that changes mid-backup, a daemon killed
 mid-backup, a restore stopped half way, a friend with no room, and pruning
 while a friend is away.
 
-`tests/cloud.sh target/release/sdb` tests cloud destinations against a local S3
-emulator. It needs the `minio` program.
+`tests/cloud.sh` tests cloud destinations against a local stand-in for S3, and
+can use two. `./check.sh` runs it against `tests/mini-aws.pl`, a small S3
+server in Perl shared with the Arkime tests: nothing to install, done in
+seconds. GitHub also runs it against
+[AWS Emulator](https://github.com/aws/aws-emulator), AWS's own stand-in, which
+checks signatures and serves https with a certificate of its own. To do that
+yourself you need the AWS CLI and either the `aws-emulator` program (Linux) or
+Docker (macOS): `SDB_TEST_S3=emulator tests/cloud.sh target/release/sdb`.
 
 To publish a release, raise `version` in `Cargo.toml`, push, and run the
 `release` workflow on GitHub (`gh workflow run release`). It names the release

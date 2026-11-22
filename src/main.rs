@@ -205,6 +205,10 @@ enum C {
         /// Create the bucket if it is not there yet
         #[arg(long)]
         create: bool,
+        /// Trust the certificates in this PEM file for this storage, instead of the usual
+        /// ones (a private server or an emulator with a certificate of its own)
+        #[arg(long)]
+        ca_file: Option<PathBuf>,
     },
     /// Apply the keep rules now and reclaim space at your friends
     Prune {
@@ -266,6 +270,14 @@ enum FriendCmd {
         name: String,
         #[arg(action = clap::ArgAction::Set)]
         on: bool,
+    },
+    /// Remove from a destination the restore points of sets no longer sent there, and
+    /// the chunks only they used
+    Clean {
+        name: String,
+        /// Show what would be removed without removing it
+        #[arg(long)]
+        dry_run: bool,
     },
     /// How much history one destination keeps, instead of each set's own rules
     Keep {
@@ -598,6 +610,7 @@ async fn real_main() -> Result<()> {
             FriendCmd::Quota { name, gb } => Cmd::FriendQuota { name, gb },
             FriendCmd::Limit { name, kbps } => Cmd::FriendLimit { name, kbps },
             FriendCmd::BackupTo { name, on } => Cmd::FriendBackupTo { name, on },
+            FriendCmd::Clean { name, dry_run } => Cmd::DestClean { name, dry_run },
             FriendCmd::Keep { name, days, last, hourly, daily, weekly, monthly, default } => {
                 let set: Vec<(String, u32)> = [
                     ("days", days),
@@ -697,13 +710,17 @@ async fn real_main() -> Result<()> {
         C::Drive { name, path } => {
             Cmd::DriveAdd { name, path: fs::canonicalize(&path).with_context(|| path.display().to_string())? }
         }
-        C::Cloud { name, endpoint, bucket, access_key, region, prefix, path_style, create } => {
+        C::Cloud { name, endpoint, bucket, access_key, region, prefix, path_style, create, ca_file } => {
+            let ca_pem = match &ca_file {
+                Some(p) => Some(fs::read_to_string(p).with_context(|| p.display().to_string())?),
+                None => None,
+            };
             let secret_key = match std::env::var("SDB_CLOUD_SECRET") {
                 Ok(s) => s,
                 Err(_) => rpassword::prompt_password("Secret key: ")?,
             };
             let path_style = path_style.then_some(true);
-            Cmd::CloudAdd { name, endpoint, bucket, region, prefix, access_key, secret_key, path_style, create }
+            Cmd::CloudAdd { name, endpoint, bucket, region, prefix, access_key, secret_key, path_style, create, ca_pem }
         }
         C::Prune { dry_run } => Cmd::Prune { dry_run },
         C::Forget { snap } => Cmd::Forget { snap },

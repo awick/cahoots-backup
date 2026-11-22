@@ -80,12 +80,20 @@ impl Bucket {
         let prefix = c.prefix.trim_matches('/');
         // Fine if one is installed already.
         let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(pem) = &c.ca_pem {
+            // Only what was named is trusted for this destination, not the usual authorities too.
+            let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+                .ok()
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| anyhow!("the CA certificate file holds no certificate in PEM form"))?;
+            http = http.tls_certs_only(certs);
+        }
         Ok(Bucket {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(300))
-                .connect_timeout(Duration::from_secs(20))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            http: http.build()?,
             bucket,
             creds: Credentials::new(c.access_key.clone(), c.secret_key.clone()),
             base: if prefix.is_empty() { format!("{owner}/") } else { format!("{prefix}/{owner}/") },
@@ -414,10 +422,13 @@ mod tests {
             access_key: "a".into(),
             secret_key: "s".into(),
             path_style: true,
+            ca_pem: None,
         };
         let b = Bucket::open(&c, "me").unwrap();
         assert_eq!(b.chunk_key(&[0xab; 32]), format!("backups/me/chunks/{}", "ab".repeat(32)));
         assert_eq!(b.snap_key("00ff").unwrap(), "backups/me/snapshots/00ff");
         assert!(b.snap_key("../x").is_err());
+        let junk = Cloud { ca_pem: Some("not a certificate".into()), ..c };
+        assert!(Bucket::open(&junk, "me").is_err());
     }
 }

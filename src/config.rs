@@ -107,6 +107,10 @@ pub struct Cloud {
     /// Address the bucket as `endpoint/bucket` instead of `bucket.endpoint` (MinIO and some others).
     #[serde(default)]
     pub path_style: bool,
+    /// For storage with a certificate of its own (a private server, an emulator): the
+    /// certificates to trust for this destination, in PEM form, instead of the usual ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

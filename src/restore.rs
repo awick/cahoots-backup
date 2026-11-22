@@ -81,7 +81,9 @@ fn place_link(dir: &OwnedFd, name: &OsStr, target: &[u8], e: &Entry, root: bool)
     let made = rfs::openat(dir, &tmp, flags, Mode::empty()).map_err(anyhow::Error::from).and_then(|t| {
         // Someone who can write `dir` may have renamed ours away and put their own in its place.
         let st = rfs::fstat(&t)?;
-        if st.st_uid != rustix::process::geteuid().as_raw() || u32::from(st.st_mode) & 0o077 != 0 {
+        if st.st_uid != rustix::process::geteuid().as_raw()
+            || rustix::fs::Mode::from_raw_mode(st.st_mode).intersects(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO)
+        {
             bail!("the temporary folder was replaced");
         }
         rfs::symlinkat(OsStr::from_bytes(target), &t, "l")?;

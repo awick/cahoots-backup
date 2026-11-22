@@ -270,6 +270,7 @@ enum Prompt {
     ExNew(String),
     ExAdd(String),
     ExDelete(String),
+    CleanDest(String),
     /// A history rule ("days" or "last") for one destination.
     DestKeep(String, &'static str),
     Remove(String),
@@ -308,6 +309,8 @@ enum Act {
     DestDays,
     DestLast,
     DestDefault,
+    CleanLook,
+    CleanDest,
     Pace,
     Quota,
     InLimit,
@@ -327,12 +330,13 @@ enum Act {
 }
 
 /// What adding cloud storage asks for, in order; the secret key comes last and is not shown.
-const CLOUD_STEPS: [&str; 7] = [
+const CLOUD_STEPS: [&str; 8] = [
     "a name for this destination",
     "endpoint, such as https://s3.us-west-004.backblazeb2.com",
     "bucket",
     "region",
     "folder inside the bucket (blank = none)",
+    "CA certificate file, only for storage with a certificate of its own (blank = none)",
     "access key (key id)",
     "secret key",
 ];
@@ -1040,6 +1044,8 @@ impl App {
                 if f.retention.is_some() {
                     v.push(act("Use each set's history rules here".into(), Act::DestDefault));
                 }
+                v.push(act("Leftovers of sets no longer sent here".into(), Act::CleanLook));
+                v.push(act("Clean up those leftovers".into(), Act::CleanDest));
                 v.push(act("Remove this destination".into(), Act::RemoveDest));
                 v
             }
@@ -1306,7 +1312,9 @@ impl App {
             | Act::UseDest
             | Act::DestDays
             | Act::DestLast
-            | Act::DestDefault => {
+            | Act::DestDefault
+            | Act::CleanLook
+            | Act::CleanDest => {
                 let Some(f) = self.picked_dest() else {
                     self.status = "there is no destination yet: invite a friend or add a drive".into();
                     return;
@@ -1316,6 +1324,13 @@ impl App {
                     Act::DestDays => self.input = Some((Prompt::DestKeep(f.name, "days"), String::new())),
                     Act::DestLast => self.input = Some((Prompt::DestKeep(f.name, "last"), String::new())),
                     Act::DestDefault => self.apply(Cmd::DestKeep { name: f.name, set: vec![], clear: true }).await,
+                    Act::CleanLook => {
+                        let cmd = Cmd::DestClean { name: f.name, dry_run: true };
+                        self.start("looking for leftovers", |ex, _| async move {
+                            Done::Popup(lines_or_error(ex.call(cmd).await))
+                        });
+                    }
+                    Act::CleanDest => self.input = Some((Prompt::CleanDest(f.name), String::new())),
                     Act::Quota if f.path.is_some() => self.status = "a drive has no quota".into(),
                     Act::Quota => self.input = Some((Prompt::Quota(f.name), String::new())),
                     Act::InLimit if !f.is_friend() => self.status = "only a friend has a speed limit".into(),
@@ -1554,8 +1569,8 @@ impl App {
 
     async fn submit(&mut self, prompt: Prompt, text: String) {
         // Blank is an answer for a pause, and for the optional folder inside a bucket.
-        let optional =
-            matches!(&prompt, Prompt::Setting("pause")) || matches!(&prompt, Prompt::Cloud(v) if v.len() == 4);
+        let optional = matches!(&prompt, Prompt::Setting("pause"))
+            || matches!(&prompt, Prompt::Cloud(v) if v.len() == 4 || v.len() == 5);
         if text.is_empty() && !optional {
             return;
         }
@@ -1647,16 +1662,31 @@ impl App {
                 }
                 let mut it = got.into_iter();
                 let mut next = || it.next().unwrap_or_default();
+                let (name, endpoint, bucket, region, prefix, ca) = (next(), next(), next(), next(), next(), next());
+                let ca_pem = match ca.as_str() {
+                    "" => None,
+                    path => {
+                        match std::fs::read_to_string(path.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1))
+                        {
+                            Ok(pem) => Some(pem),
+                            Err(e) => {
+                                self.status = format!("cannot read the CA certificate file {path}: {e}");
+                                return;
+                            }
+                        }
+                    }
+                };
                 let cmd = Cmd::CloudAdd {
-                    name: next(),
-                    endpoint: next(),
-                    bucket: next(),
-                    region: Some(next()),
-                    prefix: Some(next()),
+                    name,
+                    endpoint,
+                    bucket,
+                    region: Some(region),
+                    prefix: Some(prefix),
                     access_key: next(),
                     secret_key: next(),
                     path_style: None,
                     create: false,
+                    ca_pem,
                 };
                 self.start("checking the cloud storage", |ex, _| async move {
                     Done::Popup(lines_or_error(ex.call(cmd).await))
@@ -1685,6 +1715,15 @@ impl App {
                 Ok(gb) => self.apply(Cmd::FriendQuota { name, gb }).await,
                 Err(_) => self.status = "type a number of GB".into(),
             },
+            Prompt::CleanDest(name) => {
+                if text.eq_ignore_ascii_case("yes") {
+                    let cmd = Cmd::DestClean { name, dry_run: false };
+                    self.start(
+                        "cleaning up",
+                        |ex, pr| async move { Done::Popup(lines_or_error(ex.live(cmd, &pr).await)) },
+                    );
+                }
+            }
             Prompt::Remove(name) => {
                 if text.eq_ignore_ascii_case("yes") {
                     self.apply(Cmd::FriendRemove { name, purge: false }).await;
@@ -2315,6 +2354,9 @@ impl App {
                 }
                 Prompt::Quota(n) => format!(" GB that {n} may store on this computer "),
                 Prompt::InLimit(n) => format!(" Fastest {n} may send backups here, in KB/s (0 = unlimited) "),
+                Prompt::CleanDest(n) => {
+                    format!(" Type yes to delete from {n} the restore points of sets no longer sent there ")
+                }
                 Prompt::Remove(n) => format!(" Type yes to remove {n} (data already stored is left in place) "),
                 Prompt::Setting("hours") | Prompt::Setting("set-hours") => {
                     " Backup hours, such as 22-7, or 'always' ".into()

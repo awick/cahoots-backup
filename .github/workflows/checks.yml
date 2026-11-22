@@ -1,7 +1,7 @@
 # Copyright Andy Wick
 # SPDX-License-Identifier: Apache-2.0
 
-# Everything check.sh covers, on Linux and macOS, plus the cloud test against MinIO.
+# Everything check.sh covers, on Linux and macOS, plus the cloud test against AWS Emulator.
 name: checks
 
 on:
@@ -18,7 +18,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  MINIO: v0.0.0-20260212201848-7aac2a2c5b7c
 
 jobs:
   check:
@@ -41,11 +40,11 @@ jobs:
             target
           key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: check-${{ runner.os }}-
-      - name: Format, lints, unit tests, end-to-end and damage tests
+      - name: Format, lints, unit tests, end-to-end, damage and cloud tests
         run: ./check.sh
 
   cloud:
-    name: cloud storage (MinIO)
+    name: cloud storage (AWS Emulator)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -60,19 +59,20 @@ jobs:
             target
           key: cloud-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cloud-${{ runner.os }}-
-      # MinIO is only published as source now, so it is built once and kept.
-      - uses: actions/cache@v4
-        id: minio
-        with:
-          path: ~/go/bin/minio
-          key: minio-${{ runner.os }}-${{ env.MINIO }}
-      - name: Build MinIO
-        if: steps.minio.outputs.cache-hit != 'true'
-        run: go install github.com/minio/minio@${{ env.MINIO }}
+      # AWS's own local stand-in for S3, from their signed package.
+      - name: AWS Emulator
+        run: |
+          base=https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest
+          curl -fsSLO $base/aws-emulator_amd64.deb
+          curl -fsSLO $base/aws-emulator_amd64.deb.sig
+          curl -fsSLo aws-publishing.asc https://downloads.aws.com/keys/gpg/current.asc
+          gpg --import aws-publishing.asc
+          gpg --fingerprint ssm-publishing@amazon.com | tr -d ' ' | grep -q 98BCF336A3BE53B734E967C52E5BF49BD940F624
+          gpg --verify aws-emulator_amd64.deb.sig aws-emulator_amd64.deb
+          sudo apt-get install -y ./aws-emulator_amd64.deb
+          aws-emulator -v
+          aws --version
       - name: Build without the window
         run: cargo build --release --no-default-features
       - name: Cloud destination test
-        run: |
-          export PATH="$HOME/go/bin:$PATH"
-          command -v minio
-          sh tests/cloud.sh target/release/sdb
+        run: SDB_TEST_S3=emulator sh tests/cloud.sh target/release/sdb

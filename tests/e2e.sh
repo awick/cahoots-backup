@@ -127,7 +127,7 @@ b destination limit alice 0 >/dev/null
 
 step "verify one set"
 a verify --set pics | grep -q "usb: " || fail "verify of one set"
-a verify --set pics | grep -q "bob: 0 restore points" || fail "a set that is not sent to bob was counted there"
+a verify --set pics | grep -q "bob" && fail "a set that is not sent to bob was checked there"
 a verify --set nosuchset >/dev/null 2>&1 && fail "verify accepted a set that does not exist"
 
 step "prune and local fingerprint check"
@@ -179,6 +179,29 @@ a destination rm usb | grep -q "now has no destination" || fail "no notice about
 a backup --set pics >stranded.out 2>&1 && fail "a set went somewhere after its only destination was removed"
 a set pics --to bob >/dev/null
 a backup --set pics | grep -q "created on bob" || fail "choosing a new destination"
+
+step "taking a destination off a set, then cleaning it up"
+a drive usb drive >/dev/null
+mkdir -p elsewhere
+head -c 600000 /dev/urandom >elsewhere/only-here
+a add elsewhere --set moved >/dev/null
+a backup --set moved | grep -q "created on" || fail "backup of the set that will move"
+a backup --set default >/dev/null
+# The drive still holds what the pics set left when it moved to bob, earlier in this test.
+a destination clean usb | grep -q "set pics is no longer sent to usb" || fail "leftovers of an earlier move were not found"
+a destination clean usb | grep -q "nothing to clean" || fail "clean removed something from sets still sent there"
+ONUSB=$(find drive/sdb-store -path '*chunks*' -type f | wc -l)
+a set moved --to bob >/dev/null
+a destination clean usb --dry-run | grep -q "would remove 1 restore points" || fail "dry run of clean"
+a snapshots | grep " moved " | grep -q usb || fail "a dry run removed something"
+a destination clean usb | grep -q "removed 1 restore points" || fail "clean"
+a snapshots | grep " moved " | grep -q usb && fail "the set's restore point is still on the drive"
+a snapshots | grep " moved " | grep -q bob || fail "clean removed the set from where it still goes"
+[ "$(find drive/sdb-store -path '*chunks*' -type f | wc -l)" -lt "$ONUSB" ] || fail "clean freed no chunks"
+a verify --full | grep -q "all good" || fail "clean removed chunks another set still needs"
+a restore latest --to afterclean --from usb >/dev/null || fail "the other set no longer restores from the drive"
+a backup --set moved | grep -q "no changes" || fail "the cleaned restore point came back"
+a destination rm usb >/dev/null
 
 step "exclusion lists"
 mkdir -p data/proj/node_modules data/proj/target data/keepout

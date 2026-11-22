@@ -184,6 +184,14 @@ pub enum Cmd {
         /// How the bucket is addressed; None tries `bucket.endpoint` and then `endpoint/bucket`.
         path_style: Option<bool>,
         create: bool,
+        /// Certificates to trust for this storage instead of the usual ones (PEM text).
+        #[serde(default)]
+        ca_pem: Option<String>,
+    },
+    /// Remove from one destination what the sets no longer sent there left behind.
+    DestClean {
+        name: String,
+        dry_run: bool,
     },
     /// History rules for what is kept at one destination.
     DestKeep {
@@ -959,6 +967,81 @@ impl Node {
         Ok(freed)
     }
 
+    /// Removes from one destination the restore points of sets that are no longer sent
+    /// there, then the chunks nothing left there needs. Named restore points stay, as do
+    /// those of sets that no longer exist: `sdb forget` removes either.
+    async fn clean_dest(&self, name: &str, dry_run: bool, out: &Out) -> Result<()> {
+        let cfg = self.cfg();
+        let f = cfg.friends.iter().find(|f| f.name == name).cloned();
+        let f = f.ok_or_else(|| anyhow!("no destination named {name}"))?;
+        let peer = self.peer_patient(&f).await?;
+        let gone = self.forgotten();
+        let mut held: Vec<Snap> = vec![];
+        for (id, blob) in peer.list_snapshots().await? {
+            if gone.contains(&id) || gone.contains(&format!("{}|{id}", f.id)) {
+                continue;
+            }
+            match self.open_manifest(&id, &blob) {
+                Ok(mut m) => {
+                    m.set = cfg.set_name_now(&m.set);
+                    let index = m.index.clone();
+                    held.push(Snap { id, m, peers: vec![(f.clone(), index)] });
+                }
+                // What cannot be read cannot be judged: nothing is deleted on a guess.
+                Err(_) => bail!("{name}: restore point {id} is damaged; run `sdb verify` first"),
+            }
+        }
+        held.sort_by_key(|s| (s.m.time, s.m.nanos));
+        // "In use: no" is a pause, not a decision, so only the sets' own lists count here.
+        let sent =
+            |s: &Snap| cfg.set(&s.m.set).is_none_or(|b| b.destinations.is_empty() || b.destinations.contains(&f.name));
+        let (stay, go): (Vec<&Snap>, Vec<&Snap>) = held.iter().partition(|s| s.m.tag.is_some() || sent(s));
+        let mut names: Vec<&str> = go.iter().map(|s| s.m.set.as_str()).collect();
+        names.dedup();
+        names.sort();
+        names.dedup();
+        for n in &names {
+            let of: Vec<&&Snap> = go.iter().filter(|s| s.m.set == *n).collect();
+            out.say(format!(
+                "  set {n} is no longer sent to {name}: {} {} restore points made {} to {}",
+                if dry_run { "would remove" } else { "removing" },
+                of.len(),
+                when(of[0].m.time),
+                when(of[of.len() - 1].m.time)
+            ));
+        }
+        let named = stay.iter().filter(|s| s.m.tag.is_some() && !sent(s)).count();
+        if named > 0 {
+            out.say(format!("  {named} named restore points of those sets stay on {name}; `sdb forget` removes one"));
+        }
+        if go.is_empty() {
+            out.say(format!(
+                "nothing to clean on {name}: every restore point there belongs to a set that is sent there"
+            ));
+            return Ok(());
+        }
+        if dry_run {
+            out.say(format!(
+                "dry run: {} restore points would be removed from {name}, and the chunks only they use",
+                go.len()
+            ));
+            return Ok(());
+        }
+        self.forget_ids(go.iter().map(|s| format!("{}|{}", f.id, s.id)));
+        for s in &go {
+            peer.delete_snapshot(&s.id).await?;
+        }
+        let freed = self.gc(&peer, &stay, &mut HashMap::new()).await?;
+        let (used, _) = peer.usage_exact().await.unwrap_or((0, 0));
+        out.say(format!(
+            "removed {} restore points and {freed} chunks from {name}; {} restore points and {} remain there",
+            go.len(),
+            stay.len(),
+            human(used)
+        ));
+        Ok(())
+    }
+
     fn keep_set(snaps: &[&Snap], r: &Retention) -> HashSet<String> {
         use chrono::TimeZone;
         let mut keep = HashSet::new();
@@ -1246,7 +1329,21 @@ impl Node {
         let (snaps, peers) = self.snapshots(out).await?;
         let (mut repaired, mut lost) = (0u64, 0u64);
         let mut unchecked = vec![];
+        let chosen = set.and_then(|n| self.cfg().set(n).cloned());
         for p in &peers {
+            // A set is checked where it is sent, and wherever older restore points of it still sit.
+            if let Some(b) = &chosen {
+                let held =
+                    snaps.iter().filter(|s| s.m.set == b.name && s.peers.iter().any(|(f, _)| f.id == p.friend.id));
+                match (b.sends_to(&p.friend), held.count()) {
+                    (true, _) => {}
+                    (false, 0) => continue,
+                    (false, n) => out.say(format!(
+                        "{}: set {} is no longer sent here, but {n} older restore points of it still are; checking those",
+                        p.friend.name, b.name
+                    )),
+                }
+            }
             // One destination that misbehaves does not stop the others from being checked.
             match self.verify_one(p, &snaps, &peers, full, set, out).await {
                 Ok((fixed, gone)) => {
@@ -2385,7 +2482,18 @@ impl Node {
                 out.say(format!("{name} added: backups also go to {} (encrypted like everything else). When the drive is unplugged it is skipped and catches up later.", dir.display()));
                 Ok(())
             }
-            Cmd::CloudAdd { name, endpoint, bucket, region, prefix, access_key, secret_key, path_style, create } => {
+            Cmd::CloudAdd {
+                name,
+                endpoint,
+                bucket,
+                region,
+                prefix,
+                access_key,
+                secret_key,
+                path_style,
+                create,
+                ca_pem,
+            } => {
                 let name = clean_name(&name);
                 refuse_reserved(&name)?;
                 if self.cfg().friends.iter().any(|f| f.name == name && f.cloud.is_none()) {
@@ -2405,6 +2513,11 @@ impl Node {
                     prefix: prefix.unwrap_or_default().trim_matches('/').to_string(),
                     access_key,
                     secret_key: secret_key.trim().to_string(),
+                    // New keys for storage already added keep the certificate it was given.
+                    ca_pem: ca_pem.filter(|p| !p.trim().is_empty()).or_else(|| {
+                        let known = self.cfg().friends.into_iter().find(|f| f.name == name);
+                        known.and_then(|f| f.cloud).and_then(|c| c.ca_pem)
+                    }),
                     path_style: path_style.unwrap_or(false),
                 };
                 // Nothing is saved until the storage has taken, listed and deleted an object for us.
@@ -2458,6 +2571,10 @@ impl Node {
                      Do not add expiry (lifecycle) rules to the bucket: sdb removes what is no longer needed itself."
                 ));
                 Ok(())
+            }
+            Cmd::DestClean { name, dry_run } => {
+                let _op = self.op.lock().await;
+                self.clean_dest(&name, dry_run, out).await
             }
             Cmd::DestKeep { name, set, clear } => {
                 let general = self.cfg().retention;
