@@ -264,7 +264,7 @@ impl Gui {
         let Ok(path) = std::env::var("SDB_GUI_SHOT") else { return };
         self.frames += 1;
         ctx.request_repaint();
-        if self.frames == 20 {
+        if self.frames == std::env::var("SDB_GUI_SHOT_FRAME").ok().and_then(|f| f.parse().ok()).unwrap_or(20) {
             let done = egui::ScreenshotCallback::new(move |img: std::sync::Arc<egui::ColorImage>| {
                 let mut out = format!("P6\n{} {}\n255\n", img.size[0], img.size[1]).into_bytes();
                 for p in &img.pixels {
@@ -1096,9 +1096,10 @@ impl Gui {
             ui.weak("No restore points found yet, or no destination is reachable.");
             return;
         }
-        egui::Panel::right("timeline").default_size(300.0).show(ui, |ui| {
+        egui::Panel::right("timeline").default_size(300.0).size_range(200.0..=700.0).show(ui, |ui| {
+            ui.take_available_width();
             ui.strong(format!("Timeline ({})", self.snaps.len()));
-            egui::ScrollArea::vertical().id_salt("timeline").show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("timeline").auto_shrink(false).show(ui, |ui| {
                 for i in (0..self.snaps.len()).rev() {
                     let s = &self.snaps[i];
                     let tag = s.tag.as_ref().map(|t| format!("  \"{t}\"")).unwrap_or_default();
@@ -1115,7 +1116,7 @@ impl Gui {
                 }
             });
         });
-        egui::Panel::bottom("restore-bar").show(ui, |ui| {
+        egui::Panel::bottom("restore-bar").resizable(false).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("{} picked. Restore into:", self.picked.len()));
                 let home = std::env::var("HOME").unwrap_or_default();
@@ -1569,6 +1570,31 @@ impl Gui {
 }
 
 impl eframe::App for Gui {
+    /// For development: SDB_GUI_DRAG=x1,y1,x2,y2 drags the pointer from one point to the other
+    /// before the picture SDB_GUI_SHOT takes, to try things that only a drag shows.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let Ok(spec) = std::env::var("SDB_GUI_DRAG") else { return };
+        let n: Vec<f32> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        let [x1, y1, x2, y2] = n[..] else { return };
+        let (from, to) = (egui::pos2(x1, y1), egui::pos2(x2, y2));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        match self.frames {
+            4 => raw.events.push(egui::Event::PointerMoved(from)),
+            5 => raw.events.push(button(from, true)),
+            6..=12 => raw.events.push(egui::Event::PointerMoved(from + (to - from) * ((self.frames - 5) as f32 / 7.0))),
+            13 => raw.events.push(button(to, false)),
+            _ => {}
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.receive(&ctx);
@@ -1576,7 +1602,9 @@ impl eframe::App for Gui {
         self.maybe_screenshot(&ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
 
-        egui::Panel::left("menu").exact_size(150.0).show(ui, |ui| {
+        egui::Panel::left("menu").default_size(150.0).size_range(120.0..=360.0).show(ui, |ui| {
+            // A panel only keeps the width it is dragged to if what is in it uses that width.
+            ui.take_available_width();
             ui.add_space(6.0);
             ui.label(RichText::new("Super Duper Backup").strong());
             ui.weak(format!(
@@ -1596,7 +1624,7 @@ impl eframe::App for Gui {
                 }
             }
         });
-        egui::Panel::bottom("status").show(ui, |ui| {
+        egui::Panel::bottom("status").resizable(false).show(ui, |ui| {
             ui.horizontal(|ui| match &self.busy {
                 Some(b) => {
                     ui.spinner();
@@ -1610,7 +1638,8 @@ impl eframe::App for Gui {
         // What a command answered sits under the page it was started from, where it can be
         // read, selected and copied without covering anything.
         if let Some((title, lines)) = self.popup.clone() {
-            egui::Panel::bottom("result").resizable(true).default_size(230.0).show(ui, |ui| {
+            // Bottom panels have no drag handle unless asked for one.
+            egui::Panel::bottom("result").resizable(true).default_size(230.0).size_range(90.0..=900.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong(&title);
                     if ui.button("Copy").clicked() {
@@ -1621,7 +1650,8 @@ impl eframe::App for Gui {
                         self.popup = None;
                     }
                 });
-                egui::ScrollArea::vertical().id_salt("result").show(ui, |ui| {
+                // Filling the panel, whatever the length of the text, is what lets its edge be dragged.
+                egui::ScrollArea::vertical().id_salt("result").auto_shrink(false).show(ui, |ui| {
                     // A text box so any part can be selected; what is typed into it is not kept.
                     let mut text = lines.join("\n");
                     ui.add(
