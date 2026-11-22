@@ -419,6 +419,10 @@ async fn daemon(home: PathBuf) -> Result<()> {
 /// Starts the daemon in the background, detached from this terminal.
 fn spawn_daemon(home: &std::path::Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
+    // Where the login service looks after this home, it is the one to start the daemon.
+    if service::restart(home) {
+        return Ok(());
+    }
     let log = fs::OpenOptions::new().create(true).append(true).open(home.join("daemon.log"))?;
     std::process::Command::new(std::env::current_exe()?)
         .arg("daemon")

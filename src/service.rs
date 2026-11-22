@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 const LABEL: &str = "org.superduperbackup.sdb";
 
@@ -21,6 +25,23 @@ fn unit_path() -> PathBuf {
 /// Whether the start-at-login service file is in place.
 pub fn installed() -> bool {
     unit_path().exists()
+}
+
+/// Has the login service start the daemon, or start it afresh, so that the service stays the
+/// one running it: a daemon started beside it would leave the service failing to start its
+/// own, over and over. False when there is no service or it looks after another home (it
+/// always runs the default one); the caller then starts the daemon itself.
+pub fn restart(home: &Path) -> bool {
+    if !installed() || home != home_dir().join(".super-duper-backup") {
+        return false;
+    }
+    let done = if cfg!(target_os = "macos") {
+        let target = format!("gui/{}/{LABEL}", rustix::process::getuid().as_raw());
+        Command::new("launchctl").args(["kickstart", "-k", &target]).output()
+    } else {
+        Command::new("systemctl").args(["--user", "restart", "sdb.service"]).output()
+    };
+    done.is_ok_and(|o| o.status.success())
 }
 
 fn xml(s: &str) -> String {
