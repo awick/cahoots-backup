@@ -102,7 +102,7 @@ a verify --full | grep -q "repaired from another friend" || fail "verify did not
 a verify --full | grep -q "all good" || fail "verify after repair"
 
 step "a backup carries on after its client quits"
-a limit 1000 >/dev/null
+a limit 1 >/dev/null
 head -c 4000000 /dev/urandom >data/slow
 a backup --set default >/dev/null 2>&1 &
 CLIENT=$!
@@ -117,13 +117,28 @@ a ls latest data/slow | grep -q slow || fail "the backup stopped when its client
 a limit 0 >/dev/null
 
 step "a friend's incoming speed limit slows their uploads"
-b destination limit alice 1000 >/dev/null
+b destination limit alice 1 >/dev/null
 head -c 4000000 /dev/urandom >data/throttled
 START=$(date +%s)
 a backup --set default >/dev/null
 TOOK=$(($(date +%s) - START))
-[ "$TOOK" -ge 3 ] || fail "4 MB arrived in ${TOOK}s despite a 1000 KB/s limit"
+[ "$TOOK" -ge 3 ] || fail "4 MB arrived in ${TOOK}s despite a 1 MB/s limit"
 b destination limit alice 0 >/dev/null
+
+step "the incoming limit for all friends slows them too, and takes decimals"
+b limit --incoming 0.5 >/dev/null
+b status | grep -q "max incoming: 0.5 MB/s" || fail "the incoming limit was not saved as 0.5 MB/s"
+head -c 2000000 /dev/urandom >data/throttled2
+START=$(date +%s)
+a backup --set default >/dev/null
+TOOK=$(($(date +%s) - START))
+[ "$TOOK" -ge 3 ] || fail "2 MB arrived in ${TOOK}s despite a 0.5 MB/s limit for everyone"
+b limit --incoming 0 >/dev/null
+
+step "this computer can be given another name"
+a name renamed | grep -q "now called renamed" || fail "the name was not changed"
+a status | grep -q "name: *renamed" || fail "status does not show the new name"
+a name alice >/dev/null
 
 step "verify one set"
 a verify --set pics | grep -q "usb: " || fail "verify of one set"

@@ -625,17 +625,22 @@ pub struct Guard {
 
 impl Guard {
     /// Accounts for `bytes` just received from a friend and returns how long to wait
-    /// before reading more, so their uploads average at most `kbps`.
-    fn owe(&self, friend: &str, bytes: usize, kbps: u64) -> Duration {
-        if kbps == 0 {
-            return Duration::ZERO;
-        }
+    /// before reading more, so their uploads average at most `kbps` and all friends'
+    /// together at most `all_kbps`.
+    fn owe(&self, friend: &str, bytes: usize, kbps: u64, all_kbps: u64) -> Duration {
         let now = tokio::time::Instant::now();
-        let cost = Duration::from_nanos((bytes as u128 * 1_000_000_000 / (kbps as u128 * 1024)) as u64);
         let mut pace = self.pace.lock().unwrap();
-        let slot = pace.entry(friend.to_string()).or_insert(now);
-        *slot = (*slot).max(now) + cost;
-        slot.saturating_duration_since(now)
+        let mut wait = Duration::ZERO;
+        for (who, kbps) in [(friend, kbps), (EVERYONE, all_kbps)] {
+            if kbps == 0 {
+                continue;
+            }
+            let cost = Duration::from_nanos((bytes as u128 * 1_000_000_000 / (kbps as u128 * 1024)) as u64);
+            let slot = pace.entry(who.to_string()).or_insert(now);
+            *slot = (*slot).max(now) + cost;
+            wait = wait.max(slot.saturating_duration_since(now));
+        }
+        wait
     }
 
     fn listing(&self, friend: &str) -> Arc<Semaphore> {
@@ -665,6 +670,8 @@ impl Default for Guard {
     }
 }
 
+/// The pace entry shared by all friends; no friend has an empty id.
+const EVERYONE: &str = "";
 const MAX_STRANGERS: usize = 4;
 const MAX_BAD_INVITES: u32 = 50;
 const MAX_CONNS_PER_FRIEND: u32 = 4;
@@ -778,9 +785,10 @@ async fn read_paced(
     report: bool,
 ) -> Result<()> {
     let mut at = 0;
+    let all_kbps = node.cfg().incoming_kbps;
     loop {
         let n = (buf.len() - at).min(PIECE);
-        tokio::time::sleep(node.guard.owe(&friend.id, n + extra, friend.max_in_kbps)).await;
+        tokio::time::sleep(node.guard.owe(&friend.id, n + extra, friend.max_in_kbps, all_kbps)).await;
         r.read_exact(&mut buf[at..at + n]).await?;
         // The sender hears its data is moving however slow the limit, so only a silent node is given up on.
         if report {
@@ -913,10 +921,25 @@ mod tests {
         // 1000 chunks of 1000 bytes at 1000 KB/s owe about a second, not nothing.
         let mut owed = Duration::ZERO;
         for _ in 0..1000 {
-            owed = g.owe("f", 1000, 1000);
+            owed = g.owe("f", 1000, 1000, 0);
         }
         assert!(owed > Duration::from_millis(900) && owed < Duration::from_millis(1100), "{owed:?}");
-        assert_eq!(g.owe("f", 1 << 20, 0), Duration::ZERO, "no limit means no waiting");
+        assert_eq!(g.owe("f", 1 << 20, 0, 0), Duration::ZERO, "no limit means no waiting");
+    }
+
+    #[test]
+    fn friends_share_the_limit_for_everyone() {
+        let g = Guard::default();
+        // Two friends sending 500 KB each against 1000 KB/s for all owe a second between them.
+        let mut owed = Duration::ZERO;
+        for friend in ["a", "b"] {
+            for _ in 0..500 {
+                owed = g.owe(friend, 1024, 0, 1000);
+            }
+        }
+        assert!(owed > Duration::from_millis(900) && owed < Duration::from_millis(1100), "{owed:?}");
+        // A friend's own lower limit still holds them back further.
+        assert!(g.owe("c", 1024 * 100, 10, 1000) > Duration::from_secs(9));
     }
 
     #[test]

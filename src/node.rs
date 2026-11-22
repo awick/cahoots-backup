@@ -44,6 +44,17 @@ pub fn clean(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
 }
 
+/// A change to the general settings; what is left unset stays as it is.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Tune {
+    pub name: Option<String>,
+    pub upload_kbps: Option<u64>,
+    pub incoming_kbps: Option<u64>,
+    pub hours: Option<String>,
+    pub pause_hours: Option<i64>,
+    pub warn_days: Option<u32>,
+}
+
 /// A change to one backup set; what is left unset stays as it is.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SetEdit {
@@ -199,12 +210,7 @@ pub enum Cmd {
     Hello,
     /// Ask the daemon to exit.
     Stop,
-    Tune {
-        upload_kbps: Option<u64>,
-        hours: Option<String>,
-        pause_hours: Option<i64>,
-        warn_days: Option<u32>,
-    },
+    Tune(Tune),
     DriveAdd {
         name: String,
         path: PathBuf,
@@ -1904,9 +1910,7 @@ impl Node {
             Cmd::ExcludePattern { list, pattern, remove } => {
                 self.edit_exclude_pattern(list, pattern, remove, out).await
             }
-            Cmd::Tune { upload_kbps, hours, pause_hours, warn_days } => {
-                self.tune(upload_kbps, hours, pause_hours, warn_days, out).await
-            }
+            Cmd::Tune(t) => self.tune(t, out).await,
             Cmd::Every { name, minutes } => self.set_pace(name, minutes, out).await,
             Cmd::DriveAdd { name, path } => self.add_drive(name, path, out).await,
             Cmd::CloudAdd(c) => self.add_cloud(c, out).await,

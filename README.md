@@ -46,7 +46,7 @@ The downloads are not signed, so a Mac asks before running one the first time;
 `xattr -d com.apple.quarantine sdb` tells it you trust it.
 
 ```bash
-sdb tui                            # interactive: backup sets, restore, destinations, settings
+sdb tui                            # interactive: backup sets, restore, friends, settings
 sdb gui                            # the same in a window
 ```
 
@@ -85,13 +85,15 @@ restore point shortly after files stop changing.
 | `sdb cloud NAME --endpoint URL --bucket B --access-key K` | also back up to cloud storage: any S3-compatible bucket (Amazon S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO); the secret key is asked for, never typed on the command line; `--ca-file FILE` is for storage with a certificate of its own |
 | `sdb destination keep NAME --days 30 --last 5` | how much history one destination keeps, instead of each set's rules (`--default` goes back) |
 | `sdb every MINUTES [NAME]` | how often automatic backups go to one destination (friends default to 60 minutes, a new drive to 15) |
-| `sdb limit KBPS` | cap upload speed across friends (0 = unlimited) |
+| `sdb name NAME` | give this computer another name (friends you already have keep the name they know) |
+| `sdb limit MBPS` | cap the speed of your backups going out, to friends and cloud storage, in MB/s such as 0.5 or 20 (0 = unlimited) |
+| `sdb limit --incoming MBPS` | cap what all your friends together send to your computer (0 = unlimited) |
 | `sdb schedule 22-7` / `sdb schedule always` | hours of the day automatic backups may run |
 | `sdb pause [HOURS]` / `sdb resume` | hold automatic backups |
 | `sdb warn-after DAYS` | warn when a backup, yours or a friend's to you, is this stale (default 3) |
 | `sdb destinations` | list friends and drives |
 | `sdb destination quota NAME GB` | how much a friend may store on your computer; for cloud storage, the most you keep there (0 = no cap) |
-| `sdb destination limit NAME KBPS` | fastest a friend may send backups to your computer (0 = unlimited) |
+| `sdb destination limit NAME MBPS` | fastest one friend may send backups to your computer, in MB/s (0 = unlimited) |
 | `sdb exclude lists` | the exclusion lists, their patterns and which sets use them |
 | `sdb set NAME --exclude Developer` | the exclusion list a set uses (`Standard` unless you choose) |
 | `sdb exclude new NAME [--from LIST]` / `sdb exclude add LIST PATTERN` / `sdb exclude rm LIST PATTERN` / `sdb exclude delete LIST` | make and change lists of your own |
@@ -120,15 +122,15 @@ when each last got a backup), its schedule, and what it is doing right now.
 | --- | --- |
 | Backup | the backup sets and their status; create a set, choose its files, its destinations, its exclusion list and its schedule and history rules; back up now, verify, and take what the set now leaves out from its older restore points |
 | Restore | choose a backup set, then browse its files as of any restore point, search by name, step through time, list a file's versions, choose which destination to read from, restore |
-| Destinations | friends' computers, local drives and cloud storage: whether each is reachable and how, what you store there, what they store here; invite, accept an invite, add a drive or cloud storage, set pace, quota or cap, and how much history each keeps; clean up what sets no longer sent there left behind |
-| Settings | hours, pause, pace, upload limit, warnings and history rules that apply to every set; the exclusion lists |
+| Friends | friends' computers, and drives and cloud storage of your own, each under its own heading: whether each is reachable and how, what you store there, what they store here; invite, accept an invite, add a drive or cloud storage, set pace, quota or cap, and how much history each keeps; clean up what sets no longer sent there left behind |
+| Settings | the essentials first (this computer's name, the most to send and to receive per second), then hours, pause, pace, warnings and history rules that apply to every set; the exclusion lists |
 | History | what the daemon has done since it started |
 | Status | the full `sdb status` report |
 
 ## The GUI
 
 `sdb gui` opens the same thing in a window: the backup sets with their status,
-restore with a timeline, destinations, settings, history and status. A backup
+restore with a timeline, friends, settings, history and status. A backup
 set opens on the page, with tabs for its files, destinations and schedule. It is
 another client of the daemon, built with egui into the same binary. It needs a
 desktop session only when you run it; everything else works without one. Build

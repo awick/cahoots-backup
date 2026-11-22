@@ -6,9 +6,9 @@
 //! It is only a client: everything it shows and does goes through the daemon.
 
 use crate::{
-    config::{BackupSet, Config, DEFAULT_SET, STANDARD, is_builtin_list},
+    config::{BackupSet, Config, DEFAULT_SET, STANDARD, is_builtin_list, mbps, parse_mbps},
     control,
-    node::{CloudAdd, Cmd, SetEdit},
+    node::{CloudAdd, Cmd, SetEdit, Tune},
     snapshot::{human, parse_when, when},
 };
 use anyhow::Result;
@@ -399,13 +399,15 @@ enum Choice {
     Value(&'static str),
 }
 
-/// The general settings, in the two groups the screens show them in: the first
-/// `AUTOMATIC` are about automatic backups, the rest about how much history is kept.
-const GENERAL: [(&str, &str); 12] = [
+/// The general settings, in the groups the screens show them in: the essentials up to
+/// `ESSENTIAL`, automatic backups up to `AUTOMATIC`, then how much history is kept.
+const GENERAL: [(&str, &str); 14] = [
+    ("name", "Name: what this computer is called (friends you already have keep the name they know)"),
+    ("limit", "Max outgoing in MB/s, such as 0.5: your backups to friends and cloud storage (0 = unlimited)"),
+    ("incoming", "Max incoming in MB/s: all your friends' backups to this computer together (0 = unlimited)"),
     ("hours", "Only between these hours, such as 22-7 ('always' for any time)"),
     ("pause", "Right now (enter: pause for a number of hours; 0 resumes)"),
     ("every", "Minutes between backups to a local drive (friends and cloud storage default to 60)"),
-    ("limit", "Upload limit in KB/s across friends and cloud storage (0 = unlimited)"),
     ("warn", "Warn after this many days without a backup (0 = never)"),
     ("versions", "Keep this many versions of each file (0 = all of them)"),
     ("days", "Keep restore points for this many days (0 = for ever)"),
@@ -415,7 +417,8 @@ const GENERAL: [(&str, &str); 12] = [
     ("weekly", "Weekly: one a week is kept for this many weeks"),
     ("monthly", "Monthly: one a month is kept for this many months"),
 ];
-const AUTOMATIC: usize = 5;
+const ESSENTIAL: usize = 3;
+const AUTOMATIC: usize = 7;
 
 const RULES: [(&str, &str); 4] = [
     ("set-every", "Back up every this many minutes (0 = each destination's own pace)"),
@@ -474,8 +477,17 @@ struct App {
 impl App {
     async fn reload(&mut self) {
         match self.exec.call(Cmd::Config).await {
-            Ok(l) => match l.first().and_then(|s| serde_json::from_str(s).ok()) {
-                Some(c) => self.cfg = c,
+            Ok(l) => match l.first().and_then(|s| serde_json::from_str::<Config>(s).ok()) {
+                Some(mut c) => {
+                    // Friends first, then drives, then cloud storage: the order the Friends page
+                    // shows them in, and so the order its menu and cursor count in.
+                    c.friends.sort_by_key(|f| match f.kind() {
+                        "friend" => 0,
+                        "drive" => 1,
+                        _ => 2,
+                    });
+                    self.cfg = c;
+                }
                 None => self.status = "could not read the configuration".into(),
             },
             Err(e) => self.status = format!("{e:#}"),
@@ -651,7 +663,6 @@ impl App {
             "set-versions" => own.max_versions,
             "set-days" => own.keep_days,
             "every" => (self.cfg.min_interval_secs / 60).max(1) as u32,
-            "limit" => self.cfg.upload_kbps as u32,
             "warn" => self.cfg.warn_after_days,
             "versions" => r.max_versions,
             "days" => r.keep_days,
@@ -668,6 +679,9 @@ impl App {
         match key {
             "set-hours" if self.cur_set().hours.is_empty() => "general".into(),
             "set-hours" => self.cur_set().hours,
+            "name" => self.cfg.name.clone(),
+            "limit" => mbps(self.cfg.upload_kbps),
+            "incoming" => mbps(self.cfg.incoming_kbps),
             "hours" if self.cfg.backup_hours.is_empty() => "any time".into(),
             "hours" => self.cfg.backup_hours.clone(),
             "pause" if self.cfg.paused_until - now > 365 * 86400 => "paused".into(),
@@ -688,21 +702,30 @@ impl App {
         let edit = |every, hours, days, versions| {
             Cmd::SetEdit(SetEdit { name: self.set.clone(), every, hours, days, versions, ..Default::default() })
         };
-        let tune =
-            |upload_kbps, hours, pause_hours, warn_days| Cmd::Tune { upload_kbps, hours, pause_hours, warn_days };
+        let tune = |upload_kbps, hours, pause_hours, warn_days| {
+            Cmd::Tune(Tune { upload_kbps, hours, pause_hours, warn_days, ..Default::default() })
+        };
         let cmd = match (key, num) {
             ("set-every", Some(n)) => edit(Some(n), None, None, None),
             ("set-hours", _) => edit(None, Some(hours), None, None),
             ("set-versions", Some(n)) => edit(None, None, None, Some(n)),
             ("set-days", Some(n)) => edit(None, None, Some(n), None),
+            ("name", _) if !text.is_empty() => Cmd::Tune(Tune { name: Some(text.to_string()), ..Default::default() }),
+            ("limit", _) => match parse_mbps(text) {
+                Some(k) => tune(Some(k), None, None, None),
+                None => return false,
+            },
+            ("incoming", _) => match parse_mbps(text) {
+                Some(k) => Cmd::Tune(Tune { incoming_kbps: Some(k), ..Default::default() }),
+                None => return false,
+            },
             ("hours", _) => tune(None, Some(hours), None, None),
             ("pause", _) if text.is_empty() => tune(None, None, Some(24 * 3650), None),
             ("pause", Some(n)) => tune(None, None, Some(n as i64), None),
             ("every", Some(n)) => Cmd::Every { name: None, minutes: n },
-            ("limit", Some(n)) => tune(Some(n as u64), None, None, None),
             ("warn", Some(n)) => tune(None, None, None, Some(n)),
             ("versions", Some(n)) => Cmd::Keep { set: vec![], versions: Some(n), pattern: None },
-            (k, Some(n)) if !["hours", "pause", "set-hours"].contains(&k) => {
+            (k, Some(n)) if !["name", "hours", "pause", "set-hours"].contains(&k) => {
                 Cmd::Keep { set: vec![(k.to_string(), n)], versions: None, pattern: None }
             }
             _ => return false,
@@ -935,7 +958,7 @@ impl App {
             Kind::Root => vec![
                 go("Backup", Kind::Backup),
                 go("Restore", Kind::Restore),
-                go("Destinations", Kind::Dests),
+                go("Friends", Kind::Dests),
                 go("Settings", Kind::Settings),
                 ("History".into(), Choice::Focus),
                 ("Status".into(), Choice::Focus),
@@ -1014,7 +1037,8 @@ impl App {
                 ];
                 if f.is_friend() {
                     v.push(act(format!("Their quota: {} GB", f.quota_gb), Act::Quota));
-                    let speed = if f.max_in_kbps == 0 { "any".to_string() } else { format!("{} KB/s", f.max_in_kbps) };
+                    let speed =
+                        if f.max_in_kbps == 0 { "any".to_string() } else { format!("{} MB/s", mbps(f.max_in_kbps)) };
                     v.push(act(format!("Their speed: {speed}"), Act::InLimit));
                 }
                 if f.cloud.is_some() {
@@ -1044,6 +1068,9 @@ impl App {
                 v
             }
             Kind::Settings => vec![
+                val("Name", "name"),
+                val("Max outgoing (MB/s)", "limit"),
+                val("Max incoming (MB/s)", "incoming"),
                 act(
                     format!(
                         "At login: {}",
@@ -1054,7 +1081,6 @@ impl App {
                 val("Only between (hours)", "hours"),
                 val("Right now", "pause"),
                 val("Drives every (min)", "every"),
-                val("Upload limit (KB/s)", "limit"),
                 val("Warn after (days)", "warn"),
                 val("Keep versions", "versions"),
                 val("Keep for (days)", "days"),
@@ -1165,8 +1191,12 @@ impl App {
             }
             Kind::Settings => {
                 self.page = SETTINGS;
-                // The first menu row is the start-at-login line, which has no row in the table.
-                self.settings.select(sel.checked_sub(1));
+                // The start-at-login line follows the essentials and has no row in the table.
+                self.settings.select(match sel {
+                    s if s < ESSENTIAL => Some(s),
+                    s if s == ESSENTIAL => None,
+                    s => Some(s - 1),
+                });
                 if sel > GENERAL.len() {
                     self.sub = Sub::Excludes;
                     self.exlist = None;
@@ -1700,9 +1730,9 @@ impl App {
                 Ok(minutes) => self.apply(Cmd::Every { name: Some(name), minutes }).await,
                 Err(_) => self.status = "type a number of minutes".into(),
             },
-            Prompt::InLimit(name) => match text.parse::<u64>() {
-                Ok(kbps) => self.apply(Cmd::FriendLimit { name, kbps }).await,
-                Err(_) => self.status = "type a number of KB/s (0 = unlimited)".into(),
+            Prompt::InLimit(name) => match parse_mbps(&text) {
+                Some(kbps) => self.apply(Cmd::FriendLimit { name, kbps }).await,
+                None => self.status = "type a number of MB/s such as 0.5 (0 = unlimited)".into(),
             },
             Prompt::Quota(name) => match text.parse::<u64>() {
                 Ok(gb) => self.apply(Cmd::FriendQuota { name, gb }).await,
@@ -1978,14 +2008,23 @@ impl App {
         // the list too, so the chosen setting sits a little further down than its number.
         let heading =
             |text: &str| ListItem::new(Line::styled(text.to_string(), Style::new().add_modifier(Modifier::BOLD)));
-        let mut items = vec![heading("Automatic backups")];
-        items.extend(GENERAL[..AUTOMATIC].iter().map(|(k, label)| row(self, k, label)));
+        let mut items = vec![heading("Essentials")];
+        items.extend(GENERAL[..ESSENTIAL].iter().map(|(k, label)| row(self, k, label)));
+        items.push(ListItem::new(""));
+        items.push(heading("Automatic backups"));
+        items.extend(GENERAL[ESSENTIAL..AUTOMATIC].iter().map(|(k, label)| row(self, k, label)));
         items.push(ListItem::new(""));
         items.push(heading("History kept"));
         items.extend(GENERAL[AUTOMATIC..].iter().map(|(k, label)| row(self, k, label)));
-        let chosen = self.settings.selected().map(|i| if i < AUTOMATIC { i + 1 } else { i + 3 });
+        let chosen = self.settings.selected().map(|i| match i {
+            i if i < ESSENTIAL => i + 1,
+            i if i < AUTOMATIC => i + 3,
+            i => i + 5,
+        });
         let mut st = ListState::default().with_selected(chosen);
-        let block = Block::bordered().title(" Settings: for every set that has none of its own ").border_style(focus);
+        let block = Block::bordered()
+            .title(" Settings: this computer, and every set that has none of its own ")
+            .border_style(focus);
         f.render_stateful_widget(List::new(items).block(block).highlight_style(hl), area, &mut st);
     }
 
@@ -2045,6 +2084,7 @@ impl App {
     fn draw_dests(&mut self, f: &mut Frame, area: Rect, focus: Style, hl: Style) {
         let dim = Style::new().fg(Color::DarkGray);
         let mut items: Vec<ListItem> = vec![];
+        let mut group = "";
         for x in &self.cfg.friends {
             let o = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == x.name.as_str()));
             let get = |k: &str| o.map(|o| o[k].clone()).unwrap_or(Value::Null);
@@ -2062,12 +2102,26 @@ impl App {
                 _ => "not known yet".to_string(),
             };
             let off = if x.backup_to { "" } else { "   NOT IN USE" };
-            let mut lines = vec![Line::from(vec![
+            // The first card of each kind carries that group's heading.
+            let mut lines = vec![];
+            if group != x.kind() {
+                if !group.is_empty() {
+                    lines.push(Line::raw(""));
+                }
+                group = x.kind();
+                let title = match group {
+                    "friend" => "Friends",
+                    "drive" => "Your own drives",
+                    _ => "Cloud storage",
+                };
+                lines.push(Line::styled(title, Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)));
+            }
+            lines.push(Line::from(vec![
                 Span::styled(format!("{dot} "), Style::new().fg(color)),
                 Span::styled(format!("{:<16}", x.name), Style::new().add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{} · {state}{}", x.kind(), link.replacen(", ", " · ", 9)), dim),
                 Span::styled(off, Style::new().fg(Color::Yellow)),
-            ])];
+            ]));
             let sent = format!("{there} · last sent {}", ago(get("last_out").as_i64()));
             lines.extend(Self::labelled("You use", vec![Line::raw(sent)]));
             lines.extend(match (&x.path, &x.cloud) {
@@ -2085,7 +2139,7 @@ impl App {
             });
             let mut rules = vec![format!("every {} min", x.interval_secs(&self.cfg) / 60)];
             if x.is_friend() && x.max_in_kbps > 0 {
-                rules.push(format!("their speed {} KB/s", x.max_in_kbps));
+                rules.push(format!("their speed {} MB/s", mbps(x.max_in_kbps)));
             }
             if x.cloud.is_some() {
                 rules.push(if x.quota_gb > 0 { format!("cap {} GB", x.quota_gb) } else { "no cap".into() });
@@ -2098,11 +2152,9 @@ impl App {
             lines.extend(Self::labelled("Back up", vec![Line::styled(rules.join(" · "), dim)]));
             items.push(ListItem::new(Text::from(lines)));
         }
-        let block = Block::bordered()
-            .title(" Destinations: friends' computers, local drives and cloud storage ")
-            .border_style(focus);
+        let block = Block::bordered().title(" Friends, and drives and cloud storage of your own ").border_style(focus);
         if items.is_empty() {
-            let text = "No destinations yet.\n\n  i  invite a friend (you send them a one-time code)\n  a  accept an invite a friend sent you\n  d  add a local drive or folder\n\nCloud storage (S3, B2 and the like) is added from the menu on the left.";
+            let text = "No friends yet, and no drive or cloud storage of your own.\n\n  i  invite a friend (you send them a one-time code)\n  a  accept an invite a friend sent you\n  d  add a local drive or folder\n\nCloud storage (S3, B2 and the like) is added from the menu on the left.";
             f.render_widget(Paragraph::new(text).block(block), area);
         } else {
             if self.dests.selected().is_none() {
@@ -2303,7 +2355,7 @@ impl App {
                 Kind::Rules(_) => "Schedule".into(),
                 Kind::Restore => "Restore".into(),
                 Kind::RestoreSet(n) => n.clone(),
-                Kind::Dests => "Destinations".into(),
+                Kind::Dests => "Friends".into(),
                 Kind::Settings => "Settings".into(),
                 Kind::Excludes => "Exclusions".into(),
                 Kind::ExList(n) => n.clone(),
@@ -2399,7 +2451,7 @@ impl App {
                     format!(" Most GB to keep on {n} (0 = no cap); the oldest restore points there go first ")
                 }
                 Prompt::Quota(n) => format!(" GB that {n} may store on this computer "),
-                Prompt::InLimit(n) => format!(" Fastest {n} may send backups here, in KB/s (0 = unlimited) "),
+                Prompt::InLimit(n) => format!(" Fastest {n} may send backups here, in MB/s (0 = unlimited) "),
                 Prompt::ApplyExclusions(n) => {
                     format!(" Type yes to take what set {n} now leaves out from its older restore points ")
                 }
@@ -2411,6 +2463,7 @@ impl App {
                     " Backup hours, such as 22-7, or 'always' ".into()
                 }
                 Prompt::Setting("pause") => " Pause for how many hours? (blank = until resumed, 0 = resume) ".into(),
+                Prompt::Setting("name") => " New name for this computer ".into(),
                 Prompt::Setting(_) => " New value ".into(),
                 Prompt::Join => " Paste the invite, then Enter ".into(),
                 Prompt::RestoreTo => " Restore into which folder? ".into(),

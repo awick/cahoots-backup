@@ -192,7 +192,7 @@ cmp grown/data/growing data/growing || fail "the settled file was not captured"
 
 step "the daemon killed in the middle of a backup"
 BEFORE=$(a snapshots | wc -l)
-a limit 300 >/dev/null
+a limit 0.3 >/dev/null
 head -c 5000000 /dev/urandom >data/interrupted
 a backup >/dev/null 2>&1 &
 CLIENT=$!

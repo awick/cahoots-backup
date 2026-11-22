@@ -5,6 +5,7 @@
 //! `Node::run`.
 
 use super::*;
+use crate::config::mbps;
 
 impl Node {
     pub(super) async fn backup(self: &Arc<Self>, tag: Option<String>, set: Option<String>, out: &Out) -> Result<()> {
@@ -148,7 +149,10 @@ impl Node {
             out.say(format!("automatic backups: held ({why})"));
         }
         if c.upload_kbps > 0 {
-            out.say(format!("upload limit: {} KB/s", c.upload_kbps));
+            out.say(format!("max outgoing: {} MB/s", mbps(c.upload_kbps)));
+        }
+        if c.incoming_kbps > 0 {
+            out.say(format!("max incoming: {} MB/s", mbps(c.incoming_kbps)));
         }
         out.say("backing up:");
         for b in &c.sets {
@@ -483,7 +487,7 @@ impl Node {
         out.say(if kbps == 0 {
             format!("{name} may send backups here at any speed")
         } else {
-            format!("{name} may send backups here at up to {kbps} KB/s")
+            format!("{name} may send backups here at up to {} MB/s", mbps(kbps))
         });
         Ok(())
     }
@@ -831,22 +835,26 @@ impl Node {
         Ok(())
     }
 
-    pub(super) async fn tune(
-        &self,
-        upload_kbps: Option<u64>,
-        hours: Option<String>,
-        pause_hours: Option<i64>,
-        warn_days: Option<u32>,
-        out: &Out,
-    ) -> Result<()> {
+    pub(super) async fn tune(&self, t: Tune, out: &Out) -> Result<()> {
+        let Tune { name, upload_kbps, incoming_kbps, hours, pause_hours, warn_days } = t;
         if let Some(h) = &hours {
             if !h.is_empty() && crate::config::parse_hours(h).is_none() {
                 bail!("hours look like 22-7 (10pm to 7am); use 'always' to remove the limit");
             }
         }
+        let name = match name {
+            Some(n) if !n.chars().any(char::is_alphanumeric) => bail!("a name needs letters or digits"),
+            n => n.map(|n| clean_name(&n)),
+        };
         self.update(|c| {
+            if let Some(n) = &name {
+                c.name = n.clone();
+            }
             if let Some(k) = upload_kbps {
                 c.upload_kbps = k;
+            }
+            if let Some(k) = incoming_kbps {
+                c.incoming_kbps = k;
             }
             if let Some(h) = hours {
                 c.backup_hours = h;
@@ -858,7 +866,12 @@ impl Node {
                 c.warn_after_days = d;
             }
         })?;
-        out.say("saved");
+        match name {
+            Some(n) => {
+                out.say(format!("this computer is now called {n}; friends you already have keep the name they know"))
+            }
+            None => out.say("saved"),
+        }
         Ok(())
     }
 

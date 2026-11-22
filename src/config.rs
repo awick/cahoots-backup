@@ -272,6 +272,9 @@ pub struct Config {
     /// Upload speed limit in KB/s across all friends (0 = unlimited).
     #[serde(default)]
     pub upload_kbps: u64,
+    /// Speed limit in KB/s on what all friends together send here (0 = unlimited).
+    #[serde(default)]
+    pub incoming_kbps: u64,
     /// Hours of the day automatic backups may run, such as "22-7" (empty = any time).
     #[serde(default)]
     pub backup_hours: String,
@@ -322,6 +325,7 @@ impl Config {
             default_quota_gb: d_quota(),
             warn_after_days: d_warn(),
             upload_kbps: 0,
+            incoming_kbps: 0,
             backup_hours: String::new(),
             paused_until: 0,
             min_free_gb: d_min_free(),
@@ -418,6 +422,23 @@ impl Identity {
         let v = hex::decode(s)?;
         v.try_into().map_err(|_| anyhow::anyhow!("bad key length"))
     }
+}
+
+/// A speed typed in MB/s, decimals allowed, as the KB/s the settings hold (0 = unlimited).
+pub fn parse_mbps(text: &str) -> Option<u64> {
+    let v: f64 = text.trim().parse().ok()?;
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    let kbps = (v * 1024.0).round() as u64;
+    // A speed too small to hold is the slowest there is, not unlimited.
+    Some(if v > 0.0 { kbps.max(1) } else { 0 })
+}
+
+/// A speed held in KB/s as the MB/s shown and typed, such as 0.5.
+pub fn mbps(kbps: u64) -> String {
+    let s = format!("{:.3}", kbps as f64 / 1024.0);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Parses "22-7" into (22, 7); the window may wrap past midnight.
@@ -550,6 +571,24 @@ impl Friend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speeds_are_typed_in_mb_a_second_with_decimals() {
+        assert_eq!(parse_mbps("0.5"), Some(512));
+        assert_eq!(parse_mbps(" 20 "), Some(20480));
+        assert_eq!(parse_mbps("0"), Some(0));
+        assert_eq!(parse_mbps("0.0001"), Some(1), "tiny is slow, not unlimited");
+        for bad in ["", "fast", "-1", "nan", "inf"] {
+            assert_eq!(parse_mbps(bad), None, "{bad}");
+        }
+        for (kbps, shown) in [(0, "0"), (512, "0.5"), (1024, "1"), (10240, "10"), (307, "0.3"), (1, "0.001")] {
+            assert_eq!(mbps(kbps), shown);
+        }
+        // What is shown saves as what it was.
+        for kbps in [1, 100, 205, 307, 512, 1000, 1536] {
+            assert_eq!(parse_mbps(&mbps(kbps)), Some(kbps));
+        }
+    }
     use std::os::unix::fs::PermissionsExt;
 
     fn friend(name: &str, drive: bool) -> Friend {

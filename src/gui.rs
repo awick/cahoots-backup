@@ -5,9 +5,9 @@
 //! daemon: every button sends a command over the local socket.
 
 use crate::{
-    config::{BackupSet, Config, Friend, is_builtin_list},
+    config::{BackupSet, Config, Friend, is_builtin_list, mbps, parse_mbps},
     control,
-    node::{CloudAdd, Cmd, SetEdit},
+    node::{CloudAdd, Cmd, SetEdit, Tune},
     snapshot::{human, when},
     tui::{Item, Listing, ago, list_dir, name, parse_listing, tilde, until},
 };
@@ -68,7 +68,7 @@ enum Page {
 const PAGES: [(Page, &str); 6] = [
     (Page::Backup, "Backup"),
     (Page::Restore, "Restore"),
-    (Page::Destinations, "Destinations"),
+    (Page::Destinations, "Friends"),
     (Page::Settings, "Settings"),
     (Page::History, "History"),
     (Page::Status, "Status"),
@@ -914,7 +914,7 @@ impl Gui {
         let set = self.set(set_name);
         let o = self.set_overview(set_name);
         if self.cfg.friends.is_empty() {
-            ui.label("No destinations yet. Add a friend, a drive or cloud storage on the Destinations page.");
+            ui.label("No destinations yet. Add a friend, a drive or cloud storage on the Friends page.");
             return;
         }
         ui.weak("Tick where this set's backups go.");
@@ -1351,294 +1351,329 @@ impl Gui {
         });
     }
 
-    // ------------------------------------------------------ destinations page
+    // ----------------------------------------------------------- friends page
 
     fn dests_page(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        ui.heading("Destinations");
-        ui.weak("Friends' computers, local drives and cloud storage that your backups go to.");
+        ui.heading("Friends");
+        ui.weak("Friends' computers that your backups go to, and drives and cloud storage of your own.");
         ui.add_space(4.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for f in self.cfg.friends.clone() {
-                let o =
-                    self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == f.name.as_str())).cloned();
-                let o = o.unwrap_or(Value::Null);
-                ui.group(|ui| {
-                    ui.set_min_width(ui.available_width());
-                    // The name on the left, what it is and how it is reached on the right.
-                    ui.horizontal(|ui| {
-                        Self::dot(ui, self.dest_dot(&f.name));
-                        ui.label(RichText::new(&f.name).strong().size(17.0));
-                        if !f.backup_to {
-                            ui.colored_label(YELLOW, "not in use");
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let mut about = vec![f.kind().to_string(), o["state"].as_str().unwrap_or("checking").to_string()];
-                            about.extend(o["link"].as_str().map(String::from));
-                            match o["version"].as_str() {
-                                Some(v) => about.push(format!("version {v}")),
-                                None if f.is_friend() && o["state"] == "online" => about.push("older version".into()),
-                                None => {}
-                            }
-                            ui.weak(about.join(" · "));
-                        });
-                    });
-                    ui.add_space(2.0);
-                    let key = |k: &str| format!("{k}-{}", f.name);
-                    let (mut every, mut quota, mut limit) = (String::new(), None, None);
-                    let (mut days, mut last) = (None, None);
-                    let shown = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
-                    let (had_days, had_last) = (
-                        shown(f.retention.as_ref().map(|r| r.keep_days)),
-                        shown(f.retention.as_ref().map(|r| r.keep_last)),
-                    );
-                    Self::rows(ui, ("dest", &f.name), |ui| {
-                        ui.weak("You use");
-                        let there = match (o["used_there"].as_u64(), o["quota_there"].as_u64()) {
-                            (Some(u), Some(q)) => format!("{} of {} there", human(u), human(q)),
-                            (Some(u), None) => format!("{} there", human(u)),
-                            _ => "not known yet".to_string(),
-                        };
-                        ui.label(format!("{there} · last sent {}", ago(o["last_out"].as_i64())));
-                        ui.end_row();
-                        match (&f.path, &f.cloud) {
-                            (Some(p), _) => {
-                                ui.weak("Folder");
-                                ui.label(p.display().to_string());
-                            }
-                            (_, Some(c)) => {
-                                ui.weak("Bucket");
-                                ui.label(format!("{} at {}", c.bucket, c.endpoint));
-                            }
-                            _ => {
-                                ui.weak("They use");
-                                ui.label(format!(
-                                    "{} of {} GB here · last backup from them {}",
-                                    human(o["used_here"].as_u64().unwrap_or(0)),
-                                    f.quota_gb,
-                                    ago(o["last_in"].as_i64())
-                                ));
-                            }
-                        }
-                        ui.end_row();
-                        ui.weak("In use");
-                        let mut on = f.backup_to;
-                        if ui.checkbox(&mut on, "send backups here").changed() {
-                            self.save(&ctx, Cmd::FriendBackupTo { name: f.name.clone(), on });
-                        }
-                        ui.end_row();
-                        let cur = (f.interval_secs(&self.cfg) / 60).to_string();
-                        every = self.rule(ui, &key("every"), "Back up every", cur, "min", "at most this often");
-                        if f.is_friend() {
-                            let hint = "what they may store on this computer";
-                            quota = Some(self.rule(ui, &key("quota"), "Their quota", f.quota_gb.to_string(), "GB", hint));
-                            let hint = "fastest they may send here; 0 = any speed";
-                            limit =
-                                Some(self.rule(ui, &key("limit"), "Their speed", f.max_in_kbps.to_string(), "KB/s", hint));
-                        } else if f.cloud.is_some() {
-                            let hint = "most to keep there, oldest restore points go first; 0 = no cap";
-                            quota = Some(self.rule(ui, &key("quota"), "Cap", f.quota_gb.to_string(), "GB", hint));
-                        }
-                        // History kept here, on one row; blank follows each set's own rules.
-                        ui.weak("Keep");
-                        ui.horizontal(|ui| {
-                            let mut boxed = |ui: &mut egui::Ui, k: &str, cur: &str| {
-                                let text = self.fields.entry(key(k)).or_insert_with(|| cur.to_string());
-                                ui.add(egui::TextEdit::singleline(text).desired_width(70.0));
-                                text.trim().to_string()
-                            };
-                            days = Some(boxed(ui, "kdays", &had_days));
-                            ui.label("days of history, and always the last");
-                            last = Some(boxed(ui, "klast", &had_last));
-                            ui.add_space(8.0);
-                            ui.weak("blank = each set's rules");
-                        });
-                        ui.end_row();
-                    });
+            let all = self.cfg.friends.clone();
+            // Friends come first. A drive or a bucket is kept on this page too, but under its
+            // own heading: it is nobody's friend.
+            let groups = [
+                ("Friends", "friend", "No friends yet. One invite pairs the two of you both ways."),
+                ("Your own drives", "drive", "No drive yet."),
+                ("Cloud storage", "cloud", "No cloud storage yet."),
+            ];
+            for (title, kind, none) in groups {
+                if kind != "friend" {
+                    ui.add_space(14.0);
+                }
+                ui.label(RichText::new(title).strong().size(19.0));
+                ui.add_space(2.0);
+                let mine: Vec<&Friend> = all.iter().filter(|f| f.kind() == kind).collect();
+                if mine.is_empty() {
+                    ui.weak(none);
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let num = |t: &str, cur: u64| t.parse::<u64>().ok().filter(|v| *v != cur);
-                        let every = num(&every, f.interval_secs(&self.cfg) / 60);
-                        let quota = quota.as_deref().and_then(|t| num(t, f.quota_gb));
-                        let limit = limit.as_deref().and_then(|t| num(t, f.max_in_kbps));
-                        let days = days.filter(|t| *t != had_days);
-                        let last = last.filter(|t| *t != had_last);
-                        let dirty =
-                            every.is_some() || quota.is_some() || limit.is_some() || days.is_some() || last.is_some();
-                        if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
-                            if let Some(m) = every {
-                                self.save(&ctx, Cmd::Every { name: Some(f.name.clone()), minutes: m as u32 });
-                            }
-                            if let Some(gb) = quota {
-                                self.save(&ctx, Cmd::FriendQuota { name: f.name.clone(), gb });
-                            }
-                            if let Some(kbps) = limit {
-                                self.save(&ctx, Cmd::FriendLimit { name: f.name.clone(), kbps });
-                            }
-                            let typed = [("days", &days), ("last", &last)];
-                            if typed.iter().any(|(_, t)| t.is_some()) {
-                                let set: Vec<(String, u32)> = typed
-                                    .iter()
-                                    .filter_map(|(k, t)| Some((k.to_string(), t.as_ref()?.parse().ok()?)))
-                                    .collect();
-                                // Both blanked: back to each set's rules.
-                                let blank = |t: &Option<String>, cur: bool| t.as_ref().map_or(!cur, |t| t.is_empty());
-                                let clear = set.is_empty()
-                                    && blank(&days, f.retention.is_some())
-                                    && blank(&last, f.retention.is_some());
-                                if clear || !set.is_empty() {
-                                    self.save(&ctx, Cmd::DestKeep { name: f.name.clone(), set, clear });
-                                }
-                            }
-                            self.fields.retain(|k, _| !k.ends_with(&format!("-{}", f.name)));
-                        }
-                        // What removes things sits together on the right; each asks to be clicked twice.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let clean = |dry_run| Cmd::DestClean { name: f.name.clone(), dry_run };
-                            let hint = "Stops using this destination. What is stored there is left in place.";
-                            if self.confirm(ui, &format!("remove-{}", f.name), "Remove", hint) {
-                                self.save(&ctx, Cmd::FriendRemove { name: f.name.clone(), purge: false });
-                            }
-                            let hint = "Deletes from here the restore points of sets that are no longer sent here.";
-                            if self.confirm(ui, &format!("clean-{}", f.name), "Clean up", hint) {
-                                self.spawn(&ctx, Job::Show("Clean up"), clean(false), Some("Cleaning up"));
-                            }
-                            let look = ui
-                                .button("Leftovers?")
-                                .on_hover_text("Shows what sets no longer sent here left behind, without changing anything.");
-                            if look.clicked() {
-                                self.spawn(&ctx, Job::Show("Leftovers"), clean(true), Some("Looking for leftovers"));
-                            }
-                        });
-                    });
-                });
-                ui.add_space(4.0);
+                }
+                for f in mine {
+                    self.dest_card(ui, f);
+                    ui.add_space(4.0);
+                }
+                match kind {
+                    "friend" => self.add_friend_box(ui),
+                    "drive" => self.add_drive_box(ui),
+                    _ => self.add_cloud_box(ui),
+                }
             }
-            ui.add_space(8.0);
-            ui.group(|ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(RichText::new("Add a friend").strong().size(15.0));
-                ui.weak("One of you creates an invite and sends it; the other pastes it in. That pairs both ways.");
-                ui.add_space(2.0);
-                Self::rows(ui, "add-friend", |ui| {
-                    ui.weak("Your invite");
-                    ui.horizontal(|ui| {
-                        if ui.button("Create an invite").clicked() {
-                            self.spawn(&ctx, Job::Show("Invite"), Cmd::Invite, Some("Creating an invite"));
-                        }
-                        ui.weak("a one-time code to send them, good for a day");
-                    });
-                    ui.end_row();
-                    ui.weak("Their invite");
-                    ui.horizontal(|ui| {
-                        let text = self.fields.entry("join".into()).or_default();
-                        ui.add(egui::TextEdit::singleline(text).desired_width(360.0).hint_text("paste sdb1... here"));
-                        let ticket = text.trim().trim_start_matches("sdb join ").to_string();
-                        if ui.add_enabled(ticket.starts_with("sdb1"), egui::Button::new("Join")).clicked() {
-                            self.fields.remove("join");
-                            self.spawn(&ctx, Job::Show("Pairing"), Cmd::Join { ticket }, Some("Pairing"));
-                        }
-                    });
-                    ui.end_row();
-                });
-            });
-            ui.add_space(8.0);
-            ui.group(|ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(RichText::new("Add a local drive").strong().size(15.0));
-                ui.weak("An external drive or any folder. It is encrypted like everything else, and skipped while unplugged.");
-                ui.add_space(2.0);
-                Self::rows(ui, "add-drive", |ui| {
-                    ui.weak("Folder");
-                    ui.horizontal(|ui| {
-                        let text = self.fields.entry("drive".into()).or_insert_with(|| "/Volumes/".into());
-                        ui.add(egui::TextEdit::singleline(text).desired_width(360.0));
-                        let home = std::env::var("HOME").unwrap_or_default();
-                        // The system's own folder chooser, opened where the box points if that exists.
-                        if ui.button("Browse...").on_hover_text("Choose the folder in a dialog").clicked() {
-                            let typed = PathBuf::from(text.trim().replacen('~', &home, 1));
-                            let start = [typed, PathBuf::from("/Volumes"), PathBuf::from(&home)]
-                                .into_iter()
-                                .find(|p| p.is_dir())
-                                .unwrap_or_else(|| PathBuf::from("/"));
-                            let picked = rfd::FileDialog::new()
-                                .set_title("Choose a drive or folder to back up to")
-                                .set_directory(start)
-                                .pick_folder();
-                            if let Some(dir) = picked {
-                                *text = dir.display().to_string();
-                            }
-                        }
-                        let path =
-                            std::fs::canonicalize(text.trim().replacen('~', &home, 1)).ok().filter(|p| p.is_dir());
-                        if ui.add_enabled(path.is_some(), egui::Button::new("Add")).clicked() {
-                            if let Some(path) = path {
-                                let name = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| "drive".into());
-                                self.fields.remove("drive");
-                                self.spawn(&ctx, Job::Show("Drive added"), Cmd::DriveAdd { name, path }, None);
-                            }
-                        }
-                    });
-                    ui.end_row();
-                });
-            });
-            ui.add_space(8.0);
-            ui.group(|ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(RichText::new("Add cloud storage").strong().size(15.0));
-                ui.weak("Any S3-compatible bucket: Amazon S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO. Using the name of one you already have gives it new keys.");
-                let mut got: Vec<String> = vec![];
-                ui.add_space(2.0);
-                Self::rows(ui, "cloud", |ui| {
-                    let rows = [
-                        ("cloud-name", "Name", "what to call this destination", false),
-                        ("cloud-endpoint", "Endpoint", "https://s3.us-west-004.backblazeb2.com", false),
-                        ("cloud-bucket", "Bucket", "", false),
-                        ("cloud-region", "Region", "us-east-1", false),
-                        ("cloud-prefix", "Folder", "optional: a folder inside the bucket", false),
-                        ("cloud-ca", "CA certificate", "optional: a file, only for storage with a certificate of its own", false),
-                        ("cloud-access", "Access key", "the key id", false),
-                        ("cloud-secret", "Secret key", "", true),
-                    ];
-                    for (key, label, hint, secret) in rows {
-                        ui.weak(label);
-                        let text = self.fields.entry(key.into()).or_default();
-                        ui.add(egui::TextEdit::singleline(text).desired_width(420.0).hint_text(hint).password(secret));
-                        ui.end_row();
-                        got.push(text.trim().to_string());
+        });
+    }
+
+    /// One friend, drive or bucket: how it stands, and its settings in rows.
+    fn dest_card(&mut self, ui: &mut egui::Ui, f: &Friend) {
+        let ctx = ui.ctx().clone();
+        let o = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == f.name.as_str())).cloned();
+        let o = o.unwrap_or(Value::Null);
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            // The name on the left, what it is and how it is reached on the right.
+            ui.horizontal(|ui| {
+                Self::dot(ui, self.dest_dot(&f.name));
+                ui.label(RichText::new(&f.name).strong().size(17.0));
+                if !f.backup_to {
+                    ui.colored_label(YELLOW, "not in use");
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut about = vec![f.kind().to_string(), o["state"].as_str().unwrap_or("checking").to_string()];
+                    about.extend(o["link"].as_str().map(String::from));
+                    match o["version"].as_str() {
+                        Some(v) => about.push(format!("version {v}")),
+                        None if f.is_friend() && o["state"] == "online" => about.push("older version".into()),
+                        None => {}
                     }
+                    ui.weak(about.join(" · "));
                 });
-                // Region and folder may stay blank.
-                let ready = [0, 1, 2, 6, 7].iter().all(|i| !got[*i].is_empty());
-                if ui.add_enabled(ready, egui::Button::new("Check and add")).clicked() {
-                    let mut it = got.into_iter();
-                    let mut next = || it.next().unwrap_or_default();
-                    let (name, endpoint, bucket, region, prefix, ca) = (next(), next(), next(), next(), next(), next());
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    let ca_pem = if ca.is_empty() { Ok(None) } else { std::fs::read_to_string(ca.replacen('~', &home, 1)).map(Some) };
-                    match ca_pem {
-                        Ok(ca_pem) => {
-                            let cmd = Cmd::CloudAdd(CloudAdd {
-                                name,
-                                endpoint,
-                                bucket,
-                                region: Some(region),
-                                prefix: Some(prefix),
-                                access_key: next(),
-                                secret_key: next(),
-                                path_style: None,
-                                create: false,
-                                ca_pem,
-                            });
-                            self.spawn(&ctx, Job::Show(CLOUD_JOB), cmd, Some("Checking the cloud storage"));
-                        }
-                        Err(e) => self.status = format!("Cannot read the CA certificate file {ca}: {e}"),
+            });
+            ui.add_space(2.0);
+            let key = |k: &str| format!("{k}-{}", f.name);
+            let (mut every, mut quota, mut limit) = (String::new(), None, None);
+            let (mut days, mut last) = (None, None);
+            let shown = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
+            let (had_days, had_last) =
+                (shown(f.retention.as_ref().map(|r| r.keep_days)), shown(f.retention.as_ref().map(|r| r.keep_last)));
+            Self::rows(ui, ("dest", &f.name), |ui| {
+                ui.weak("You use");
+                let there = match (o["used_there"].as_u64(), o["quota_there"].as_u64()) {
+                    (Some(u), Some(q)) => format!("{} of {} there", human(u), human(q)),
+                    (Some(u), None) => format!("{} there", human(u)),
+                    _ => "not known yet".to_string(),
+                };
+                ui.label(format!("{there} · last sent {}", ago(o["last_out"].as_i64())));
+                ui.end_row();
+                match (&f.path, &f.cloud) {
+                    (Some(p), _) => {
+                        ui.weak("Folder");
+                        ui.label(p.display().to_string());
+                    }
+                    (_, Some(c)) => {
+                        ui.weak("Bucket");
+                        ui.label(format!("{} at {}", c.bucket, c.endpoint));
+                    }
+                    _ => {
+                        ui.weak("They use");
+                        ui.label(format!(
+                            "{} of {} GB here · last backup from them {}",
+                            human(o["used_here"].as_u64().unwrap_or(0)),
+                            f.quota_gb,
+                            ago(o["last_in"].as_i64())
+                        ));
                     }
                 }
+                ui.end_row();
+                ui.weak("In use");
+                let mut on = f.backup_to;
+                if ui.checkbox(&mut on, "send backups here").changed() {
+                    self.save(&ctx, Cmd::FriendBackupTo { name: f.name.clone(), on });
+                }
+                ui.end_row();
+                let cur = (f.interval_secs(&self.cfg) / 60).to_string();
+                every = self.rule(ui, &key("every"), "Back up every", cur, "min", "at most this often");
+                if f.is_friend() {
+                    let hint = "what they may store on this computer";
+                    quota = Some(self.rule(ui, &key("quota"), "Their quota", f.quota_gb.to_string(), "GB", hint));
+                    let hint = "fastest they may send here, such as 0.5; 0 = any speed";
+                    limit = Some(self.rule(ui, &key("limit"), "Their speed", mbps(f.max_in_kbps), "MB/s", hint));
+                } else if f.cloud.is_some() {
+                    let hint = "most to keep there, oldest restore points go first; 0 = no cap";
+                    quota = Some(self.rule(ui, &key("quota"), "Cap", f.quota_gb.to_string(), "GB", hint));
+                }
+                // History kept here, on one row; blank follows each set's own rules.
+                ui.weak("Keep");
+                ui.horizontal(|ui| {
+                    let mut boxed = |ui: &mut egui::Ui, k: &str, cur: &str| {
+                        let text = self.fields.entry(key(k)).or_insert_with(|| cur.to_string());
+                        ui.add(egui::TextEdit::singleline(text).desired_width(70.0));
+                        text.trim().to_string()
+                    };
+                    days = Some(boxed(ui, "kdays", &had_days));
+                    ui.label("days of history, and always the last");
+                    last = Some(boxed(ui, "klast", &had_last));
+                    ui.add_space(8.0);
+                    ui.weak("blank = each set's rules");
+                });
+                ui.end_row();
             });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let num = |t: &str, cur: u64| t.parse::<u64>().ok().filter(|v| *v != cur);
+                let every = num(&every, f.interval_secs(&self.cfg) / 60);
+                let quota = quota.as_deref().and_then(|t| num(t, f.quota_gb));
+                let limit = limit.filter(|t| *t != mbps(f.max_in_kbps)).and_then(|t| parse_mbps(&t));
+                let days = days.filter(|t| *t != had_days);
+                let last = last.filter(|t| *t != had_last);
+                let dirty = every.is_some() || quota.is_some() || limit.is_some() || days.is_some() || last.is_some();
+                if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
+                    if let Some(m) = every {
+                        self.save(&ctx, Cmd::Every { name: Some(f.name.clone()), minutes: m as u32 });
+                    }
+                    if let Some(gb) = quota {
+                        self.save(&ctx, Cmd::FriendQuota { name: f.name.clone(), gb });
+                    }
+                    if let Some(kbps) = limit {
+                        self.save(&ctx, Cmd::FriendLimit { name: f.name.clone(), kbps });
+                    }
+                    let typed = [("days", &days), ("last", &last)];
+                    if typed.iter().any(|(_, t)| t.is_some()) {
+                        let set: Vec<(String, u32)> = typed
+                            .iter()
+                            .filter_map(|(k, t)| Some((k.to_string(), t.as_ref()?.parse().ok()?)))
+                            .collect();
+                        // Both blanked: back to each set's rules.
+                        let blank = |t: &Option<String>, cur: bool| t.as_ref().map_or(!cur, |t| t.is_empty());
+                        let clear = set.is_empty()
+                            && blank(&days, f.retention.is_some())
+                            && blank(&last, f.retention.is_some());
+                        if clear || !set.is_empty() {
+                            self.save(&ctx, Cmd::DestKeep { name: f.name.clone(), set, clear });
+                        }
+                    }
+                    self.fields.retain(|k, _| !k.ends_with(&format!("-{}", f.name)));
+                }
+                // What removes things sits together on the right; each asks to be clicked twice.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let clean = |dry_run| Cmd::DestClean { name: f.name.clone(), dry_run };
+                    let hint = "Stops using this destination. What is stored there is left in place.";
+                    if self.confirm(ui, &format!("remove-{}", f.name), "Remove", hint) {
+                        self.save(&ctx, Cmd::FriendRemove { name: f.name.clone(), purge: false });
+                    }
+                    let hint = "Deletes from here the restore points of sets that are no longer sent here.";
+                    if self.confirm(ui, &format!("clean-{}", f.name), "Clean up", hint) {
+                        self.spawn(&ctx, Job::Show("Clean up"), clean(false), Some("Cleaning up"));
+                    }
+                    let look = ui
+                        .button("Leftovers?")
+                        .on_hover_text("Shows what sets no longer sent here left behind, without changing anything.");
+                    if look.clicked() {
+                        self.spawn(&ctx, Job::Show("Leftovers"), clean(true), Some("Looking for leftovers"));
+                    }
+                });
+            });
+        });
+    }
+
+    fn add_friend_box(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new("Add a friend").strong().size(15.0));
+            ui.weak("One of you creates an invite and sends it; the other pastes it in. That pairs both ways.");
+            ui.add_space(2.0);
+            Self::rows(ui, "add-friend", |ui| {
+                ui.weak("Your invite");
+                ui.horizontal(|ui| {
+                    if ui.button("Create an invite").clicked() {
+                        self.spawn(&ctx, Job::Show("Invite"), Cmd::Invite, Some("Creating an invite"));
+                    }
+                    ui.weak("a one-time code to send them, good for a day");
+                });
+                ui.end_row();
+                ui.weak("Their invite");
+                ui.horizontal(|ui| {
+                    let text = self.fields.entry("join".into()).or_default();
+                    ui.add(egui::TextEdit::singleline(text).desired_width(360.0).hint_text("paste sdb1... here"));
+                    let ticket = text.trim().trim_start_matches("sdb join ").to_string();
+                    if ui.add_enabled(ticket.starts_with("sdb1"), egui::Button::new("Join")).clicked() {
+                        self.fields.remove("join");
+                        self.spawn(&ctx, Job::Show("Pairing"), Cmd::Join { ticket }, Some("Pairing"));
+                    }
+                });
+                ui.end_row();
+            });
+        });
+    }
+
+    fn add_drive_box(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new("Add a drive").strong().size(15.0));
+            ui.weak(
+                "An external drive or any folder. It is encrypted like everything else, and skipped while unplugged.",
+            );
+            ui.add_space(2.0);
+            Self::rows(ui, "add-drive", |ui| {
+                ui.weak("Folder");
+                ui.horizontal(|ui| {
+                    let text = self.fields.entry("drive".into()).or_insert_with(|| "/Volumes/".into());
+                    ui.add(egui::TextEdit::singleline(text).desired_width(360.0));
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    // The system's own folder chooser, opened where the box points if that exists.
+                    if ui.button("Browse...").on_hover_text("Choose the folder in a dialog").clicked() {
+                        let typed = PathBuf::from(text.trim().replacen('~', &home, 1));
+                        let start = [typed, PathBuf::from("/Volumes"), PathBuf::from(&home)]
+                            .into_iter()
+                            .find(|p| p.is_dir())
+                            .unwrap_or_else(|| PathBuf::from("/"));
+                        let picked = rfd::FileDialog::new()
+                            .set_title("Choose a drive or folder to back up to")
+                            .set_directory(start)
+                            .pick_folder();
+                        if let Some(dir) = picked {
+                            *text = dir.display().to_string();
+                        }
+                    }
+                    let path = std::fs::canonicalize(text.trim().replacen('~', &home, 1)).ok().filter(|p| p.is_dir());
+                    if ui.add_enabled(path.is_some(), egui::Button::new("Add")).clicked() {
+                        if let Some(path) = path {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "drive".into());
+                            self.fields.remove("drive");
+                            self.spawn(&ctx, Job::Show("Drive added"), Cmd::DriveAdd { name, path }, None);
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+        });
+    }
+
+    fn add_cloud_box(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new("Add cloud storage").strong().size(15.0));
+            ui.weak("Any S3-compatible bucket: Amazon S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO. Using the name of one you already have gives it new keys.");
+            let mut got: Vec<String> = vec![];
+            ui.add_space(2.0);
+            Self::rows(ui, "cloud", |ui| {
+                let rows = [
+                    ("cloud-name", "Name", "what to call this destination", false),
+                    ("cloud-endpoint", "Endpoint", "https://s3.us-west-004.backblazeb2.com", false),
+                    ("cloud-bucket", "Bucket", "", false),
+                    ("cloud-region", "Region", "us-east-1", false),
+                    ("cloud-prefix", "Folder", "optional: a folder inside the bucket", false),
+                    ("cloud-ca", "CA certificate", "optional: a file, only for storage with a certificate of its own", false),
+                    ("cloud-access", "Access key", "the key id", false),
+                    ("cloud-secret", "Secret key", "", true),
+                ];
+                for (key, label, hint, secret) in rows {
+                    ui.weak(label);
+                    let text = self.fields.entry(key.into()).or_default();
+                    ui.add(egui::TextEdit::singleline(text).desired_width(420.0).hint_text(hint).password(secret));
+                    ui.end_row();
+                    got.push(text.trim().to_string());
+                }
+            });
+            // Region and folder may stay blank.
+            let ready = [0, 1, 2, 6, 7].iter().all(|i| !got[*i].is_empty());
+            if ui.add_enabled(ready, egui::Button::new("Check and add")).clicked() {
+                let mut it = got.into_iter();
+                let mut next = || it.next().unwrap_or_default();
+                let (name, endpoint, bucket, region, prefix, ca) = (next(), next(), next(), next(), next(), next());
+                let home = std::env::var("HOME").unwrap_or_default();
+                let ca_pem = if ca.is_empty() { Ok(None) } else { std::fs::read_to_string(ca.replacen('~', &home, 1)).map(Some) };
+                match ca_pem {
+                    Ok(ca_pem) => {
+                        let cmd = Cmd::CloudAdd(CloudAdd {
+                            name,
+                            endpoint,
+                            bucket,
+                            region: Some(region),
+                            prefix: Some(prefix),
+                            access_key: next(),
+                            secret_key: next(),
+                            path_style: None,
+                            create: false,
+                            ca_pem,
+                        });
+                        self.spawn(&ctx, Job::Show(CLOUD_JOB), cmd, Some("Checking the cloud storage"));
+                    }
+                    Err(e) => self.status = format!("Cannot read the CA certificate file {ca}: {e}"),
+                }
+            }
         });
     }
 
@@ -1647,16 +1682,49 @@ impl Gui {
     fn settings_page(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.heading("Settings");
-        ui.weak("These apply to every backup set that has no setting of its own.");
+        ui.weak("This computer, and what applies to every backup set that has no setting of its own.");
         ui.add_space(4.0);
         let c = self.cfg.clone();
         let r = c.retention.clone();
         let mut v: HashMap<&str, String> = HashMap::new();
-        let mut changed = |key: &'static str, typed: String, cur: &str| {
+        let mut save = false;
+        fn note(v: &mut HashMap<&'static str, String>, key: &'static str, typed: String, cur: &str) {
             if typed != cur {
                 v.insert(key, typed);
             }
+        }
+        let save_button = |ui: &mut egui::Ui, v: &HashMap<&str, String>, keys: &[&str]| {
+            ui.add_space(2.0);
+            ui.add_enabled(keys.iter().any(|k| v.contains_key(k)), egui::Button::new("Save")).clicked()
         };
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new("Essentials").strong().size(15.0));
+            ui.add_space(2.0);
+            Self::rows(ui, "essentials", |ui| {
+                ui.weak("Name");
+                let text = self.fields.entry("def-name".into()).or_insert_with(|| c.name.clone());
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(text).desired_width(142.0));
+                    ui.weak("what this computer is called; friends you already have keep the name they know");
+                });
+                note(&mut v, "name", text.trim().to_string(), &c.name);
+                ui.end_row();
+                let cur = mbps(c.upload_kbps);
+                let hint = "your backups to friends and cloud storage, such as 0.5 or 20; 0 = unlimited";
+                note(&mut v, "limit", self.rule(ui, "def-limit", "Max outgoing", cur.clone(), "MB/s", hint), &cur);
+                let cur = mbps(c.incoming_kbps);
+                let hint = "all your friends' backups to this computer together; 0 = unlimited";
+                note(
+                    &mut v,
+                    "incoming",
+                    self.rule(ui, "def-incoming", "Max incoming", cur.clone(), "MB/s", hint),
+                    &cur,
+                );
+            });
+            save |= save_button(ui, &v, &["name", "limit", "incoming"]);
+        });
+        ui.add_space(4.0);
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new("Automatic backups").strong().size(15.0));
@@ -1678,70 +1746,57 @@ impl Gui {
                     ui.label(if paused { "paused" } else { "running" });
                     let (label, hours) = if paused { ("Resume", 0) } else { ("Pause", 24 * 3650) };
                     if ui.button(label).clicked() {
-                        let cmd =
-                            Cmd::Tune { upload_kbps: None, hours: None, pause_hours: Some(hours), warn_days: None };
-                        self.save(&ctx, cmd);
+                        self.save(&ctx, Cmd::Tune(Tune { pause_hours: Some(hours), ..Default::default() }));
                     }
                 });
                 ui.end_row();
                 let cur = c.backup_hours.clone();
                 let hint = "hours such as 22-7; blank = any time";
-                changed("hours", self.rule(ui, "def-hours", "Only between", cur.clone(), "", hint), &cur);
+                note(&mut v, "hours", self.rule(ui, "def-hours", "Only between", cur.clone(), "", hint), &cur);
                 let cur = (c.min_interval_secs / 60).max(1).to_string();
                 let hint = "how often a local drive gets a backup; friends and cloud storage default to 60";
-                changed("every", self.rule(ui, "def-every", "Drives every", cur.clone(), "min", hint), &cur);
-                let cur = c.upload_kbps.to_string();
-                let hint = "across friends and cloud storage; 0 = unlimited";
-                changed("limit", self.rule(ui, "def-limit", "Upload limit", cur.clone(), "KB/s", hint), &cur);
+                note(&mut v, "every", self.rule(ui, "def-every", "Drives every", cur.clone(), "min", hint), &cur);
                 let cur = c.warn_after_days.to_string();
                 let hint = "without a backup, yours or a friend's to you; 0 = never";
-                changed("warn", self.rule(ui, "def-warn", "Warn after", cur.clone(), "days", hint), &cur);
+                note(&mut v, "warn", self.rule(ui, "def-warn", "Warn after", cur.clone(), "days", hint), &cur);
             });
+            save |= save_button(ui, &v, &["hours", "every", "warn"]);
         });
         ui.add_space(4.0);
+        const HISTORY: [&str; 7] = ["versions", "days", "last", "hourly", "daily", "weekly", "monthly"];
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new("History kept").strong().size(15.0));
             ui.add_space(2.0);
             Self::rows(ui, "history", |ui| {
-                let rows: [(&'static str, &str, String, &str, &str); 7] = [
-                    ("versions", "Keep", r.max_versions.to_string(), "versions", "of each file; 0 = all of them"),
-                    (
-                        "days",
-                        "Keep for",
-                        r.keep_days.to_string(),
-                        "days",
-                        "then restore points are deleted; 0 = for ever",
-                    ),
-                    ("last", "Always the last", r.keep_last.to_string(), "", "restore points, whatever their age"),
-                    (
-                        "hourly",
-                        "Hourly",
-                        r.keep_hourly.to_string(),
-                        "hours",
-                        "one restore point an hour is kept this long",
-                    ),
-                    ("daily", "Daily", r.keep_daily.to_string(), "days", "one a day is kept this long"),
-                    ("weekly", "Weekly", r.keep_weekly.to_string(), "weeks", "one a week is kept this long"),
-                    ("monthly", "Monthly", r.keep_monthly.to_string(), "months", "one a month is kept this long"),
+                let rows: [(&str, String, &str, &str); 7] = [
+                    ("Keep", r.max_versions.to_string(), "versions", "of each file; 0 = all of them"),
+                    ("Keep for", r.keep_days.to_string(), "days", "then restore points are deleted; 0 = for ever"),
+                    ("Always the last", r.keep_last.to_string(), "", "restore points, whatever their age"),
+                    ("Hourly", r.keep_hourly.to_string(), "hours", "one restore point an hour is kept this long"),
+                    ("Daily", r.keep_daily.to_string(), "days", "one a day is kept this long"),
+                    ("Weekly", r.keep_weekly.to_string(), "weeks", "one a week is kept this long"),
+                    ("Monthly", r.keep_monthly.to_string(), "months", "one a month is kept this long"),
                 ];
-                for (key, label, cur, unit, hint) in rows {
-                    changed(key, self.rule(ui, &format!("def-{key}"), label, cur.clone(), unit, hint), &cur);
+                for (key, (label, cur, unit, hint)) in HISTORY.into_iter().zip(rows) {
+                    note(&mut v, key, self.rule(ui, &format!("def-{key}"), label, cur.clone(), unit, hint), &cur);
                 }
             });
+            save |= save_button(ui, &v, &HISTORY);
         });
-        ui.add_space(4.0);
-        if ui.add_enabled(!v.is_empty(), egui::Button::new("Save")).clicked() {
+        if save {
             let num = |k: &str| v.get(k).and_then(|t| t.parse::<u32>().ok());
-            if v.contains_key("hours") || v.contains_key("limit") || v.contains_key("warn") {
+            if ["name", "limit", "incoming", "hours", "warn"].iter().any(|k| v.contains_key(k)) {
                 self.save(
                     &ctx,
-                    Cmd::Tune {
-                        upload_kbps: num("limit").map(u64::from),
+                    Cmd::Tune(Tune {
+                        name: v.get("name").cloned(),
+                        upload_kbps: v.get("limit").and_then(|t| parse_mbps(t)),
+                        incoming_kbps: v.get("incoming").and_then(|t| parse_mbps(t)),
                         hours: v.get("hours").cloned(),
-                        pause_hours: None,
                         warn_days: num("warn"),
-                    },
+                        ..Default::default()
+                    }),
                 );
             }
             if let Some(m) = num("every") {

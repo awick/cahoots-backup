@@ -25,7 +25,7 @@ mod watch;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::{Config, Identity};
-use node::{CloudAdd, Cmd, Node, Out, SetEdit};
+use node::{CloudAdd, Cmd, Node, Out, SetEdit, Tune};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
@@ -174,8 +174,16 @@ enum C {
         #[arg(long)]
         monthly: Option<u32>,
     },
-    /// Limit upload speed in KB/s across all friends (0 = unlimited)
-    Limit { upload_kbps: u64 },
+    /// Limit speed in MB/s, decimals allowed (0 = unlimited): your backups going out,
+    /// and with --incoming what all friends together send here
+    Limit {
+        #[arg(value_name = "MBPS", value_parser = speed)]
+        upload_kbps: Option<u64>,
+        #[arg(long, value_name = "MBPS", value_parser = speed)]
+        incoming: Option<u64>,
+    },
+    /// Give this computer another name
+    Name { name: String },
     /// Hours automatic backups may run, e.g. 22-7, or 'always'
     Schedule { hours: String },
     /// Hold automatic backups, for a number of hours or until `sdb resume`
@@ -276,8 +284,12 @@ enum FriendCmd {
     },
     /// Set how many GB a friend may store on this computer
     Quota { name: String, gb: u64 },
-    /// Fastest a friend may send backups to this computer, in KB/s (0 = unlimited)
-    Limit { name: String, kbps: u64 },
+    /// Fastest a friend may send backups to this computer, in MB/s, decimals allowed (0 = unlimited)
+    Limit {
+        name: String,
+        #[arg(value_name = "MBPS", value_parser = speed)]
+        kbps: u64,
+    },
     /// Start or stop sending your backups to a friend
     BackupTo {
         name: String,
@@ -372,6 +384,11 @@ fn passphrase(confirm: bool) -> Result<String> {
         bail!("use at least 8 characters");
     }
     Ok(p)
+}
+
+/// A speed in MB/s from the command line, as KB/s.
+fn speed(text: &str) -> Result<u64, String> {
+    config::parse_mbps(text).ok_or_else(|| "a speed is a number of MB/s such as 0.5 or 20 (0 = unlimited)".to_string())
 }
 
 fn hostname() -> String {
@@ -711,20 +728,22 @@ async fn real_main() -> Result<()> {
             .collect();
             Cmd::Keep { set, versions, pattern }
         }
-        C::Limit { upload_kbps } => {
-            Cmd::Tune { upload_kbps: Some(upload_kbps), hours: None, pause_hours: None, warn_days: None }
+        C::Limit { upload_kbps: None, incoming: None } => {
+            bail!(
+                "give a speed in MB/s for your backups going out, --incoming MBPS for what friends send here, or both"
+            )
         }
-        C::Schedule { hours } => Cmd::Tune {
-            upload_kbps: None,
-            hours: Some(if hours == "always" { String::new() } else { hours }),
-            pause_hours: None,
-            warn_days: None,
-        },
-        C::Pause { hours } => {
-            Cmd::Tune { upload_kbps: None, hours: None, pause_hours: Some(hours.unwrap_or(24 * 3650)), warn_days: None }
+        C::Limit { upload_kbps, incoming } => {
+            Cmd::Tune(Tune { upload_kbps, incoming_kbps: incoming, ..Default::default() })
         }
-        C::Resume => Cmd::Tune { upload_kbps: None, hours: None, pause_hours: Some(0), warn_days: None },
-        C::WarnAfter { days } => Cmd::Tune { upload_kbps: None, hours: None, pause_hours: None, warn_days: Some(days) },
+        C::Name { name } => Cmd::Tune(Tune { name: Some(name), ..Default::default() }),
+        C::Schedule { hours } => {
+            let hours = Some(if hours == "always" { String::new() } else { hours });
+            Cmd::Tune(Tune { hours, ..Default::default() })
+        }
+        C::Pause { hours } => Cmd::Tune(Tune { pause_hours: Some(hours.unwrap_or(24 * 3650)), ..Default::default() }),
+        C::Resume => Cmd::Tune(Tune { pause_hours: Some(0), ..Default::default() }),
+        C::WarnAfter { days } => Cmd::Tune(Tune { warn_days: Some(days), ..Default::default() }),
         C::Every { minutes, name } => Cmd::Every { name, minutes },
         C::Drive { name, path } => {
             Cmd::DriveAdd { name, path: fs::canonicalize(&path).with_context(|| path.display().to_string())? }
