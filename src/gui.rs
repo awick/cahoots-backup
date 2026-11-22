@@ -129,6 +129,8 @@ struct Gui {
     popup: Option<(String, Vec<String>)>,
     /// Text being typed into fields, by field name.
     fields: HashMap<String, String>,
+    /// The confirm button that was clicked once and is waiting for its second click.
+    armed: Option<(String, Instant)>,
 
     // Backup page: the set being edited and the folder picker.
     edit: Option<(String, Tab)>,
@@ -177,6 +179,7 @@ impl Gui {
             status: String::new(),
             popup: None,
             fields: HashMap::new(),
+            armed: None,
             edit: None,
             root,
             hidden: false,
@@ -389,6 +392,32 @@ impl Gui {
         } else {
             ui.painter().circle_stroke(rect.center(), 4.5, egui::Stroke::new(1.5, color));
         }
+    }
+
+    /// A button for something that cannot be undone. The first click only arms it: it turns
+    /// red and asks to be clicked again, and goes back by itself after a few seconds or when
+    /// another one is armed. Returns true on that second click.
+    fn confirm(&mut self, ui: &mut egui::Ui, key: &str, label: &str, hint: &str) -> bool {
+        const ARMED_FOR: Duration = Duration::from_secs(5);
+        let armed = self.armed.as_ref().is_some_and(|(k, at)| k == key && at.elapsed() < ARMED_FOR);
+        if armed {
+            let text = RichText::new(format!("Confirm: {}", label.to_lowercase())).color(Color32::WHITE);
+            if ui.add(egui::Button::new(text).fill(RED)).on_hover_text("Click again to go ahead").clicked() {
+                self.armed = None;
+                return true;
+            }
+            return false;
+        }
+        let mut button = ui.button(label);
+        if !hint.is_empty() {
+            button = button.on_hover_text(hint);
+        }
+        if button.clicked() {
+            self.armed = Some((key.to_string(), Instant::now()));
+            // So it is drawn going back, even if nothing else happens meanwhile.
+            ui.ctx().request_repaint_after(ARMED_FOR);
+        }
+        false
     }
 
     /// A set's rows are a grid whose first column holds the dim labels: the same width
@@ -851,11 +880,7 @@ impl Gui {
                     let label = Some("Looking through older restore points");
                     self.spawn(&ctx, Job::Show("Left out now"), prune(true), label);
                 }
-                let sure = self.fields.entry("apply-excl".into()).or_default();
-                ui.add(egui::TextEdit::singleline(sure).desired_width(40.0).hint_text("yes"));
-                let yes = sure.trim().eq_ignore_ascii_case("yes");
-                if ui.add_enabled(yes, egui::Button::new("Take it out of them")).clicked() {
-                    self.fields.remove("apply-excl");
+                if self.confirm(ui, "apply-excl", "Take it out of them", "") {
                     self.spawn(&ctx, Job::Show("Prune"), prune(false), Some("Pruning"));
                 }
             });
@@ -1035,16 +1060,12 @@ impl Gui {
             if self.cfg.sets.len() > 1 {
                 ui.weak("Delete");
                 ui.horizontal(|ui| {
-                    let sure = self.fields.entry("delete-sure".into()).or_default();
-                    ui.add(egui::TextEdit::singleline(sure).desired_width(40.0).hint_text("yes"));
-                    let ok = sure.trim().eq_ignore_ascii_case("yes");
-                    if ui.add_enabled(ok, egui::Button::new("Delete this set")).clicked() {
+                    if self.confirm(ui, "delete-set", "Delete this set", "") {
                         let mut cmd = Self::set_edit(&set.name);
                         if let Cmd::SetEdit(e) = &mut cmd {
                             e.delete = true;
                         }
                         self.save(&ctx, cmd);
-                        self.fields.remove("delete-sure");
                         self.edit = None;
                     }
                     ui.weak("its restore points stay until they are pruned");
@@ -1192,9 +1213,18 @@ impl Gui {
                         Self::folders(ui, &b);
                         ui.end_row();
                         ui.weak("Kept on");
-                        let on: Vec<&str> =
-                            self.cfg.friends.iter().filter(|f| b.sends_to(f)).map(|f| f.name.as_str()).collect();
-                        ui.label(if on.is_empty() { "no destination yet".to_string() } else { on.join(", ") });
+                        // Each with the dot that says whether it can be reached right now.
+                        ui.horizontal(|ui| {
+                            let on: Vec<Friend> = self.cfg.friends.iter().filter(|f| b.sends_to(f)).cloned().collect();
+                            if on.is_empty() {
+                                ui.weak("no destination yet");
+                            }
+                            for f in on {
+                                Self::dot(ui, self.dest_dot(&f.name));
+                                ui.label(&f.name);
+                                ui.add_space(10.0);
+                            }
+                        });
                         ui.end_row();
                     });
                     ui.add_space(4.0);
@@ -1462,30 +1492,22 @@ impl Gui {
                             }
                             self.fields.retain(|k, _| !k.ends_with(&format!("-{}", f.name)));
                         }
-                        // What removes things sits together on the right, behind a typed "yes".
+                        // What removes things sits together on the right; each asks to be clicked twice.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let clean = |dry_run| Cmd::DestClean { name: f.name.clone(), dry_run };
-                            let sure = self.fields.entry(format!("remove-{}", f.name)).or_default();
-                            let yes = sure.trim().eq_ignore_ascii_case("yes");
-                            let remove = ui
-                                .add_enabled(yes, egui::Button::new("Remove"))
-                                .on_hover_text("Stops using this destination. What is stored there is left in place.");
-                            let tidy = ui.add_enabled(yes, egui::Button::new("Clean up")).on_hover_text(
-                                "Deletes from here the restore points of sets that are no longer sent here.",
-                            );
-                            let sure = self.fields.entry(format!("remove-{}", f.name)).or_default();
-                            ui.add(egui::TextEdit::singleline(sure).desired_width(40.0).hint_text("yes"));
+                            let hint = "Stops using this destination. What is stored there is left in place.";
+                            if self.confirm(ui, &format!("remove-{}", f.name), "Remove", hint) {
+                                self.save(&ctx, Cmd::FriendRemove { name: f.name.clone(), purge: false });
+                            }
+                            let hint = "Deletes from here the restore points of sets that are no longer sent here.";
+                            if self.confirm(ui, &format!("clean-{}", f.name), "Clean up", hint) {
+                                self.spawn(&ctx, Job::Show("Clean up"), clean(false), Some("Cleaning up"));
+                            }
                             let look = ui
                                 .button("Leftovers?")
                                 .on_hover_text("Shows what sets no longer sent here left behind, without changing anything.");
                             if look.clicked() {
                                 self.spawn(&ctx, Job::Show("Leftovers"), clean(true), Some("Looking for leftovers"));
-                            }
-                            if tidy.clicked() {
-                                self.fields.remove(&format!("remove-{}", f.name));
-                                self.spawn(&ctx, Job::Show("Clean up"), clean(false), Some("Cleaning up"));
-                            } else if remove.clicked() {
-                                self.save(&ctx, Cmd::FriendRemove { name: f.name.clone(), purge: false });
                             }
                         });
                     });
@@ -1799,19 +1821,42 @@ impl Gui {
                         }
                         if !builtin {
                             ui.separator();
-                            let sure = self.fields.entry(format!("exdel-{}", l.name)).or_default();
-                            ui.add(egui::TextEdit::singleline(sure).desired_width(40.0).hint_text("yes"));
-                            if ui
-                                .add_enabled(sure.trim().eq_ignore_ascii_case("yes"), egui::Button::new("Delete list"))
-                                .clicked()
-                            {
-                                self.fields.remove(&format!("exdel-{}", l.name));
+                            if self.confirm(ui, &format!("exdel-{}", l.name), "Delete list", "") {
                                 self.save(&ctx, Cmd::ExcludeDelete { name: l.name.clone() });
                             }
                         }
                     });
                 });
             }
+            ui.add_space(4.0);
+            // A list of your own from nothing, or from one of the lists above.
+            Self::rows(ui, "new-exlist", |ui| {
+                ui.weak("New list");
+                ui.horizontal(|ui| {
+                    let text = self.fields.entry("exnew".into()).or_default();
+                    ui.add(egui::TextEdit::singleline(text).desired_width(160.0).hint_text("name"));
+                    let name = text.trim().to_string();
+                    ui.label("starting");
+                    let from = self.fields.entry("exnew-from".into()).or_default().clone();
+                    let mut picked = from.clone();
+                    let shown = if from.is_empty() { "empty".to_string() } else { format!("as a copy of {from}") };
+                    egui::ComboBox::from_id_salt("exnew-from").selected_text(shown).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut picked, String::new(), "empty");
+                        for l in self.cfg.lists() {
+                            ui.selectable_value(&mut picked, l.name.clone(), format!("as a copy of {}", l.name));
+                        }
+                    });
+                    if picked != from {
+                        self.fields.insert("exnew-from".into(), picked.clone());
+                    }
+                    if ui.add_enabled(!name.is_empty(), egui::Button::new("Create")).clicked() {
+                        self.fields.remove("exnew");
+                        self.fields.remove("exnew-from");
+                        self.save(&ctx, Cmd::ExcludeNew { name, from: Some(picked).filter(|f| !f.is_empty()) });
+                    }
+                });
+                ui.end_row();
+            });
         });
     }
 

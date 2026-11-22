@@ -267,7 +267,8 @@ enum Prompt {
     /// Adding cloud storage, one answer at a time: the answers so far.
     Cloud(Vec<String>),
     /// Name for a new exclusion list that starts as a copy of this one.
-    ExNew(String),
+    /// None starts the list empty.
+    ExNew(Option<String>),
     ExAdd(String),
     ExDelete(String),
     CleanDest(String),
@@ -305,6 +306,7 @@ enum Act {
     ExcludedLook,
     ExcludedApply,
     ExNew,
+    ExNewEmpty,
     ExCopy,
     ExAdd,
     ExRemove(usize),
@@ -1074,6 +1076,7 @@ impl App {
                         go(&label, Kind::ExList(l.name.clone()))
                     })
                     .collect();
+                v.push(act("+ New list (starts empty)".into(), Act::ExNewEmpty));
                 v.push(act("+ New list (starts as Standard)".into(), Act::ExNew));
                 v
             }
@@ -1271,11 +1274,12 @@ impl App {
                 });
             }
             Act::ExcludedApply => self.input = Some((Prompt::ApplyExclusions(self.set.clone()), String::new())),
-            Act::ExNew => self.input = Some((Prompt::ExNew(STANDARD.into()), String::new())),
+            Act::ExNew => self.input = Some((Prompt::ExNew(Some(STANDARD.into())), String::new())),
+            Act::ExNewEmpty => self.input = Some((Prompt::ExNew(None), String::new())),
             Act::ExCopy | Act::ExAdd | Act::ExDelete | Act::ExRemove(_) => {
                 let Some((Kind::ExList(list), _)) = self.stack.last().cloned() else { return };
                 match a {
-                    Act::ExCopy => self.input = Some((Prompt::ExNew(list), String::new())),
+                    Act::ExCopy => self.input = Some((Prompt::ExNew(Some(list)), String::new())),
                     Act::ExAdd => self.input = Some((Prompt::ExAdd(list), String::new())),
                     Act::ExDelete => self.input = Some((Prompt::ExDelete(list), String::new())),
                     Act::ExRemove(i) => {
@@ -1681,7 +1685,7 @@ impl App {
                     Done::Popup(lines_or_error(ex.call(cmd).await))
                 });
             }
-            Prompt::ExNew(from) => self.apply(Cmd::ExcludeNew { name: text, from: Some(from) }).await,
+            Prompt::ExNew(from) => self.apply(Cmd::ExcludeNew { name: text, from }).await,
             Prompt::ExAdd(list) => self.apply(Cmd::ExcludePattern { list, pattern: text, remove: false }).await,
             Prompt::ExDelete(name) => {
                 if text.eq_ignore_ascii_case("yes") {
@@ -2124,9 +2128,17 @@ impl App {
                 Span::styled(format!("   last backup {}", ago(o.and_then(|o| o["last"].as_i64()))), dim),
             ])];
             lines.extend(Self::labelled("Files", Self::folder_lines(b)));
-            let on: Vec<&str> = self.cfg.friends.iter().filter(|x| b.sends_to(x)).map(|x| x.name.as_str()).collect();
-            let kept = if on.is_empty() { "no destination yet".to_string() } else { on.join(", ") };
-            lines.extend(Self::labelled("Kept on", vec![Line::raw(kept)]));
+            // Each with the dot that says whether it can be reached right now.
+            let mut kept: Vec<Span> = vec![];
+            for x in self.cfg.friends.iter().filter(|x| b.sends_to(x)) {
+                let (dot, color) = self.dest_state(&x.name);
+                kept.push(Span::styled(format!("{dot} "), Style::new().fg(color)));
+                kept.push(Span::raw(format!("{}    ", x.name)));
+            }
+            if kept.is_empty() {
+                kept.push(Span::raw("no destination yet"));
+            }
+            lines.extend(Self::labelled("Kept on", vec![Line::from(kept)]));
             items.push(ListItem::new(Text::from(lines)));
         }
         let block = Block::bordered().title(" Restore: choose a backup set ").border_style(focus);
@@ -2376,7 +2388,8 @@ impl App {
                     CLOUD_STEPS.len(),
                     CLOUD_STEPS[got.len().min(CLOUD_STEPS.len() - 1)]
                 ),
-                Prompt::ExNew(from) => format!(" Name for the new list (a copy of {from}) "),
+                Prompt::ExNew(Some(from)) => format!(" Name for the new list (a copy of {from}) "),
+                Prompt::ExNew(None) => " Name for the new, empty list ".into(),
                 Prompt::ExAdd(l) => format!(" Pattern to leave out with {l}, such as *.iso or build or /Users/me/tmp "),
                 Prompt::ExDelete(l) => format!(" Type yes to delete the list {l} (sets using it go back to Standard) "),
                 Prompt::DestKeep(n, "days") => format!(" Days of history kept on {n} (0 = unlimited) "),
