@@ -239,6 +239,15 @@ a restore latest data/sub --to blocked >blocked.out 2>&1 && fail "restore claime
 grep -qi "panicked" blocked.out && fail "a file in the way crashed the restore"
 [ "$(cat blocked/data)" = x ] || fail "the file in the way was destroyed"
 
+step "a folder that is missing is not recorded as an empty one"
+BEFORE=$(a snapshots | wc -l)
+mv data data.away
+a backup >gone.out 2>&1 && fail "a backup of a missing folder claimed success"
+grep -q "is missing or cannot be read" gone.out || fail "the missing folder was not named: $(tail -1 gone.out)"
+[ "$(a snapshots | wc -l)" = "$BEFORE" ] || fail "a missing folder left a restore point"
+mv data.away data
+a backup >/dev/null || fail "backup once the folder is back"
+
 step "a friend with no room is skipped, the drive still gets the backup"
 b destination quota alice 0 >/dev/null
 echo three >data/sub/note.txt
