@@ -2142,6 +2142,7 @@ mod tests {
         assert_eq!(clean("plain text, ünïcode"), "plain text, ünïcode");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_drive_marker_is_only_a_small_regular_file() {
         let dir = std::env::temp_dir().join(format!("sdb-mark-{}", std::process::id()));

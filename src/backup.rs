@@ -1121,8 +1121,10 @@ async fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
+    #[cfg(unix)]
     #[test]
     fn a_swapped_or_sparse_file_is_not_read() {
         let dir = std::env::temp_dir().join(format!("sdb-test-scan-{}", rand::random::<u64>()));
@@ -1150,6 +1152,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_walk_never_leaves_the_set() {
         let dir = std::env::temp_dir().join(format!("sdb-test-walk-{}", rand::random::<u64>()));

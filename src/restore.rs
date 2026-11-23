@@ -322,6 +322,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn top(dir: &Path) -> Dir {
@@ -329,6 +330,7 @@ mod tests {
         Dir::open(dir, true).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn folders_are_never_opened_through_a_link() {
         let dir = std::env::temp_dir().join(format!("sdb-test-restore-{}", rand::random::<u64>()));
@@ -375,6 +377,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_folders_this_restore_made_are_recorded() {
         let dir = std::env::temp_dir().join(format!("sdb-test-restore-{}", rand::random::<u64>()));
@@ -393,6 +396,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn set_id_bits_are_dropped_unless_root() {
         let dir = std::env::temp_dir().join(format!("sdb-test-restore-{}", rand::random::<u64>()));

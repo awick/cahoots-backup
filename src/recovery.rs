@@ -273,6 +273,7 @@ fn copy_write(home: &Path, force: bool, copy: &mut Copy) -> Result<bool> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn a_kit_is_read_only_from_a_small_regular_file() {
         let dir = std::env::temp_dir().join(format!("sdb-test-kit-{}", rand::random::<u64>()));

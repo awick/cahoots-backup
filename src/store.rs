@@ -619,6 +619,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn links_planted_in_the_store_are_not_followed() {
         let (s, dir) = store(0);
@@ -636,6 +637,7 @@ mod tests {
         fs::remove_dir_all(outside).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn scrub_and_listing_keep_to_the_store_layout() {
         let (s, dir) = store(0);

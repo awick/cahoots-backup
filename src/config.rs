@@ -594,6 +594,7 @@ impl Friend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -719,6 +720,7 @@ mod tests {
         assert!(!all.sends_to(&off));
     }
 
+    #[cfg(unix)]
     #[test]
     fn old_config_moves_folders_into_the_default_set() {
         let dir = std::env::temp_dir().join(format!("sdb-test-cfg-{}", rand::random::<u64>()));
