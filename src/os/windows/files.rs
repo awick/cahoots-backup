@@ -16,6 +16,7 @@ use std::{
 
 // Windows' own numbers for these.
 const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+const FILE_ATTRIBUTE_HIDDEN_SYSTEM: u32 = 0x2 | 0x4;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 /// Kept by a cloud service such as OneDrive and not on this disk: reading it would fetch it.
 const FILE_ATTRIBUTE_AWAY: u32 = 0x1000 | 0x4_0000 | 0x40_0000;
@@ -39,10 +40,13 @@ fn refused<T>(why: &'static str) -> io::Result<T> {
 fn info(f: &fs::File) -> io::Result<Meta> {
     let (i, md) = (winapi_util::file::information(f)?, f.metadata()?);
     let attrs = md.file_attributes();
-    // A link or junction stands for another name; any other reparse point is left alone.
-    let kind = if md.file_type().is_symlink() {
+    // A link or junction stands for another name; any other reparse point is left alone. So
+    // are the hidden system junctions Windows keeps for the old names of its own folders
+    // (`My Documents`, `Application Data`): nobody made them and nobody can read through them.
+    let own_junction = attrs & FILE_ATTRIBUTE_HIDDEN_SYSTEM == FILE_ATTRIBUTE_HIDDEN_SYSTEM;
+    let kind = if md.file_type().is_symlink() && !own_junction {
         Kind::Link
-    } else if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 || (md.is_file() && attrs & FILE_ATTRIBUTE_AWAY != 0) {
+    } else if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         Kind::Other
     } else if md.is_dir() {
         Kind::Dir
@@ -66,6 +70,7 @@ fn info(f: &fs::File) -> io::Result<Meta> {
         // Windows counts time in 100 ns steps from 1601.
         mtime: (md.last_write_time() as i64 - 116_444_736_000_000_000).saturating_mul(100),
         size: md.len(),
+        away: kind == Kind::File && attrs & FILE_ATTRIBUTE_AWAY != 0,
     })
 }
 
@@ -289,7 +294,8 @@ pub fn is_root() -> bool {
     false
 }
 
-/// To be checked against the owner Windows records, when restore is written for it.
+/// Asked of a folder a restore has just made, before it is given a recorded owner and mode.
+/// Windows has neither to give, only a time, so there is nothing here to keep from anyone.
 pub fn private_to_me(_m: &Meta) -> bool {
     true
 }
@@ -384,6 +390,20 @@ mod tests {
         assert_eq!(top.stat("link".as_ref(), true).unwrap().kind, Kind::Dir);
         assert!(Dir::open(&dir.join("link"), false).is_err());
         assert!(Dir::open(&dir.join("link"), true).is_ok());
+        // One marked the way Windows marks its own is not offered as a link to back up.
+        let attrib = |args: &[&str], path: &Path| {
+            assert!(std::process::Command::new("attrib").args(args).arg(path).status().unwrap().success());
+        };
+        attrib(&["+s", "+h", "/l"], &dir.join("link"));
+        assert_eq!(top.stat("link".as_ref(), false).unwrap().kind, Kind::Other);
+        assert!(top.sub("link".as_ref()).is_err());
+        attrib(&["-s", "-h", "/l"], &dir.join("link"));
+        // A file a cloud service has taken off the disk is still a file, and says so.
+        fs::write(dir.join("real/cloud.txt"), "x").unwrap();
+        assert!(!top.sub("real".as_ref()).unwrap().stat("cloud.txt".as_ref(), false).unwrap().away);
+        attrib(&["+o"], &dir.join("real/cloud.txt"));
+        let cloud = top.sub("real".as_ref()).unwrap().stat("cloud.txt".as_ref(), false).unwrap();
+        assert!(cloud.away && cloud.kind == Kind::File);
         drop(top);
         fs::remove_dir(dir.join("link")).unwrap();
         fs::remove_dir_all(dir).unwrap();

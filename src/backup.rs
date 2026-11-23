@@ -106,6 +106,9 @@ struct Scan {
     bytes: u64,
     new_bytes: u64,
     skipped: u64,
+    /// Files a cloud service keeps elsewhere, new or changed since they were last backed up:
+    /// reading one would fetch it.
+    away: u64,
     /// Files refused outright (sparse, or past RUN_FREE_IDS): data the user expects backed up
     /// but that is not.
     refused: u64,
@@ -185,8 +188,17 @@ fn scan(
     out: Out,
 ) -> Result<Scan> {
     let run = RUNS.fetch_add(1, Ordering::Relaxed);
-    let mut res =
-        Scan { entries: vec![], index: vec![], files: 0, bytes: 0, new_bytes: 0, skipped: 0, refused: 0, deferred: 0 };
+    let mut res = Scan {
+        entries: vec![],
+        index: vec![],
+        files: 0,
+        bytes: 0,
+        new_bytes: 0,
+        skipped: 0,
+        away: 0,
+        refused: 0,
+        deferred: 0,
+    };
     let mut entries: Vec<Option<Entry>> = vec![];
     let mut free = Free::new(RUN_FREE_IDS, sc.keys.chunk_id(&vec![0; MAX_CHUNK]));
     // The chunks of each file with more than one name, so a further link is not read again.
@@ -236,6 +248,10 @@ fn scan(
                         res.files += 1;
                         res.bytes += md.size;
                         Kind::File { size: md.size, chunks }
+                    }
+                    None if md.away => {
+                        res.away += 1;
+                        continue;
                     }
                     None => {
                         todo.push((entries.len(), md.dev, md.ino, link.is_some()));
@@ -498,7 +514,7 @@ pub fn check_local(keys: &Keys, last: Vec<Entry>, out: &Out) -> (u64, u64) {
         let Ok(md) = os::stat(&path, false) else {
             continue;
         };
-        if md.size != *size || md.mtime != e.mtime || md.ino != e.ino {
+        if md.size != *size || md.mtime != e.mtime || md.ino != e.ino || md.away {
             continue;
         }
         let Ok((f, len)) = open_scanned(&path, md.dev, md.ino) else {
@@ -1078,6 +1094,9 @@ async fn run_once(
     let mut skipped = String::new();
     if scan.skipped > 0 {
         skipped += &format!(", {} unreadable skipped", scan.skipped);
+    }
+    if scan.away > 0 {
+        skipped += &format!(", {} online-only files not fetched to back up", scan.away);
     }
     if scan.refused > 0 {
         skipped += &format!(", {} files NOT backed up", scan.refused);

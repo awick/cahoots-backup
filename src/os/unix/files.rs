@@ -52,6 +52,7 @@ fn meta(st: &Stat) -> Meta {
         gid: st.st_gid as u32,
         mtime: st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
         size: st.st_size as u64,
+        away: false,
     }
 }
 

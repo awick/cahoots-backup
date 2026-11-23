@@ -51,6 +51,8 @@ pub struct Meta {
     pub gid: u32,
     pub mtime: i64,
     pub size: u64,
+    /// Kept by a cloud service and not on this disk: reading it would fetch it.
+    pub away: bool,
 }
 
 /// What a restore point recorded about a file, to be put back on it.
