@@ -5,6 +5,35 @@
 Goal: a `cahoots.exe` that does everything the Mac and Linux builds do (daemon, command
 line, terminal UI, window), and can be a friend to Mac and Linux nodes in both directions.
 
+## Status (2026-11-23)
+
+Work is on the `windows` branch. Test machine: a Windows 11 Arm virtual machine; both the
+Intel and the Arm build compile and pass the unit tests there.
+
+- **Phase 0, done.** Everything system-specific is behind `src/os`. Mac and Linux pass the full
+  checks unchanged.
+- **Phase 1, working.** The daemon runs on Windows. A Mac node paired with it, backed up to it
+  and restored from it. Left: decide the home folder, try disk and cloud destinations, the
+  end-to-end scripts.
+- **Phases 2 to 4, not started.** Backing up and restoring Windows files, the window, release.
+
+What turned out different from the plan below:
+
+- **Control channel.** The program forbids `unsafe` code, and giving a pipe its own access list
+  needs it. So the pipe gets a new random name each start, kept with a key in the home
+  folder, and each side shows the key before anything else is said. Nothing was loosened.
+- **File identity** comes from the `winapi-util` library, already a dependency, for the same
+  reason.
+- **Main stack.** Windows gives 1 MB where the others give 8, and the program overflowed it on
+  start; `build.rs` now asks for 8 MB.
+- **Arm build** needs `clang` installed, for the `ring` library. The Intel build does not.
+- **Daemon under SSH.** Windows ends a daemon started from an SSH session when that session
+  closes. Starting it at login (phase 3) is not affected.
+
+Still open from the lists below: restore does not yet check who owns a folder it just made
+(`private_to_me` in `src/os/windows/files.rs` answers yes); paths in restore points are a
+placeholder until phase 2.
+
 ## Summary
 
 - **Nothing in the design blocks it.** The network library, the crypto, the cloud code, the
