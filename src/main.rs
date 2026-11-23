@@ -437,8 +437,18 @@ fn lock(home: &std::path::Path) -> Result<fs::File> {
     Ok(f)
 }
 
+/// With CAHOOTS_TRACE set (say to `iroh=debug`), what the networking logs goes to trace.log.
+fn trace(home: &std::path::Path) -> Result<()> {
+    let Some(filter) = config::env_text("TRACE") else { return Ok(()) };
+    let file = fs::OpenOptions::new().create(true).append(true).open(home.join("trace.log"))?;
+    let filter = tracing_subscriber::EnvFilter::try_new(filter).context("CAHOOTS_TRACE")?;
+    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
+    Ok(())
+}
+
 async fn daemon(home: PathBuf) -> Result<()> {
     let _lock = lock(&home)?;
+    trace(&home)?;
     control::started_fingerprint();
     let (node, router) = Node::start(home.clone(), true, true).await?;
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();

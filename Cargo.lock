@@ -511,6 +511,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tracing-subscriber",
  "url",
  "walkdir",
  "zstd",
