@@ -11,11 +11,6 @@ bucket as well. Friends, and the cloud, only ever hold ciphertext.
 
 **[cahootsbackup.com](https://cahootsbackup.com)** has the short tour, with pictures.
 
-Cahoots Backup was called Super Duper Backup, and its command `sdb`, up to
-release 0.1.0. Nothing stored changes with the name: existing backups, recovery
-kits and friends keep working, a node from before the rename stays in its
-`~/.super-duper-backup` folder, and the `SDB_...` settings are still read.
-
 ## Why this exists
 
 We loved CrashPlan for Home. Its best trick had nothing to do with its cloud:
