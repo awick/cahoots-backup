@@ -46,6 +46,10 @@ url = "2.5.8"
 walkdir = "2.5.0"
 zstd = "0.14.4"
 
+[lib]
+name = "cahoots_backup"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cahoots"
 path = "src/main.rs"
