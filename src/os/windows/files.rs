@@ -214,6 +214,8 @@ impl Dir {
                     return Err(e);
                 }
                 let mut open = md.permissions();
+                // On Windows this clears the one read-only flag and opens nothing to anyone.
+                #[allow(clippy::permissions_set_readonly_false)]
                 open.set_readonly(false);
                 look(&to, false, FILE_WRITE_ATTRIBUTES)?.set_permissions(open)?;
                 fs::rename(&from, &to)

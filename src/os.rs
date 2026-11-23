@@ -58,7 +58,10 @@ pub struct Meta {
 /// What a restore point recorded about a file, to be put back on it.
 pub struct Recorded {
     pub mode: u32,
+    // Windows has no owner to put back.
+    #[cfg_attr(windows, allow(dead_code))]
     pub uid: u32,
+    #[cfg_attr(windows, allow(dead_code))]
     pub gid: u32,
     pub mtime: i64,
 }

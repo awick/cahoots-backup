@@ -1,12 +1,12 @@
 # Copyright Andy Wick
 # SPDX-License-Identifier: Apache-2.0
 
-# Everything check.sh covers, on Linux and macOS, plus the cloud test against AWS Emulator.
+# Everything check.sh covers, on Linux, macOS and Windows, plus the cloud test against AWS Emulator.
 name: checks
 
 on:
   push:
-    branches: [main]
+    branches: [main, windows]
   pull_request:
 
 permissions:
@@ -23,11 +23,15 @@ jobs:
   check:
     name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    # On Windows too: there it is Git Bash, which check.sh and the tests run under.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - name: Rust

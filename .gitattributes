@@ -1,0 +1,6 @@
+# Copyright Andy Wick
+# SPDX-License-Identifier: Apache-2.0
+
+# The scripts run under Git Bash on Windows, which cannot take Windows line endings.
+*.sh text eol=lf
+*.pl text eol=lf
