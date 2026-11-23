@@ -168,7 +168,7 @@ impl Gui {
     fn new(home: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel();
         let long_ago = Instant::now() - Duration::from_secs(3600);
-        let root = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let root = crate::os::home_text().unwrap_or_else(|| "/".into());
         let root = std::fs::canonicalize(&root).map(|p| p.to_string_lossy().into_owned()).unwrap_or(root);
         Gui {
             home,
@@ -1346,7 +1346,7 @@ impl Gui {
         egui::Panel::bottom("restore-bar").resizable(false).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("{} picked. Restore into:", self.picked.len()));
-                let home = std::env::var("HOME").unwrap_or_default();
+                let home = crate::os::home_text().unwrap_or_default();
                 let to = self.fields.entry("restore-to".into()).or_insert_with(|| format!("{home}/cahoots-restore"));
                 ui.add(egui::TextEdit::singleline(to).desired_width(300.0));
                 let to = to.replacen('~', &home, 1);
@@ -1653,7 +1653,7 @@ impl Gui {
                 ui.horizontal(|ui| {
                     let text = self.fields.entry("drive".into()).or_insert_with(|| "/Volumes/".into());
                     ui.add(egui::TextEdit::singleline(text).desired_width(360.0));
-                    let home = std::env::var("HOME").unwrap_or_default();
+                    let home = crate::os::home_text().unwrap_or_default();
                     // The system's own folder chooser, opened where the box points if that exists.
                     if ui.button("Browse...").on_hover_text("Choose the folder in a dialog").clicked() {
                         let typed = PathBuf::from(text.trim().replacen('~', &home, 1));
@@ -1719,7 +1719,7 @@ impl Gui {
                 let mut it = got.into_iter();
                 let mut next = || it.next().unwrap_or_default();
                 let (name, endpoint, bucket, region, prefix, ca) = (next(), next(), next(), next(), next(), next());
-                let home = std::env::var("HOME").unwrap_or_default();
+                let home = crate::os::home_text().unwrap_or_default();
                 let ca_pem = if ca.is_empty() { Ok(None) } else { std::fs::read_to_string(ca.replacen('~', &home, 1)).map(Some) };
                 match ca_pem {
                     Ok(ca_pem) => {
@@ -1974,7 +1974,7 @@ impl Gui {
     fn kit_rows(&mut self, ui: &mut egui::Ui) {
         let note = "keep the file somewhere other than this computer";
         let Some(pass) = self.passphrase_rows(ui, "kit", "Save the kit as...", note) else { return };
-        let folder = crate::recovery::default_folder().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        let folder = crate::recovery::default_folder().or_else(crate::os::user_home);
         let picked = rfd::FileDialog::new()
             .set_title("Save the recovery kit")
             .set_directory(folder.unwrap_or_else(|| PathBuf::from("/")))
@@ -2004,7 +2004,7 @@ impl Gui {
         ui.horizontal(|ui| {
             if let Some(folder) = c["folder"].as_str() {
                 // Short enough to leave room for the buttons; the whole path shows on hover.
-                let home = std::env::var("HOME").unwrap_or_default();
+                let home = crate::os::home_text().unwrap_or_default();
                 let mut short = match folder.strip_prefix(&home) {
                     Some(rest) if !home.is_empty() => format!("~{rest}"),
                     _ => folder.to_string(),

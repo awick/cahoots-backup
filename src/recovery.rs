@@ -68,7 +68,7 @@ pub const EXT: &str = "cahoots-recovery-kit";
 /// Where a kit is offered to be kept: on a Mac the Documents folder, which iCloud Drive
 /// carries off the computer when it is set to.
 pub fn default_folder() -> Option<PathBuf> {
-    let docs = PathBuf::from(std::env::var_os("HOME")?).join("Documents");
+    let docs = crate::os::user_home()?.join("Documents");
     (cfg!(target_os = "macos") && docs.is_dir()).then_some(docs)
 }
 
@@ -106,7 +106,7 @@ pub fn import_kit(home: &Path, passphrase: &str, kit: &str) -> Result<Config> {
     }
     let data: KitData = serde_json::from_slice(&crypto::kit_open(passphrase, kit)?)?;
     fs::create_dir_all(home)?;
-    fs::set_permissions(home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    crate::os::private_dir(home)?;
     data.identity.save(home)?;
     data.config.save(home)?;
     if !data.forgotten.is_empty() {

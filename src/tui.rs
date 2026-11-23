@@ -191,8 +191,8 @@ pub(crate) fn until(ts: i64) -> String {
 
 /// Shortens a path by replacing the home folder with `~`.
 pub(crate) fn tilde(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && path.starts_with(&h) => format!("~{}", &path[h.len()..]),
+    match crate::os::home_text() {
+        Some(h) if !h.is_empty() && path.starts_with(&h) => format!("~{}", &path[h.len()..]),
         _ => path.to_string(),
     }
 }
@@ -1447,7 +1447,7 @@ impl App {
                 if self.restore.picked.is_empty() {
                     self.status = "pick files or folders with space first".into();
                 } else {
-                    let home = std::env::var("HOME").unwrap_or_default();
+                    let home = crate::os::home_text().unwrap_or_default();
                     self.input = Some((Prompt::RestoreTo, format!("{home}/cahoots-restore")));
                 }
             }
@@ -1714,7 +1714,7 @@ impl App {
                 }
             }
             Prompt::Drive => {
-                let home = std::env::var("HOME").unwrap_or_default();
+                let home = crate::os::home_text().unwrap_or_default();
                 let typed = text.replacen('~', &home, 1);
                 match std::fs::canonicalize(&typed) {
                     Ok(path) if path.is_dir() => {
@@ -1745,8 +1745,11 @@ impl App {
                 let ca_pem = match ca.as_str() {
                     "" => None,
                     path => {
-                        match std::fs::read_to_string(path.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1))
-                        {
+                        match std::fs::read_to_string(path.replacen(
+                            '~',
+                            &crate::os::home_text().unwrap_or_default(),
+                            1,
+                        )) {
                             Ok(pem) => Some(pem),
                             Err(e) => {
                                 self.status = format!("cannot read the CA certificate file {path}: {e}");
@@ -2706,7 +2709,7 @@ pub async fn run(home: PathBuf) -> Result<()> {
     };
     app.reload().await;
     app.sync();
-    app.set_root(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+    app.set_root(crate::os::home_text().unwrap_or_else(|| "/".into()));
     let mut term = ratatui::init();
     let res = event_loop(&mut app, &mut term, done_rx, progress_rx, found_rx).await;
     ratatui::restore();

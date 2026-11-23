@@ -14,6 +14,7 @@ mod crypto;
 mod gui;
 mod net;
 mod node;
+mod os;
 mod proto;
 mod recovery;
 mod restore;
@@ -420,7 +421,7 @@ fn speed(text: &str) -> Result<u64, String> {
 }
 
 fn hostname() -> String {
-    let name = rustix::system::uname().nodename().to_string_lossy().into_owned();
+    let name = os::host_name();
     let h = name.split('.').next().unwrap_or("").to_string();
     if h.is_empty() { "computer".into() } else { h }
 }
@@ -466,10 +467,9 @@ async fn daemon(home: PathBuf) -> Result<()> {
     out.say(format!("Cahoots Backup daemon started as {} ({})", node.cfg().name, node.id()));
     tokio::spawn(control::serve(node.clone(), control::listen(&home)?));
     tokio::spawn(watch::run(node.clone(), out));
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let stop = os::stop_signal()?;
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+        _ = stop => {}
         _ = node.quit.notified() => {
             // Out of reach first, so no new command arrives at a daemon on its way out; then
             // a moment for the answer to the one that stopped it.
@@ -489,20 +489,14 @@ fn say(text: impl std::fmt::Display) {
 
 /// Starts the daemon in the background, detached from this terminal.
 fn spawn_daemon(home: &std::path::Path) -> Result<()> {
-    use std::os::unix::process::CommandExt;
     // Where the login service looks after this home, it is the one to start the daemon.
     if service::restart(home) {
         return Ok(());
     }
     let log = fs::OpenOptions::new().create(true).append(true).open(home.join("daemon.log"))?;
-    std::process::Command::new(std::env::current_exe()?)
-        .arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0)
-        .spawn()
-        .context("cannot start the cahoots daemon")?;
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("daemon").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    os::detached(&mut cmd).spawn().context("cannot start the cahoots daemon")?;
     Ok(())
 }
 
@@ -572,7 +566,7 @@ async fn run(cmd: Cmd) -> Result<()> {
 async fn tui_main(home: PathBuf) -> Result<()> {
     if !home.join("identity.key").exists() {
         fs::create_dir_all(&home)?;
-        fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        os::private_dir(&home)?;
         Identity::generate().save(&home)?;
         Config::new(hostname()).save(&home)?;
     }
@@ -600,7 +594,7 @@ async fn real_main() -> Result<()> {
                 bail!("\"{name}\" has a special meaning in destination lists; choose another name");
             }
             fs::create_dir_all(&home)?;
-            fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+            os::private_dir(&home)?;
             Identity::generate().save(&home)?;
             let mut cfg = Config::new(name);
             cfg.port = port.unwrap_or(cfg.port);
@@ -621,7 +615,7 @@ async fn real_main() -> Result<()> {
         C::Gui => {
             if !home.join("identity.key").exists() {
                 fs::create_dir_all(&home)?;
-                fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+                os::private_dir(&home)?;
                 Identity::generate().save(&home)?;
                 Config::new(hostname()).save(&home)?;
             }

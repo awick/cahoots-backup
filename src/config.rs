@@ -23,7 +23,7 @@ pub fn env_text(name: &str) -> Option<String> {
 /// Where a node keeps itself unless told otherwise: ~/.cahoots, or the folder an install
 /// from before the rename already lives in.
 pub fn default_home() -> PathBuf {
-    let user = PathBuf::from(std::env::var_os("HOME").expect("HOME is not set"));
+    let user = crate::os::user_home().expect("HOME is not set");
     let (new, old) = (user.join(".cahoots"), user.join(".super-duper-backup"));
     if !new.exists() && old.join("identity.key").exists() { old } else { new }
 }
@@ -401,9 +401,9 @@ impl Config {
 /// Writes a file only its owner can read. The temporary file is new, private from the
 /// start and never opened through a link someone else left in the folder.
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    use std::io::Write;
     let tmp = path.with_extension(format!("tmp{:016x}", rand::random::<u64>()));
-    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    let mut f = crate::os::create_private(&tmp)?;
     let done = f.write_all(data).and_then(|_| fs::rename(&tmp, path));
     if done.is_err() {
         let _ = fs::remove_file(&tmp);

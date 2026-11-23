@@ -15,7 +15,7 @@ const OLD_LABEL: &str = "org.superduperbackup.sdb";
 const OLD_UNIT: &str = "sdb.service";
 
 fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").expect("HOME is not set"))
+    crate::os::user_home().expect("HOME is not set")
 }
 
 fn unit_path() -> PathBuf {
