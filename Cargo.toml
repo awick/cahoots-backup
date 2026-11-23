@@ -14,6 +14,10 @@ rustix = { version = "1.1.6", features = ["fs", "process", "system"] }
 winapi-util = "0.1.11"
 windows-registry = "0.6.1"
 
+# Puts the icon and the program's name into the Windows programs.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 anyhow = "1.0.104"
 argon2 = "0.6.0"

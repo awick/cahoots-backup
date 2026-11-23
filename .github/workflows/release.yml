@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Publishes a GitHub release named after the version in Cargo.toml, with binaries for
-# macOS and Linux, and Docker images of the daemon for amd64 and arm64 at
+# macOS, Linux and Windows, and Docker images of the daemon for amd64 and arm64 at
 # ghcr.io/<owner>/<repository>. Started by hand (Actions > release > Run workflow, or
 # `gh workflow run release`): raise the version in Cargo.toml, push, then run it.
 # `gh workflow run release -f dry_run=true` builds and tests it all and publishes nothing.
@@ -52,22 +52,39 @@ jobs:
           # The older Ubuntu, so the binaries also run on systems with an older C library.
           - { name: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { name: linux-arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          # With cahootsw.exe, the same program without a console. It also runs on Arm.
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: --features windowed
+    # On Windows too, where it is Git Bash.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - name: Rust
         run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
       - name: Build
-        run: cargo build --profile dist --locked --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --target ${{ matrix.target }} ${{ matrix.features }}
       - name: Package
         run: |
           dir=cahoots-${{ needs.version.outputs.version }}-${{ matrix.name }}
           mkdir "$dir"
-          cp target/${{ matrix.target }}/dist/cahoots LICENSE README.md "$dir/"
-          tar -czf "$dir.tar.gz" "$dir"
+          cp LICENSE README.md "$dir/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/${{ matrix.target }}/dist/cahoots.exe target/${{ matrix.target }}/dist/cahootsw.exe "$dir/"
+            7z a "$dir.zip" "$dir"
+          else
+            cp target/${{ matrix.target }}/dist/cahoots "$dir/"
+            tar -czf "$dir.tar.gz" "$dir"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: cahoots-*.tar.gz
+          path: |
+            cahoots-*.tar.gz
+            cahoots-*.zip
           if-no-files-found: error
 
   publish:
@@ -86,9 +103,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          sha256sum cahoots-*.tar.gz >SHA256SUMS
+          sha256sum cahoots-*.tar.gz cahoots-*.zip >SHA256SUMS
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Cahoots Backup $VERSION" --generate-notes cahoots-*.tar.gz SHA256SUMS
+            --title "Cahoots Backup $VERSION" --generate-notes cahoots-*.tar.gz cahoots-*.zip SHA256SUMS
 
   # One image per kind of processor, each built on a runner of that kind, then joined
   # under one name so `docker pull` picks the right one.

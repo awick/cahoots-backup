@@ -275,8 +275,12 @@ pub async fn run(node: Arc<Node>, out: Out) {
     }
 }
 
-/// Best-effort desktop notification (Notification Center on macOS, notify-send on Linux).
+/// Best-effort desktop notification (Notification Center on macOS, notify-send on Linux,
+/// none yet on Windows).
 fn notify_desktop(text: &str) {
+    if cfg!(windows) {
+        return;
+    }
     let text = text.replace(['"', '\\'], "'");
     let _ = if cfg!(target_os = "macos") {
         std::process::Command::new("osascript")

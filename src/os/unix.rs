@@ -56,3 +56,11 @@ pub fn app_data() -> Option<std::path::PathBuf> {
 pub fn uid() -> u32 {
     rustix::process::getuid().as_raw()
 }
+
+/// Where plugged-in drives show up, to start a drive's path from.
+pub const DRIVES: &str = "/Volumes/";
+
+/// A path with every link in it followed.
+pub fn real_path(p: impl AsRef<std::path::Path>) -> io::Result<std::path::PathBuf> {
+    fs::canonicalize(p)
+}

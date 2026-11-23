@@ -519,7 +519,7 @@ impl App {
     fn set_root(&mut self, root: String) {
         self.folder_filter.clear();
         // Backed up folders are stored by their real path, so browse by real path too.
-        let root = std::fs::canonicalize(&root).map(|p| p.to_string_lossy().into_owned()).unwrap_or(root);
+        let root = crate::os::real_path(&root).map(|p| p.to_string_lossy().into_owned()).unwrap_or(root);
         self.folders.reset(list_dir(&root, self.hidden));
         self.root = root;
     }
@@ -1344,7 +1344,7 @@ impl App {
                 });
             }
             Act::Accept => self.input = Some((Prompt::Join, String::new())),
-            Act::AddDrive => self.input = Some((Prompt::Drive, "/Volumes/".into())),
+            Act::AddDrive => self.input = Some((Prompt::Drive, crate::os::DRIVES.into())),
             Act::SetExclude => {
                 // Enter moves the set on to the next list.
                 let lists = self.cfg.lists();
@@ -1448,7 +1448,8 @@ impl App {
                     self.status = "pick files or folders with space first".into();
                 } else {
                     let home = crate::os::home_text().unwrap_or_default();
-                    self.input = Some((Prompt::RestoreTo, format!("{home}/cahoots-restore")));
+                    let to = Path::new(&home).join("cahoots-restore").to_string_lossy().into_owned();
+                    self.input = Some((Prompt::RestoreTo, to));
                 }
             }
             Act::Search => self.input = Some((Prompt::Filter, self.restore.filter.clone())),
@@ -1716,7 +1717,7 @@ impl App {
             Prompt::Drive => {
                 let home = crate::os::home_text().unwrap_or_default();
                 let typed = text.replacen('~', &home, 1);
-                match std::fs::canonicalize(&typed) {
+                match crate::os::real_path(&typed) {
                     Ok(path) if path.is_dir() => {
                         let name = path
                             .file_name()

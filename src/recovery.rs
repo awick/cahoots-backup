@@ -65,11 +65,14 @@ pub fn file_name(name: &str) -> String {
 
 pub const EXT: &str = "cahoots-recovery-kit";
 
-/// Where a kit is offered to be kept: on a Mac the Documents folder, which iCloud Drive
-/// carries off the computer when it is set to.
+/// Where a kit is offered to be kept: the Documents folder on a Mac or on Windows, which
+/// iCloud Drive or OneDrive carries off the computer when it is set to.
 pub fn default_folder() -> Option<PathBuf> {
-    let docs = crate::os::user_home()?.join("Documents");
-    (cfg!(target_os = "macos") && docs.is_dir()).then_some(docs)
+    // On Windows, Documents is usually the one OneDrive keeps, when OneDrive is set up.
+    let synced = std::env::var_os("OneDrive").filter(|_| cfg!(windows)).map(PathBuf::from);
+    let docs = synced.map(|d| d.join("Documents")).filter(|d| d.is_dir());
+    let docs = docs.unwrap_or(crate::os::user_home()?.join("Documents"));
+    ((cfg!(target_os = "macos") || cfg!(windows)) && docs.is_dir()).then_some(docs)
 }
 
 /// Everything a kit holds, before it is sealed, the settings among it, and whose it is.

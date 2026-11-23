@@ -169,7 +169,7 @@ impl Gui {
         let (tx, rx) = mpsc::channel();
         let long_ago = Instant::now() - Duration::from_secs(3600);
         let root = crate::os::home_text().unwrap_or_else(|| "/".into());
-        let root = std::fs::canonicalize(&root).map(|p| p.to_string_lossy().into_owned()).unwrap_or(root);
+        let root = crate::os::real_path(&root).map(|p| p.to_string_lossy().into_owned()).unwrap_or(root);
         Gui {
             home,
             tx,
@@ -262,7 +262,7 @@ impl Gui {
                 self.text_at = Instant::now();
             }
             "files" => {
-                self.open.insert(format!("{}/Documents", self.root));
+                self.open.insert(Path::new(&self.root).join("Documents").to_string_lossy().into_owned());
                 self.edit = Some((first_set, Tab::Files));
             }
             "schedule" => self.edit = Some((first_set, Tab::Schedule)),
@@ -1347,7 +1347,10 @@ impl Gui {
             ui.horizontal(|ui| {
                 ui.label(format!("{} picked. Restore into:", self.picked.len()));
                 let home = crate::os::home_text().unwrap_or_default();
-                let to = self.fields.entry("restore-to".into()).or_insert_with(|| format!("{home}/cahoots-restore"));
+                let to = self
+                    .fields
+                    .entry("restore-to".into())
+                    .or_insert_with(|| Path::new(&home).join("cahoots-restore").to_string_lossy().into_owned());
                 ui.add(egui::TextEdit::singleline(to).desired_width(300.0));
                 let to = to.replacen('~', &home, 1);
                 if ui.add_enabled(!self.picked.is_empty() && !to.is_empty(), egui::Button::new("Restore")).clicked() {
@@ -1651,13 +1654,13 @@ impl Gui {
             Self::rows(ui, "add-drive", |ui| {
                 ui.weak("Folder");
                 ui.horizontal(|ui| {
-                    let text = self.fields.entry("drive".into()).or_insert_with(|| "/Volumes/".into());
+                    let text = self.fields.entry("drive".into()).or_insert_with(|| crate::os::DRIVES.into());
                     ui.add(egui::TextEdit::singleline(text).desired_width(360.0));
                     let home = crate::os::home_text().unwrap_or_default();
                     // The system's own folder chooser, opened where the box points if that exists.
                     if ui.button("Browse...").on_hover_text("Choose the folder in a dialog").clicked() {
                         let typed = PathBuf::from(text.trim().replacen('~', &home, 1));
-                        let start = [typed, PathBuf::from("/Volumes"), PathBuf::from(&home)]
+                        let start = [typed, PathBuf::from(crate::os::DRIVES), PathBuf::from(&home)]
                             .into_iter()
                             .find(|p| p.is_dir())
                             .unwrap_or_else(|| PathBuf::from("/"));
@@ -1669,7 +1672,7 @@ impl Gui {
                             *text = dir.display().to_string();
                         }
                     }
-                    let path = std::fs::canonicalize(text.trim().replacen('~', &home, 1)).ok().filter(|p| p.is_dir());
+                    let path = crate::os::real_path(text.trim().replacen('~', &home, 1)).ok().filter(|p| p.is_dir());
                     if ui.add_enabled(path.is_some(), egui::Button::new("Add")).clicked() {
                         if let Some(path) = path {
                             let name = path
@@ -2027,6 +2030,8 @@ impl Gui {
             } else {
                 ui.weak(if cfg!(target_os = "macos") {
                     "optional: a folder that syncs, such as Documents with iCloud Drive; cahoots keeps the kit there up to date"
+                } else if cfg!(windows) {
+                    "optional: a folder that syncs, such as Documents with OneDrive; cahoots keeps the kit there up to date"
                 } else {
                     "optional: a folder that a cloud drive syncs; cahoots keeps the kit there up to date"
                 });

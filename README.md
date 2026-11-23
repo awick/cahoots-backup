@@ -5,7 +5,7 @@
 # Cahoots Backup
 
 Encrypted, deduplicated backups between friends. Each person runs `cahoots` on their
-Mac or Linux computer; you add each other with one-time invites and your
+Mac, Linux or Windows computer; you add each other with one-time invites and your
 computers back up to one another, and optionally to a local drive or a cloud
 bucket as well. Friends, and the cloud, only ever hold ciphertext.
 
@@ -41,7 +41,7 @@ protects your files today. It is not affiliated with CrashPlan or its makers.
 
 ## Quick start
 
-Download `cahoots` for macOS or Linux from the
+Download `cahoots` for macOS, Linux or Windows from the
 [releases page](https://github.com/awick/cahoots-backup/releases), or build
 it yourself with `cargo build --release` (the binary is `target/release/cahoots`).
 The downloads are not signed, so a Mac asks before running one the first time;
@@ -175,6 +175,32 @@ that talk to it over a private local socket. The first command starts it if it
 is not running, and replaces it if it was started by an older build;
 `cahoots stop` stops it and `cahoots service install` starts it at login. Its log is
 `~/.cahoots/daemon.log`.
+
+## On Windows
+
+The download holds two programs. `cahoots.exe` is the command. `cahootsw.exe` is the same
+program without a console: start it from Explorer for the window, and it is what
+`cahoots service install` has Windows start at login to run the daemon. Everything lives
+in `%LOCALAPPDATA%\Cahoots`.
+
+A Windows computer works with friends on any system, and what one system backed up
+restores on another from its recovery kit. What is different on Windows:
+
+- There is no owner or permission to record: only the read-only flag is kept and put back.
+- Making a link during a restore needs Developer Mode or an administrator. Without either,
+  each link is reported and left out.
+- A file OneDrive keeps online only is not fetched. One that was backed up before stays in
+  the backup; a new or changed one is counted in the backup's summary line.
+- Restoring a Mac or Linux backup, a name Windows cannot hold is spelled out (`a:b` becomes
+  `a%3Ab`) and a second file whose name differs only in capitals gets a number. Each is
+  reported.
+- The downloads are not signed, so Windows shows "Windows protected your PC" the first
+  time: choose More info, then Run anyway.
+- There are no desktop notifications yet.
+
+To build it yourself you need the Visual Studio Build Tools with the C++ workload, and for
+an Arm computer also `clang`. `cargo build --release --features windowed` builds both
+programs.
 
 ## Running the daemon in Docker
 
@@ -401,7 +427,8 @@ friends cannot be guessed open; the passphrase only guards the kit file. See
 
 ## Files
 
-Everything lives in `~/.cahoots` (override with `CAHOOTS_HOME`):
+Everything lives in `~/.cahoots`, or `%LOCALAPPDATA%\Cahoots` on Windows (override with
+`CAHOOTS_HOME`):
 `config.toml` (also holds any cloud storage keys), `identity.key` (secret),
 `store/` (friends' encrypted data, move it with `store_dir`), `cache/`.
 
@@ -472,8 +499,8 @@ git config --local core.hooksPath .githooks/   # once per clone: quick checks be
 ./check.sh                                     # those plus the end-to-end, damage and cloud tests
 ```
 
-GitHub runs the full `./check.sh` on Linux and macOS for every push and pull
-request, so a commit only waits for the quick part.
+GitHub runs the full `./check.sh` on Linux, macOS and Windows (there under Git Bash) for
+every push and pull request, so a commit only waits for the quick part.
 
 `tests/e2e.sh` starts three local nodes and a drive (no internet needed) and
 exercises pairing, backup, restore, sets, a refused stranger, corruption
@@ -496,7 +523,7 @@ Docker (macOS): `CAHOOTS_TEST_S3=emulator tests/cloud.sh target/release/cahoots`
 
 To publish a release, raise `version` in `Cargo.toml`, push, and run the
 `release` workflow on GitHub (`gh workflow run release`). It names the release
-after that version and attaches binaries for macOS and Linux, built with the
+after that version and attaches binaries for macOS, Linux and Windows, built with the
 slower, smaller `dist` profile (`cargo build --profile dist`). It also pushes the
 Docker images to `ghcr.io/awick/cahoots-backup`. GitHub builds and tries
 the image on every push (`tests/docker.sh`), without publishing it. To rehearse a

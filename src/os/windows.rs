@@ -50,3 +50,18 @@ pub fn uid() -> u32 {
 pub fn app_data() -> Option<std::path::PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
 }
+
+/// Where plugged-in drives show up, to start a drive's path from.
+pub const DRIVES: &str = "D:\\";
+
+/// A path with every link in it followed, in the form people write: Windows' own answer
+/// starts with `\\?\`, which says the same.
+pub fn real_path(p: impl AsRef<Path>) -> io::Result<std::path::PathBuf> {
+    let real = fs::canonicalize(p)?;
+    let text = real.to_string_lossy();
+    Ok(match (text.strip_prefix(r"\\?\UNC\"), text.strip_prefix(r"\\?\")) {
+        (Some(share), _) => format!(r"\\{share}").into(),
+        (None, Some(rest)) => rest.into(),
+        (None, None) => real.clone(),
+    })
+}

@@ -681,7 +681,7 @@ async fn real_main(cli: Cli) -> Result<()> {
             let Some(folder) = folder.or_else(recovery::default_folder) else {
                 bail!("name the folder to keep the copy in, or --now to write it again, or --off to stop")
             };
-            let folder = fs::canonicalize(&folder).with_context(|| folder.display().to_string())?;
+            let folder = os::real_path(&folder).with_context(|| folder.display().to_string())?;
             say(format!(
                 "The kit will be kept as {}",
                 folder.join(recovery::file_name(&Config::load(&home)?.name)).display()
@@ -711,11 +711,11 @@ async fn real_main(cli: Cli) -> Result<()> {
             }
             let paths = paths
                 .iter()
-                .map(|p| fs::canonicalize(p).with_context(|| p.display().to_string()))
+                .map(|p| os::real_path(p).with_context(|| p.display().to_string()))
                 .collect::<Result<_>>()?;
             Cmd::AddPaths { paths, set }
         }
-        C::Rm { path } => Cmd::RemovePath { path: fs::canonicalize(&path).unwrap_or(std::path::absolute(&path)?) },
+        C::Rm { path } => Cmd::RemovePath { path: os::real_path(&path).unwrap_or(std::path::absolute(&path)?) },
         C::Exclude { cmd } => match cmd {
             ExcludeCmd::Lists => Cmd::ExcludeLists,
             ExcludeCmd::New { name, from, empty } => {
@@ -726,7 +726,7 @@ async fn real_main(cli: Cli) -> Result<()> {
             ExcludeCmd::Delete { list } => Cmd::ExcludeDelete { name: list },
         },
         C::Skip { path, set, remove } => {
-            Cmd::Skip { path: fs::canonicalize(&path).unwrap_or(std::path::absolute(&path)?), set, remove }
+            Cmd::Skip { path: os::real_path(&path).unwrap_or(std::path::absolute(&path)?), set, remove }
         }
         C::Invite => Cmd::Invite,
         C::Join { ticket } => Cmd::Join { ticket },
@@ -840,7 +840,7 @@ async fn real_main(cli: Cli) -> Result<()> {
         C::KeepFree { gb } => Cmd::Tune(Tune { min_free_gb: Some(gb), ..Default::default() }),
         C::Every { minutes, name } => Cmd::Every { name, minutes },
         C::Drive { name, path } => {
-            Cmd::DriveAdd { name, path: fs::canonicalize(&path).with_context(|| path.display().to_string())? }
+            Cmd::DriveAdd { name, path: os::real_path(&path).with_context(|| path.display().to_string())? }
         }
         C::Cloud { name, endpoint, bucket, access_key, region, prefix, path_style, create, ca_file } => {
             let ca_pem = match &ca_file {
