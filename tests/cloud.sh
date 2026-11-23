@@ -137,7 +137,11 @@ s destinations | grep -q s3 && fail "a destination that failed its check was sav
 step "add cloud storage"
 add_cloud --create | grep -q "s3 added" || fail "add"
 s destinations | grep -q "s3 .*cloud storage, bucket sdbtest" || fail "not listed"
-[ "$(ls -l home/config.toml | cut -c1-10)" = "-rw-------" ] || fail "config is not private"
+# Windows has no such bits: there the folder it is in is what keeps others out.
+case "$(uname -s)" in
+MINGW* | MSYS*) ;;
+*) [ "$(ls -l home/config.toml | cut -c1-10)" = "-rw-------" ] || fail "config is not private" ;;
+esac
 s status | grep -q "$CAHOOTS_CLOUD_SECRET" && fail "status shows the secret key"
 
 step "backup, change, backup"

@@ -8,6 +8,11 @@ CAHOOTS=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 T=$(cd "$(mktemp -d /tmp/cahoots-damage.XXXXXX)" && pwd -P)
 export CAHOOTS_OFFLINE=1
 fail() { echo "FAILED: $1" >&2; exit 1; }
+# On Windows this runs under Git Bash, which copies where `ln -s` should link unless told.
+case "$(uname -s)" in
+MINGW* | MSYS*) WINDOWS=1 && export MSYS=winsymlinks:nativestrict ;;
+*) WINDOWS= ;;
+esac
 step() { echo "  $1"; }
 a() { CAHOOTS_HOME=$T/alice "$CAHOOTS" "$@"; }
 b() { CAHOOTS_HOME=$T/bob "$CAHOOTS" "$@"; }
@@ -140,16 +145,19 @@ step "odd names, empty things, links, a pipe and an unreadable file"
 mkdir -p "data/odd/empty dir" "data/odd/ leading space"
 : >data/odd/empty-file
 echo dash >"data/odd/-dash"
-echo quote >"data/odd/it's \"quoted\""
 echo uni >"data/odd/ünïcödé-日本語"
 echo long >"data/odd/$(printf 'n%.0s' $(seq 1 240))"
-echo nl >"$(printf 'data/odd/new\nline')"
-echo tab >"$(printf 'data/odd/tab\there')"
 ln -s nowhere data/odd/broken-link
 ln -s "empty dir" data/odd/dir-link
-mkfifo data/odd/pipe
-echo secret >data/odd/locked
-chmod 000 data/odd/locked
+# Windows has no such names, no pipes in folders and no file its owner cannot read.
+if [ -z "$WINDOWS" ]; then
+    echo quote >"data/odd/it's \"quoted\""
+    echo nl >"$(printf 'data/odd/new\nline')"
+    echo tab >"$(printf 'data/odd/tab\there')"
+    mkfifo data/odd/pipe
+    echo secret >data/odd/locked
+    chmod 000 data/odd/locked
+fi
 a backup >odd.out 2>&1 &
 ODD=$!
 for _ in $(seq 1 60); do
@@ -158,20 +166,25 @@ for _ in $(seq 1 60); do
 done
 kill -0 "$ODD" 2>/dev/null && fail "the backup hung (a pipe in the folder?)"
 wait "$ODD" || fail "backup of odd names: $(tail -1 odd.out)"
-grep -q "unreadable skipped" odd.out || fail "the unreadable file was not mentioned"
+[ -n "$WINDOWS" ] || grep -q "unreadable skipped" odd.out || fail "the unreadable file was not mentioned"
 a ls latest >ls.out
-[ "$(grep -c 'new' ls.out)" = 1 ] || fail "a name with a line break took more than one line"
+[ -n "$WINDOWS" ] || [ "$(grep -c 'new' ls.out)" = 1 ] || fail "a name with a line break took more than one line"
 a restore latest --to odd >/dev/null 2>&1 || fail "restore of odd names"
-for n in empty-file -dash "it's \"quoted\"" "ünïcödé-日本語" "$(printf 'n%.0s' $(seq 1 240))" "$(printf 'new\nline')" "$(printf 'tab\there')"; do
+for n in empty-file -dash "ünïcödé-日本語" "$(printf 'n%.0s' $(seq 1 240))"; do
     cmp -s "odd/data/odd/$n" "data/odd/$n" || fail "odd name not restored: $n"
 done
+if [ -z "$WINDOWS" ]; then
+    for n in "it's \"quoted\"" "$(printf 'new\nline')" "$(printf 'tab\there')"; do
+        cmp -s "odd/data/odd/$n" "data/odd/$n" || fail "odd name not restored: $n"
+    done
+fi
 [ -d "odd/data/odd/empty dir" ] || fail "an empty folder was not restored"
 [ -d "odd/data/odd/ leading space" ] || fail "a folder with a leading space was not restored"
 [ "$(readlink odd/data/odd/broken-link)" = nowhere ] || fail "a broken link was not restored as a link"
 [ -L odd/data/odd/dir-link ] || fail "a link to a folder was not restored as a link"
 [ ! -e odd/data/odd/locked ] || fail "an unreadable file appeared in the restore"
 [ ! -e odd/data/odd/pipe ] || fail "a pipe was restored as something"
-chmod 600 data/odd/locked
+[ -n "$WINDOWS" ] || chmod 600 data/odd/locked
 rm -f data/odd/pipe
 
 step "a file that changes while it is backed up"
@@ -194,13 +207,22 @@ step "the daemon killed in the middle of a backup"
 BEFORE=$(a snapshots | wc -l)
 a limit 0.3 >/dev/null
 head -c 5000000 /dev/urandom >data/interrupted
+DAEMON=
+if [ -n "$WINDOWS" ]; then
+    # Nothing there says which daemon holds which home, so the one to kill is started here.
+    a stop >/dev/null
+    CAHOOTS_HOME=$T/alice "$CAHOOTS" daemon >/dev/null 2>&1 &
+    DAEMON=$!
+    sleep 2
+fi
 a backup >/dev/null 2>&1 &
 CLIENT=$!
 sleep 2
-PID=$(daemon_pid alice)
+PID=${DAEMON:-$(daemon_pid alice)}
 [ -n "$PID" ] || fail "could not find the daemon to kill"
 kill -9 "$PID"
 wait "$CLIENT" 2>/dev/null || true
+[ -z "$DAEMON" ] || wait "$DAEMON" 2>/dev/null || true
 a limit 0 >/dev/null
 [ "$(a snapshots | wc -l)" = "$BEFORE" ] || fail "a half-finished backup left a restore point"
 a backup | grep -q "created on" || fail "backup after the kill"

@@ -6,6 +6,11 @@ CAHOOTS=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 T=$(mktemp -d /tmp/cahoots-e2e.XXXXXX)
 export CAHOOTS_OFFLINE=1
 fail() { echo "FAILED: $1" >&2; exit 1; }
+# On Windows this runs under Git Bash, which copies where `ln -s` should link unless told.
+case "$(uname -s)" in
+MINGW* | MSYS*) WINDOWS=1 && export MSYS=winsymlinks:nativestrict ;;
+*) WINDOWS= ;;
+esac
 step() { echo "  $1"; }
 # Every command talks to that node's daemon, starting it when needed.
 a() { CAHOOTS_HOME=$T/alice "$CAHOOTS" "$@"; }
@@ -249,12 +254,17 @@ a restore latest data/sub --to trap2 >/dev/null || fail "restore beside a plante
 
 step "set-id bits are not restored"
 echo three >data/sub/note.txt
-chmod 4755 data/sub/note.txt
-a backup --set default >/dev/null
-a restore latest data/sub/note.txt --to suid >/dev/null
-[ -u suid/data/sub/note.txt ] && fail "a set-uid file was restored set-uid"
-[ -x suid/data/sub/note.txt ] || fail "ordinary permissions were lost"
-chmod 644 data/sub/note.txt
+# Windows has no such bits.
+if [ -z "$WINDOWS" ]; then
+    chmod 4755 data/sub/note.txt
+    a backup --set default >/dev/null
+    a restore latest data/sub/note.txt --to suid >/dev/null
+    [ -u suid/data/sub/note.txt ] && fail "a set-uid file was restored set-uid"
+    [ -x suid/data/sub/note.txt ] || fail "ordinary permissions were lost"
+    chmod 644 data/sub/note.txt
+else
+    a backup --set default >/dev/null
+fi
 
 step "a forgotten restore point cannot be brought back"
 GONE=$(a snapshots | awk '/ pics / {id=$1} END {print id}')
