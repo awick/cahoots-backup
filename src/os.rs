@@ -25,3 +25,38 @@ pub fn user_home() -> Option<PathBuf> {
 pub fn home_text() -> Option<String> {
     std::env::var(HOME).ok()
 }
+
+/// What a name in a folder is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    File,
+    Dir,
+    Link,
+    /// A pipe, device or socket.
+    Other,
+    /// The folder does not say; ask with `stat`.
+    Unknown,
+}
+
+/// What the system records about a file. `mode` is the whole of it, type bits included, and
+/// `mtime` is in nanoseconds.
+#[derive(Clone, Debug)]
+pub struct Meta {
+    pub kind: Kind,
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: i64,
+    pub size: u64,
+}
+
+/// What a restore point recorded about a file, to be put back on it.
+pub struct Recorded {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: i64,
+}

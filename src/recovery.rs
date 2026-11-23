@@ -222,16 +222,14 @@ const MAX_KIT: u64 = 4 << 20;
 /// Reads a kit from a folder others may write: never through a link, never waiting on a pipe
 /// or device, and never more than a kit's size.
 fn read_kit(path: &Path) -> Option<String> {
-    use rustix::fs::{FileType, Mode, OFlags};
     use std::io::Read;
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let fd = rustix::fs::open(path, flags, Mode::empty()).ok()?;
-    let st = rustix::fs::fstat(&fd).ok()?;
-    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile || st.st_size as u64 > MAX_KIT {
+    let f = crate::os::open_file(path).ok()?;
+    let md = f.metadata().ok()?;
+    if !md.is_file() || md.len() > MAX_KIT {
         return None;
     }
     let mut s = String::new();
-    fs::File::from(fd).take(MAX_KIT).read_to_string(&mut s).ok()?;
+    f.take(MAX_KIT).read_to_string(&mut s).ok()?;
     Some(s)
 }
 

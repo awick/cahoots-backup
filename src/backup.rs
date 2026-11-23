@@ -6,21 +6,17 @@ use crate::{
     crypto::{Id, Keys},
     net::Peer,
     node::{Node, Out},
+    os,
     snapshot::{self, Entry, Kind, Manifest, human},
 };
 use anyhow::{Result, anyhow, bail};
 use fastcdc::v2020::{FastCDC, StreamCDC};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use rustix::fs::{CWD, FileType, OFlags};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
     fs,
     io::{Read, Seek},
-    os::{
-        fd::{AsFd, BorrowedFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
-    },
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -194,7 +190,7 @@ fn scan(
     // The chunks of each file with more than one name, so a further link is not read again.
     let mut linked: HashMap<(u64, u64), (u64, Vec<Id>)> = HashMap::new();
     let refuse = |res: &mut Scan, path: &[u8]| {
-        out.say(format!("  NOT BACKED UP {}: {FREE_FULL}", Path::new(OsStr::from_bytes(path)).display()));
+        out.say(format!("  NOT BACKED UP {}: {FREE_FULL}", os::bytes_path(path).display()));
         res.refused += 1;
     };
     // Changed files (entry, device, inode, more than one name) are read after the walk, longest
@@ -209,14 +205,14 @@ fn scan(
                 continue;
             }
         };
-        let (md, path) = (&f.md, f.path.as_os_str().as_bytes().to_vec());
+        let (md, path) = (&f.md, os::path_bytes(&f.path));
         let kind = match f.ft {
-            FileType::Directory => Kind::Dir,
-            FileType::Symlink => match f.link {
+            os::Kind::Dir => Kind::Dir,
+            os::Kind::Link => match f.link {
                 Some(t) => Kind::Symlink(t),
                 None => continue,
             },
-            FileType::RegularFile => {
+            os::Kind::File => {
                 let link = (md.nlink > 1).then_some((md.dev, md.ino));
                 let reuse = prev.get(&path).and_then(|p| match &p.kind {
                     Kind::File { size, chunks }
@@ -293,7 +289,7 @@ fn scan(
             continue;
         }
         started = true;
-        let path = Path::new(OsStr::from_bytes(&key));
+        let path = &os::bytes_path(&key);
         match read_file(path, dev, ino, &mut sc) {
             Ok((size, chunks, skipped)) => {
                 holes += skipped;
@@ -368,64 +364,56 @@ impl Free {
     }
 }
 
-/// What the walk keeps of a stat, as std's MetadataExt gives it.
-struct Meta {
-    dev: u64,
-    ino: u64,
-    nlink: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    mtime: i64,
-    size: u64,
-}
-
-#[allow(clippy::unnecessary_cast)]
-fn meta(st: &rustix::fs::Stat) -> Meta {
-    Meta {
-        dev: st.st_dev as u64,
-        ino: st.st_ino as u64,
-        nlink: st.st_nlink as u64,
-        mode: st.st_mode as u32,
-        uid: st.st_uid as u32,
-        gid: st.st_gid as u32,
-        mtime: st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
-        size: st.st_size as u64,
-    }
-}
-
 /// One thing the walk found. `into` is the folder to go into, as (device, inode).
 struct Found {
     path: PathBuf,
-    ft: FileType,
-    md: Meta,
+    ft: os::Kind,
+    md: os::Meta,
     link: Option<Vec<u8>>,
     into: Option<(u64, u64)>,
 }
 
-/// Looks at `name` in the open folder `dir`, without following it if it is a link (but into a
-/// root given as a link to a folder, as the user named it).
-fn found<P: rustix::path::Arg + Copy>(dir: BorrowedFd<'_>, name: P, path: PathBuf, root: bool) -> Result<Found> {
-    use rustix::fs::{AtFlags, statat};
-    let st = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| anyhow!("{}: {e}", path.display()))?;
-    let (ft, md) = (FileType::from_raw_mode(st.st_mode), meta(&st));
-    if ft == FileType::Symlink && root {
+/// Where the walk looks: at a root as the user named it, or at a name in an open folder.
+#[derive(Clone, Copy)]
+enum At<'a> {
+    Root(&'a Path),
+    In(&'a os::Dir, &'a OsStr),
+}
+
+impl At<'_> {
+    fn stat(self, follow: bool) -> std::io::Result<os::Meta> {
+        match self {
+            At::Root(path) => os::stat(path, follow),
+            At::In(dir, name) => dir.stat(name, follow),
+        }
+    }
+
+    fn read_link(self) -> std::io::Result<Vec<u8>> {
+        match self {
+            At::Root(path) => os::read_link(path),
+            At::In(dir, name) => dir.read_link(name),
+        }
+    }
+}
+
+/// Looks at one name without following it if it is a link (but into a root given as a link to
+/// a folder, as the user named it).
+fn found(at: At, path: PathBuf) -> Result<Found> {
+    let md = at.stat(false).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    let ft = md.kind;
+    if ft == os::Kind::Link && matches!(at, At::Root(_)) {
         // A root named through a link is the folder it names, recorded as that folder: restore
         // then makes a folder there and puts what it holds inside, not a link it cannot enter.
-        if let Some(t) = statat(dir, name, AtFlags::empty())
-            .ok()
-            .filter(|s| FileType::from_raw_mode(s.st_mode) == FileType::Directory)
-        {
-            let md = meta(&t);
-            return Ok(Found { path, ft: FileType::Directory, into: Some((md.dev, md.ino)), md, link: None });
+        if let Some(md) = at.stat(true).ok().filter(|t| t.kind == os::Kind::Dir) {
+            return Ok(Found { path, ft: os::Kind::Dir, into: Some((md.dev, md.ino)), md, link: None });
         }
     }
     let link = match ft {
-        FileType::Symlink => rustix::fs::readlinkat(dir, name, vec![]).ok().map(|t| t.into_bytes()),
+        os::Kind::Link => at.read_link().ok(),
         _ => None,
     };
     let into = match ft {
-        FileType::Directory => Some((md.dev, md.ino)),
+        os::Kind::Dir => Some((md.dev, md.ino)),
         _ => None,
     };
     Ok(Found { path, ft, md, link, into })
@@ -443,33 +431,23 @@ struct Walk<'a> {
 impl<'a> Walk<'a> {
     fn new(roots: &[PathBuf], ex: &'a Excludes) -> Self {
         let top: Vec<_> =
-            roots.iter().filter(|r| !ex.is_excluded(r)).map(|r| found(CWD, r.as_path(), r.clone(), true)).collect();
+            roots.iter().filter(|r| !ex.is_excluded(r)).map(|r| found(At::Root(r.as_path()), r.clone())).collect();
         Walk { ex, stack: vec![top.into_iter()] }
     }
 
     fn list(&self, path: &Path, (dev, ino): (u64, u64), root: bool) -> Result<Vec<Result<Found>>> {
-        let mut flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NONBLOCK;
-        if !root {
-            flags |= OFlags::NOFOLLOW;
-        }
-        let fd = rustix::fs::open(path, flags, rustix::fs::Mode::empty())?;
-        let md = meta(&rustix::fs::fstat(&fd)?);
+        let dir = os::Dir::open(path, root)?;
+        let md = dir.meta()?;
         if (md.dev, md.ino) != (dev, ino) {
             bail!("it was replaced while being backed up");
         }
-        let mut names = vec![];
-        for d in rustix::fs::Dir::read_from(&fd)? {
-            let name = d?.file_name().to_owned();
-            if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                names.push(name);
-            }
-        }
+        let mut names = dir.names()?;
         names.sort();
         Ok(names
             .iter()
             .filter_map(|n| {
-                let p = path.join(OsStr::from_bytes(n.to_bytes()));
-                (!self.ex.is_excluded(&p)).then(|| found(fd.as_fd(), n.as_c_str(), p, false))
+                let p = path.join(n);
+                (!self.ex.is_excluded(&p)).then(|| found(At::In(&dir, n), p))
             })
             .collect())
     }
@@ -515,13 +493,13 @@ pub fn check_local(keys: &Keys, last: Vec<Entry>, out: &Out) -> (u64, u64) {
             continue;
         };
         let path = e.path();
-        let Ok(md) = fs::symlink_metadata(&path) else {
+        let Ok(md) = os::stat(&path, false) else {
             continue;
         };
-        if md.size() != *size || md.mtime() * 1_000_000_000 + md.mtime_nsec() != e.mtime || md.ino() != e.ino {
+        if md.size != *size || md.mtime != e.mtime || md.ino != e.ino {
             continue;
         }
-        let Ok((f, len)) = open_scanned(&path, md.dev(), md.ino()) else {
+        let Ok((f, len)) = open_scanned(&path, md.dev, md.ino) else {
             continue;
         };
         checked += 1;
@@ -550,23 +528,20 @@ pub fn check_local(keys: &Keys, last: Vec<Entry>, out: &Out) -> (u64, u64) {
 /// Opens the file the scan just looked at. A link, pipe or different file swapped in
 /// since then is refused rather than read, and a pipe cannot make the open wait.
 fn open_scanned(path: &Path, dev: u64, ino: u64) -> Result<(fs::File, u64)> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let flags = (OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32;
-    let f = fs::OpenOptions::new().read(true).custom_flags(flags).open(path)?;
-    let md = f.metadata()?;
-    if !md.is_file() || md.dev() != dev || md.ino() != ino {
+    let f = os::open_file(path)?;
+    let md = os::file_meta(&f)?;
+    if md.kind != os::Kind::File || md.dev != dev || md.ino != ino {
         bail!("it was replaced while being backed up");
     }
-    Ok((f, md.size()))
+    Ok((f, md.size))
 }
 
 /// The stretches of a file to skip rather than read, as (start, length) in whole zero
 /// chunks. What is left of each hole, and holes smaller than a chunk, are read as zeros.
 fn holes(f: &fs::File, len: u64) -> Result<Vec<(u64, u64)>> {
-    use rustix::{fs::SeekFrom, io::Errno};
     let unknown = || -> Result<Vec<(u64, u64)>> {
         // The filesystem cannot say where its holes are, so all of them would be read.
-        let empty = len.saturating_sub(f.metadata()?.blocks().saturating_mul(512));
+        let empty = len.saturating_sub(os::allocated(f)?);
         if empty > MAX_ZEROS_READ {
             bail!("sparse file with {} of empty space on a filesystem that cannot skip it", human(empty));
         }
@@ -574,16 +549,16 @@ fn holes(f: &fs::File, len: u64) -> Result<Vec<(u64, u64)>> {
     };
     let (mut out, mut pos, mut skip, mut read) = (vec![], 0u64, 0u64, 0u64);
     while pos < len {
-        let hole = match rustix::fs::seek(f, SeekFrom::Hole(pos)) {
+        let hole = match os::seek_hole(f, pos) {
             Ok(h) => h.clamp(pos, len),
             Err(_) => return unknown(),
         };
         if hole >= len {
             break;
         }
-        let data = match rustix::fs::seek(f, SeekFrom::Data(hole)) {
-            Ok(d) => d.clamp(hole + 1, len),
-            Err(Errno::NXIO) => len,
+        let data = match os::seek_data(f, hole) {
+            Ok(Some(d)) => d.clamp(hole + 1, len),
+            Ok(None) => len,
             Err(_) => return unknown(),
         };
         let whole = (data - hole) / MAX_CHUNK as u64 * MAX_CHUNK as u64;
@@ -1146,6 +1121,7 @@ async fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn a_swapped_or_sparse_file_is_not_read() {
@@ -1196,7 +1172,7 @@ mod tests {
         assert_eq!(names(&dir.join("via")), ["", "a", "a/x", "b"]);
         // ...and recorded as the folder it names, so a restore can make a folder there.
         let top = Walk::new(&[dir.join("via")], &ex).next().unwrap().unwrap();
-        assert!(top.ft == FileType::Directory && top.link.is_none());
+        assert!(top.ft == os::Kind::Dir && top.link.is_none());
         // A folder swapped for a link, or for another folder, after its parent listed it.
         let walk = Walk::new(&[], &ex);
         let st = fs::symlink_metadata(root.join("a")).unwrap();

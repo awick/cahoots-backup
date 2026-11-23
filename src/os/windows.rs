@@ -38,3 +38,10 @@ pub fn stop_signal() -> io::Result<impl Future<Output = ()>> {
 }
 
 pub mod control;
+
+mod files;
+pub use files::*;
+
+pub fn uid() -> u32 {
+    0
+}

@@ -5,19 +5,15 @@ use crate::{
     backup::MAX_CHUNK,
     config::Friend,
     node::{Node, Out},
+    os::{self, Dir},
     snapshot::{Entry, Kind, human},
 };
 use anyhow::{Context, Result, anyhow, bail};
-use rustix::{
-    fs::{self as rfs, AtFlags, Mode, OFlags, Timespec, Timestamps},
-    process::{Gid, Uid},
-};
 use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
     fs,
     io::{Seek, SeekFrom, Write},
-    os::{fd::OwnedFd, unix::ffi::OsStrExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -34,16 +30,15 @@ fn rel(e: &Entry, roots: &[PathBuf]) -> PathBuf {
 /// mode, never one someone else had waiting under the same name.
 type Made = HashSet<(u64, u64)>;
 
-#[allow(clippy::unnecessary_cast)]
-fn id(fd: &OwnedFd) -> Option<(u64, u64)> {
-    rfs::fstat(fd).ok().map(|st| (st.st_dev as u64, st.st_ino as u64))
+fn id(fd: &Dir) -> Option<(u64, u64)> {
+    fd.meta().ok().map(|m| (m.dev, m.ino))
 }
 
 /// Opens the folder `rel` below `top` one name at a time, never passing through a symbolic
 /// link, so nothing planted in the restore folder can steer a write somewhere else. Missing
 /// folders are made when `made` is given, which then records them. On failure it gives the
 /// part of `rel` that is in the way, so what lies below it can be skipped.
-fn open_dir(top: &OwnedFd, rel: &Path, mut made: Option<&mut Made>) -> Result<OwnedFd, (PathBuf, anyhow::Error)> {
+fn open_dir(top: &Dir, rel: &Path, mut made: Option<&mut Made>) -> Result<Dir, (PathBuf, anyhow::Error)> {
     let mut fd = top.try_clone().map_err(|e| (rel.to_path_buf(), e.into()))?;
     let mut at = PathBuf::new();
     for c in rel.components() {
@@ -54,60 +49,30 @@ fn open_dir(top: &OwnedFd, rel: &Path, mut made: Option<&mut Made>) -> Result<Ow
         };
         at.push(name);
         let new = match made {
-            Some(_) => match rfs::mkdirat(&fd, name, Mode::from_raw_mode(0o700)) {
-                Err(e) if e != rustix::io::Errno::EXIST => return Err((at, e.into())),
+            Some(_) => match fd.make(name) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err((at, e.into())),
                 r => r.is_ok(),
             },
             None => false,
         };
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        fd = rfs::openat(&fd, name, flags, Mode::empty())
+        fd = fd
+            .sub(name)
             .map_err(|e| (at.clone(), anyhow!("a link or not a folder, refusing to restore through it ({e})")))?;
         // Ours only if it is still the private one just made: anyone who can write the parent
         // may have swapped theirs in between.
         if new && let Some(m) = made.as_deref_mut() {
-            let st = rfs::fstat(&fd).map_err(|e| (at.clone(), e.into()))?;
-            if st.st_uid == rustix::process::geteuid().as_raw()
-                && !Mode::from_raw_mode(st.st_mode).intersects(Mode::RWXG | Mode::RWXO)
-            {
-                m.extend(id(&fd));
+            let st = fd.meta().map_err(|e| (at.clone(), e.into()))?;
+            if os::private_to_me(&st) {
+                m.insert((st.dev, st.ino));
             }
         }
     }
     Ok(fd)
 }
 
-fn stamps(e: &Entry) -> Timestamps {
-    let t = Timespec { tv_sec: e.mtime.div_euclid(1_000_000_000), tv_nsec: e.mtime.rem_euclid(1_000_000_000) as _ };
-    Timestamps { last_access: t, last_modification: t }
-}
-
-/// Applies the recorded owner, permissions and time to an open file or folder. Set-id bits
-/// only survive a restore run by root, which also restores the owner they belong to.
-fn finish(fd: &impl std::os::fd::AsFd, e: &Entry, root: bool) {
-    // Kept only once the file really belongs to that owner, never on one left with root's.
-    let owned = root && rfs::fchown(fd, Some(Uid::from_raw(e.uid)), Some(Gid::from_raw(e.gid))).is_ok();
-    let keep = if owned { 0o7777 } else { 0o777 };
-    let _ = rfs::fchmod(fd, Mode::from_raw_mode((e.mode & keep) as _));
-    let _ = rfs::futimens(fd, &stamps(e));
-}
-
-/// A folder that was already there keeps its owner and any set-id bits; it gets the recorded
-/// permissions and time only if it already belongs to the recorded owner (or, not as root,
-/// to us, as fchmod allows nothing else).
-fn finish_existing(fd: &OwnedFd, e: &Entry, root: bool) {
-    let Ok(st) = rfs::fstat(fd) else { return };
-    // Owned by root and private, exactly as a restore makes its folders: only root could have
-    // made it, so it is an earlier, stopped restore's own and is finished as one made now.
-    if root && st.st_uid == 0 && st.st_mode & 0o7777 == 0o700 {
-        return finish(fd, e, root);
-    }
-    if root && st.st_uid != e.uid {
-        return;
-    }
-    let special = Mode::from_raw_mode(st.st_mode) & (Mode::SUID | Mode::SGID | Mode::SVTX);
-    let _ = rfs::fchmod(fd, Mode::from_raw_mode((e.mode & 0o777) as _) | special);
-    let _ = rfs::futimens(fd, &stamps(e));
+/// What the restore point recorded about an entry, to be put back on it.
+fn recorded(e: &Entry) -> os::Recorded {
+    os::Recorded { mode: e.mode, uid: e.uid, gid: e.gid, mtime: e.mtime }
 }
 
 /// A half-written file untouched for this long belongs to a restore that died: a live one
@@ -124,32 +89,31 @@ fn is_tmp(name: &[u8]) -> bool {
 
 /// Clears away the half-written files that restores which died (the daemon killed, the power
 /// gone) left in a folder. One a running restore is still writing is too fresh to be taken.
-#[allow(clippy::unnecessary_cast)]
-fn sweep(dir: &OwnedFd) {
+fn sweep(dir: &Dir) {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let Ok(list) = rfs::Dir::read_from(dir) else { return };
-    for e in list.flatten() {
-        let name = e.file_name();
-        let stale = is_tmp(name.to_bytes())
-            && rfs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
-                .is_ok_and(|st| rfs::FileType::from_raw_mode(st.st_mode).is_file() && now - st.st_mtime as i64 > STALE);
+    dir.each_name(|name, _| {
+        let stale = is_tmp(name.as_encoded_bytes())
+            && dir
+                .stat(name, false)
+                .is_ok_and(|m| m.kind == os::Kind::File && now - m.mtime.div_euclid(1_000_000_000) > STALE);
         if stale {
-            let _ = rfs::unlinkat(dir, name, AtFlags::empty());
+            let _ = dir.remove_file(name);
         }
-    }
+        true
+    });
 }
 
 /// A file being written, removed again if the restore ends or is stopped (its client gone, say)
 /// before the file is moved into place.
 struct Unfinished {
-    dir: Option<OwnedFd>,
+    dir: Option<Dir>,
     name: OsString,
 }
 
 impl Drop for Unfinished {
     fn drop(&mut self) {
         if let Some(dir) = &self.dir {
-            let _ = rfs::unlinkat(dir, &self.name, AtFlags::empty());
+            let _ = dir.remove_file(&self.name);
         }
     }
 }
@@ -158,31 +122,24 @@ impl Drop for Unfinished {
 /// and time there, then moves it into place. Done next to the destination, anyone who can
 /// write the restore folder could swap in a hard link to another file between the steps and
 /// have that file chowned instead.
-fn place_link(dir: &OwnedFd, name: &OsStr, target: &[u8], e: &Entry, root: bool) -> Result<()> {
-    let tmp = format!(".sdb-tmp-{:016x}", rand::random::<u64>());
-    rfs::mkdirat(dir, &tmp, Mode::from_raw_mode(0o700))?;
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let made = rfs::openat(dir, &tmp, flags, Mode::empty()).map_err(anyhow::Error::from).and_then(|t| {
+fn place_link(dir: &Dir, name: &OsStr, target: &[u8], e: &Entry, root: bool) -> Result<()> {
+    let tmp: OsString = format!(".sdb-tmp-{:016x}", rand::random::<u64>()).into();
+    dir.make(&tmp)?;
+    let made = dir.sub(&tmp).map_err(anyhow::Error::from).and_then(|t| {
         // Someone who can write `dir` may have renamed ours away and put their own in its place.
-        let st = rfs::fstat(&t)?;
-        if st.st_uid != rustix::process::geteuid().as_raw()
-            || rustix::fs::Mode::from_raw_mode(st.st_mode).intersects(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO)
-        {
+        if !os::private_to_me(&t.meta()?) {
             bail!("the temporary folder was replaced");
         }
-        rfs::symlinkat(OsStr::from_bytes(target), &t, "l")?;
-        if root {
-            let (u, g) = (Some(Uid::from_raw(e.uid)), Some(Gid::from_raw(e.gid)));
-            let _ = rfs::chownat(&t, "l", u, g, AtFlags::SYMLINK_NOFOLLOW);
-        }
-        let _ = rfs::utimensat(&t, "l", &stamps(e), AtFlags::SYMLINK_NOFOLLOW);
-        let moved = rfs::renameat(&t, "l", dir, name);
+        let link = OsStr::new("l");
+        t.symlink(link, target)?;
+        t.finish_link(link, &recorded(e), root);
+        let moved = t.rename(link, dir, name);
         if moved.is_err() {
-            let _ = rfs::unlinkat(&t, "l", AtFlags::empty());
+            let _ = t.remove_file(link);
         }
         Ok(moved?)
     });
-    let _ = rfs::unlinkat(dir, &tmp, AtFlags::REMOVEDIR);
+    let _ = dir.remove_dir(&tmp);
     made
 }
 
@@ -212,11 +169,10 @@ pub async fn run(
         roots.clear();
     }
     let roots = &roots[..];
-    let root = rustix::process::geteuid().is_root();
+    let root = os::is_root();
     // `to` is the folder the user chose, so links in it and its parents are followed on purpose.
     fs::create_dir_all(to).with_context(|| to.display().to_string())?;
-    let top = rfs::open(to, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-        .with_context(|| to.display().to_string())?;
+    let top = Dir::open(to, true).with_context(|| to.display().to_string())?;
     let (mut files, mut bytes, mut skipped) = (0u64, 0u64, 0u64);
     let mut told = std::time::Instant::now();
     // A hole the backup skipped is stored as this chunk; it is skipped again here rather
@@ -227,7 +183,7 @@ pub async fn run(
     // Folders that could not be opened; everything below them is skipped.
     let mut blocked: Vec<PathBuf> = Vec::new();
     // The folder most recently written into, kept open for the files that follow in it.
-    let mut held: Option<(PathBuf, OwnedFd)> = None;
+    let mut held: Option<(PathBuf, Dir)> = None;
     let mut made = Made::new();
     for e in &entries {
         let path = rel(e, roots);
@@ -284,14 +240,13 @@ pub async fn run(
                 // file may have; the ending keeps it out of backups.
                 let mut old: OsString = name.to_owned();
                 old.push(".sdb-tmp");
-                let _ = rfs::unlinkat(dir, &old, AtFlags::empty());
+                let _ = dir.remove_file(&old);
                 tmp_count += 1;
                 let tmp: OsString = format!(".{run_tag}-{tmp_count}.sdb-tmp").into();
                 let tmp = &tmp;
                 // A brand new file, never one (or a link) that was waiting under this name.
-                let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                let fd = match rfs::openat(dir, tmp, flags, Mode::from_raw_mode(0o600)) {
-                    Ok(fd) => fd,
+                let mut f = match dir.create_file(tmp) {
+                    Ok(f) => f,
                     Err(err) => {
                         skip(out, to, &path, &err.into(), None);
                         skipped += 1;
@@ -299,7 +254,6 @@ pub async fn run(
                     }
                 };
                 let mut unfinished = Unfinished { dir: dir.try_clone().ok(), name: tmp.clone() };
-                let mut f = fs::File::from(fd);
                 let mut copy = async || -> Result<()> {
                     for run in chunks.chunk_by(|a, b| (*a == zero) == (*b == zero)) {
                         if run[0] == zero {
@@ -327,19 +281,19 @@ pub async fn run(
                 };
                 let copied = copy().await;
                 if let Err(err) = copied {
-                    let _ = rfs::unlinkat(dir, tmp, AtFlags::empty());
+                    let _ = dir.remove_file(tmp);
                     return Err(err);
                 }
                 if written != *size {
-                    let _ = rfs::unlinkat(dir, tmp, AtFlags::empty());
+                    let _ = dir.remove_file(tmp);
                     skip(out, to, &path, &anyhow!("restored {written} bytes but the backup recorded {size}"), None);
                     skipped += 1;
                     continue;
                 }
-                finish(&f, e, root);
+                os::finish_file(&f, &recorded(e), root);
                 drop(f);
-                if let Err(err) = rfs::renameat(dir, tmp, dir, name) {
-                    let _ = rfs::unlinkat(dir, tmp, AtFlags::empty());
+                if let Err(err) = dir.rename(tmp, dir, name) {
+                    let _ = dir.remove_file(tmp);
                     skip(out, to, &path, &err.into(), None);
                     skipped += 1;
                     continue;
@@ -353,8 +307,8 @@ pub async fn run(
     for e in entries.iter().rev().filter(|e| e.kind == Kind::Dir) {
         // Re-opened by name, so checked to be the very folder made earlier.
         match open_dir(&top, &rel(e, roots), None) {
-            Ok(fd) if id(&fd).is_some_and(|i| made.contains(&i)) => finish(&fd, e, root),
-            Ok(fd) => finish_existing(&fd, e, root),
+            Ok(fd) if id(&fd).is_some_and(|i| made.contains(&i)) => fd.finish(&recorded(e), root),
+            Ok(fd) => fd.finish_existing(&recorded(e), root),
             Err(_) => {}
         }
     }
@@ -370,9 +324,9 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn top(dir: &Path) -> OwnedFd {
+    fn top(dir: &Path) -> Dir {
         fs::create_dir_all(dir).unwrap();
-        rfs::open(dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap()
+        Dir::open(dir, true).unwrap()
     }
 
     #[test]
@@ -434,7 +388,7 @@ mod tests {
         let fd = open_dir(&top, Path::new("planted"), None).unwrap();
         assert!(!made.contains(&id(&fd).unwrap()));
         let e = Entry { path: vec![], mode: 0o42755, uid: 0, gid: 0, mtime: 0, ino: 0, kind: Kind::Dir };
-        finish_existing(&fd, &e, false);
+        fd.finish_existing(&recorded(&e), false);
         assert_eq!(fs::metadata(dir.join("planted")).unwrap().permissions().mode() & 0o7777, 0o755);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -453,7 +407,7 @@ mod tests {
             ino: 0,
             kind: Kind::Dir,
         };
-        finish(&f, &e, false);
+        os::finish_file(&f, &recorded(&e), false);
         assert_eq!(f.metadata().unwrap().permissions().mode() & 0o7777, 0o755);
         fs::remove_dir_all(dir).unwrap();
     }

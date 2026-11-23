@@ -5,21 +5,16 @@
 
 use crate::{
     crypto::Id,
+    os::{Dir, Kind},
     proto::{ID_BATCH, MAX_BLOB, MAX_IDS, MAX_MSG, MAX_SNAPSHOT},
 };
 use anyhow::{Result, anyhow, bail};
-use rustix::{
-    fs::{AtFlags, FileType, Mode, OFlags},
-    io::Errno,
-};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fs, io,
     io::{Read, Write},
     mem,
-    os::fd::{AsFd, OwnedFd},
-    os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
@@ -86,10 +81,6 @@ fn lock_in(locks: &Locks, owner: &str) -> Arc<Mutex<()>> {
     locks.lock().unwrap().entry(owner.to_string()).or_default().clone()
 }
 
-fn is_file(st: &rustix::fs::Stat) -> bool {
-    FileType::from_raw_mode(st.st_mode).is_file()
-}
-
 /// Reads at most `max` bytes of a regular file. Type and size come from the open file itself,
 /// so a file swapped for a link, a device or a pipe after any check is not read.
 fn read_open(f: fs::File, max: usize) -> Option<Vec<u8>> {
@@ -102,43 +93,21 @@ fn read_open(f: fs::File, max: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Opening never follows a link and never waits on a pipe.
-fn read_flags() -> OFlags {
-    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
-}
-
 /// A name of exactly `len` lowercase hex digits, as the store writes them.
 fn hex_name(name: &OsStr, len: usize) -> bool {
-    name.len() == len && name.as_bytes().iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// Opens a folder inside an open folder, refusing a link or anything that is not a folder.
-fn sub(dir: impl AsFd, name: &OsStr) -> Option<OwnedFd> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    rustix::fs::openat(dir, name, flags, Mode::empty()).ok()
-}
-
-/// Hands each name in an open folder, with the type the folder itself records for it, to `f`
-/// until it returns false.
-fn each_name(dir: impl AsFd, mut f: impl FnMut(&OsStr, rustix::fs::FileType) -> bool) {
-    let Ok(mut d) = rustix::fs::Dir::read_from(dir) else { return };
-    while let Some(Ok(e)) = d.read() {
-        if !f(OsStr::from_bytes(e.file_name().to_bytes()), e.file_type()) {
-            return;
-        }
-    }
+    name.len() == len && name.as_encoded_bytes().iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Hands each well-named chunk file in an owner's open chunks folder (`<2hex>/<2hex><62hex>`) to
 /// `f`, with the open folder it sits in, until `f` returns false. Each folder is opened from the
 /// one above it and never through a link, so a folder swapped for a link cannot lead outside.
-fn each_chunk(chunks: &OwnedFd, mut f: impl FnMut(&OwnedFd, &OsStr, rustix::fs::FileType) -> bool) {
+fn each_chunk(chunks: &Dir, mut f: impl FnMut(&Dir, &OsStr, Kind) -> bool) {
     let mut go = true;
-    each_name(chunks, |shard, _| {
-        let Some(dir) = hex_name(shard, 2).then(|| sub(chunks, shard)).flatten() else { return true };
-        each_name(&dir, |name, ft| {
-            if hex_name(name, 64) && name.as_bytes().starts_with(shard.as_bytes()) {
-                go = f(&dir, name, ft);
+    chunks.each_name(|shard, _| {
+        let Some(dir) = hex_name(shard, 2).then(|| chunks.sub(shard).ok()).flatten() else { return true };
+        dir.each_name(|name, kind| {
+            if hex_name(name, 64) && name.as_encoded_bytes().starts_with(shard.as_encoded_bytes()) {
+                go = f(&dir, name, kind);
             }
             go
         });
@@ -168,8 +137,7 @@ impl Store {
     pub fn new(root: PathBuf, min_free: u64) -> Self {
         if fs::create_dir_all(&root).is_ok() {
             // Through a handle that refuses a link, so a link swapped in cannot redirect the change.
-            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let _ = rustix::fs::open(&root, flags, Mode::empty()).and_then(|d| rustix::fs::fchmod(d, Mode::RWXU));
+            let _ = Dir::open(&root, false).and_then(|d| d.set_private());
         }
         Store {
             root,
@@ -187,20 +155,18 @@ impl Store {
 
     /// Opens a folder under the root one step at a time, never following a link, so a link
     /// planted (or swapped in after a check) anywhere below the root is refused, not followed.
-    fn open_dir(&self, dir: &Path, create: bool) -> io::Result<OwnedFd> {
+    fn open_dir(&self, dir: &Path, create: bool) -> io::Result<Dir> {
         let rel = dir.strip_prefix(&self.root).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        let mut fd = rustix::fs::open(&self.root, flags, Mode::empty())?;
+        let mut fd = Dir::open(&self.root, true)?;
         for c in rel.components() {
             let Component::Normal(name) = c else { return Err(io::ErrorKind::InvalidInput.into()) };
-            let flags = flags | OFlags::NOFOLLOW;
-            fd = match rustix::fs::openat(&fd, name, flags, Mode::empty()) {
-                Err(Errno::NOENT) if create => {
-                    match rustix::fs::mkdirat(&fd, name, Mode::RWXU) {
-                        Ok(()) | Err(Errno::EXIST) => {}
-                        Err(e) => return Err(e.into()),
+            fd = match fd.sub(name) {
+                Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
+                    match fd.make(name) {
+                        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+                        _ => {}
                     }
-                    rustix::fs::openat(&fd, name, flags, Mode::empty())?
+                    fd.sub(name)?
                 }
                 r => r?,
             };
@@ -208,13 +174,13 @@ impl Store {
         Ok(fd)
     }
 
-    fn read_at(dir: impl AsFd, name: &OsStr, max: usize) -> Option<Vec<u8>> {
-        read_open(fs::File::from(rustix::fs::openat(dir, name, read_flags(), Mode::empty()).ok()?), max)
+    fn read_at(dir: &Dir, name: &OsStr, max: usize) -> Option<Vec<u8>> {
+        read_open(dir.open_file(name).ok()?, max)
     }
 
     /// Reads a regular file of at most `max` bytes that sits in plain folders under the root.
     fn read_plain(&self, path: &Path, max: usize) -> Option<Vec<u8>> {
-        Self::read_at(self.open_dir(path.parent()?, false).ok()?, path.file_name()?, max)
+        Self::read_at(&self.open_dir(path.parent()?, false).ok()?, path.file_name()?, max)
     }
 
     /// Removes one stored file and returns what it counted; None if no regular file is there.
@@ -224,13 +190,14 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             r => r?,
         };
-        match rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) if is_file(&st) => {
-                rustix::fs::unlinkat(&dir, name, AtFlags::empty())?;
-                Ok(Some(cost(st.st_size as u64)))
+        match dir.stat(name, false) {
+            Ok(m) if m.kind == Kind::File => {
+                dir.remove_file(name)?;
+                Ok(Some(cost(m.size)))
             }
-            Ok(_) | Err(Errno::NOENT) => Ok(None),
-            Err(e) => Err(e.into()),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -311,8 +278,8 @@ impl Store {
         let dir = self
             .open_dir(path.parent().unwrap(), true)
             .map_err(|e| anyhow!("the store folder has been tampered with or cannot be opened ({e})"))?;
-        let old = match rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) if is_file(&st) => cost(st.st_size as u64),
+        let old = match dir.stat(name, false) {
+            Ok(m) if m.kind == Kind::File => cost(m.size),
             _ => 0,
         };
         let new = cost(data.len() as u64);
@@ -325,14 +292,13 @@ impl Store {
         }
         let mut tmp = name.to_os_string();
         tmp.push(format!(".tmp{}", rand::random::<u64>()));
-        let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         self.change(owner, || {
             let res = (|| -> io::Result<()> {
-                fs::File::from(rustix::fs::openat(&dir, &tmp, flags, Mode::RUSR | Mode::WUSR)?).write_all(data)?;
-                Ok(rustix::fs::renameat(&dir, &tmp, &dir, name)?)
+                dir.create_file(&tmp)?.write_all(data)?;
+                dir.rename(&tmp, &dir, name)
             })();
             if res.is_err() {
-                let _ = rustix::fs::unlinkat(&dir, &tmp, AtFlags::empty());
+                let _ = dir.remove_file(&tmp);
             }
             let delta = if res.is_ok() { new as i64 - old as i64 } else { 0 };
             (res, delta)
@@ -385,17 +351,16 @@ impl Store {
     pub fn scrub(&self) -> (u64, u64) {
         let (mut checked, mut bad) = (0, 0);
         let Ok(root) = self.open_dir(&self.root, false) else { return (0, 0) };
-        each_name(&root, |owner, _| {
+        root.each_name(|owner, _| {
             let ok = owner.to_str().is_some_and(|o| check_owner(o).is_ok());
-            let Some(chunks) = ok.then(|| sub(&root, owner)).flatten().and_then(|d| sub(d, "chunks".as_ref())) else {
-                return true;
-            };
+            let chunks = ok.then(|| root.sub(owner).ok()).flatten().and_then(|d| d.sub("chunks".as_ref()).ok());
+            let Some(chunks) = chunks else { return true };
             each_chunk(&chunks, |dir, name, _| {
                 let Some(buf) = Self::read_at(dir, name, MAX_FILE) else { return true };
                 checked += 1;
                 if !Self::intact(&buf) {
                     bad += 1;
-                    let _ = rustix::fs::unlinkat(dir, name, AtFlags::empty());
+                    let _ = dir.remove_file(name);
                 }
                 true
             });
@@ -418,19 +383,16 @@ impl Store {
         let dir = self.root.join(owner).join("chunks");
         let Some(chunks) = check_owner(owner).ok().and_then(|_| self.open_dir(&dir, false).ok()) else { return };
         let (mut batch, mut total, mut go) = (Vec::with_capacity(ID_BATCH), 0u64, true);
-        each_chunk(&chunks, |dir, name, ft| {
+        each_chunk(&chunks, |dir, name, kind| {
             // The folder says what each entry is, so a listing reads only folders: a stat per
             // chunk would make a large listing from a slow disk crawl. Damaged or empty files are
             // what scrub and verify are for.
-            use rustix::fs::FileType;
-            let file = match ft {
-                FileType::RegularFile => true,
-                FileType::Unknown => {
-                    rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| is_file(&st))
-                }
+            let file = match kind {
+                Kind::File => true,
+                Kind::Unknown => dir.stat(name, false).is_ok_and(|m| m.kind == Kind::File),
                 _ => false,
             };
-            let Some(id) = file.then(|| hex::decode(name.as_bytes()).ok()?.try_into().ok()).flatten() else {
+            let Some(id) = file.then(|| hex::decode(name.as_encoded_bytes()).ok()?.try_into().ok()).flatten() else {
                 return true;
             };
             batch.push(id);

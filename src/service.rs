@@ -78,7 +78,7 @@ pub fn restart(home: &Path) -> bool {
         return false;
     }
     let done = if cfg!(target_os = "macos") {
-        let target = format!("gui/{}/{LABEL}", rustix::process::getuid().as_raw());
+        let target = format!("gui/{}/{LABEL}", crate::os::uid());
         Command::new("launchctl").args(["kickstart", "-k", &target]).output()
     } else {
         Command::new("systemctl").args(["--user", "restart", UNIT]).output()

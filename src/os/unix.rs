@@ -43,3 +43,11 @@ pub fn stop_signal() -> io::Result<impl Future<Output = ()>> {
 }
 
 pub mod control;
+
+mod files;
+pub use files::*;
+
+/// This user's number, as launchd names its services.
+pub fn uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}

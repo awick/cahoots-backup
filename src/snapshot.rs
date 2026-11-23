@@ -4,7 +4,7 @@
 use crate::crypto::Id;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf};
+use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum Kind {
@@ -26,7 +26,7 @@ pub struct Entry {
 
 impl Entry {
     pub fn path(&self) -> PathBuf {
-        PathBuf::from(OsStr::from_bytes(&self.path))
+        crate::os::bytes_path(&self.path)
     }
 
     pub fn show(&self) -> String {

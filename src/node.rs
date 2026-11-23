@@ -482,17 +482,14 @@ fn dialable(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
 /// A drive's marker. Neither the folder nor the marker is opened through a link, a pipe cannot
 /// block the open, and type and size come from the open file, so only a small regular file is read.
 fn read_mark(dir: &Path) -> Option<String> {
-    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
     use std::io::Read;
-    let d = open(dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()).ok()?;
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let fd = openat(&d, "sdb-drive-id", flags, Mode::empty()).ok()?;
-    let st = fstat(&fd).ok()?;
-    if !FileType::from_raw_mode(st.st_mode).is_file() || st.st_size > 128 {
+    let f = crate::os::Dir::open(dir, false).ok()?.open_file("sdb-drive-id".as_ref()).ok()?;
+    let md = f.metadata().ok()?;
+    if !md.is_file() || md.len() > 128 {
         return None;
     }
     let mut s = String::new();
-    fs::File::from(fd).take(128).read_to_string(&mut s).ok()?;
+    f.take(128).read_to_string(&mut s).ok()?;
     Some(s)
 }
 
