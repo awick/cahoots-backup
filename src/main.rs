@@ -473,11 +473,11 @@ async fn daemon(home: PathBuf) -> Result<()> {
         _ = node.quit.notified() => {
             // Out of reach first, so no new command arrives at a daemon on its way out; then
             // a moment for the answer to the one that stopped it.
-            let _ = fs::remove_file(control::sock_path(&home));
+            control::unlisten(&home);
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
-    let _ = fs::remove_file(control::sock_path(&home));
+    control::unlisten(&home);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), router.shutdown()).await;
     Ok(())
 }
@@ -514,7 +514,7 @@ async fn gone(home: &std::path::Path) {
 
 /// Connects to the daemon, starting it if it is not running and replacing it
 /// if it was started from an older build than this client.
-async fn daemon_stream(home: &std::path::Path) -> Result<tokio::net::UnixStream> {
+async fn daemon_stream(home: &std::path::Path) -> Result<control::Stream> {
     Config::load(home)?;
     for _ in 0..2 {
         if let Some(s) = control::connect(home).await {
