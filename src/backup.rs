@@ -741,7 +741,10 @@ pub async fn run(
     for s in &sets {
         let prefix = if label { format!("[{}] ", s.name) } else { String::new() };
         node.set_running(&s.name, Some("checking files".into()));
-        let res = run_set(node, tag.clone(), s, only, &prefix, out).await;
+        let res = match check_roots(node, &cfg, s).await {
+            Ok(()) => run_set(node, tag.clone(), s, only, &prefix, out).await,
+            Err(e) => Err(e),
+        };
         node.set_running(&s.name, None);
         if let Err(e) = res {
             node.note(format!("{prefix}backup failed: {e:#}"));
@@ -754,6 +757,32 @@ pub async fn run(
         Some(_) => bail!("not every set could be backed up"),
         None => Ok(()),
     }
+}
+
+/// A folder that is not there, or cannot be read at all, is not backed up as an empty one:
+/// with its disk unplugged, or on a new computer set up from the recovery kit, that would
+/// make the newest restore point one with nothing in it. The set waits instead.
+async fn check_roots(node: &Arc<Node>, cfg: &Config, set: &BackupSet) -> Result<()> {
+    let (ex, roots) = (Excludes::new(cfg, set, &node.home)?, set.paths.clone());
+    let looked = tokio::task::spawn_blocking(move || {
+        for root in roots.iter().filter(|r| !ex.is_excluded(r)) {
+            // A root that is itself a link to nothing is recorded as that link.
+            let seen = fs::symlink_metadata(root).and_then(|md| match fs::metadata(root) {
+                Ok(to) if to.is_dir() => fs::read_dir(root)?.next().transpose().map(|_| ()),
+                Err(e) if !md.is_symlink() => Err(e),
+                _ => Ok(()),
+            });
+            if let Err(e) = seen {
+                bail!(
+                    "{0} is missing or cannot be read ({e}). Nothing was backed up, so that its files are not \
+                     recorded as deleted. If it is gone for good, run `cahoots rm {0}`",
+                    root.display()
+                );
+            }
+        }
+        Ok(())
+    });
+    looked.await?
 }
 
 async fn run_set(
