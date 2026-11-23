@@ -374,6 +374,8 @@ mod tests {
         assert!(!dir.join(".aaaaaaaa-1.sdb-tmp").exists(), "a stale half-written file is cleared");
         assert!(dir.join(".bbbbbbbb-2.sdb-tmp").exists(), "a fresh one is left alone");
         assert!(dir.join("kept.txt").exists(), "nothing else is touched");
+        // Windows keeps a folder that is open where it is.
+        drop(top);
         fs::remove_dir_all(dir).unwrap();
     }
 
