@@ -2530,6 +2530,16 @@ impl eframe::App for Gui {
     }
 }
 
+/// Says what went wrong in a box of its own, for a program with no console to say it in.
+#[cfg(feature = "windowed")]
+pub fn alert(text: &str) {
+    rfd::MessageDialog::new()
+        .set_title("Cahoots Backup")
+        .set_description(text)
+        .set_level(rfd::MessageLevel::Error)
+        .show();
+}
+
 pub fn run(home: PathBuf) -> anyhow::Result<()> {
     // For development: CAHOOTS_GUI_TALL makes the window tall enough to picture a long page whole.
     let height = if cfg!(debug_assertions) && crate::config::env("GUI_TALL").is_some() { 1500.0 } else { 700.0 };

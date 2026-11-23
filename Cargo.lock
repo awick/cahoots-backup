@@ -515,6 +515,7 @@ dependencies = [
  "url",
  "walkdir",
  "winapi-util",
+ "windows-registry",
  "zstd",
 ]
 

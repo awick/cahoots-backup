@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use std::fs;
 use std::{
-    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -18,6 +19,7 @@ fn home_dir() -> PathBuf {
     crate::os::user_home().expect("HOME is not set")
 }
 
+#[cfg(not(windows))]
 fn unit_path() -> PathBuf {
     if cfg!(target_os = "macos") {
         home_dir().join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
@@ -41,6 +43,7 @@ pub fn outdated() -> bool {
 }
 
 /// Takes the service from before the rename out of the way.
+#[cfg(not(windows))]
 fn remove_old() {
     let path = old_unit_path();
     if !path.exists() {
@@ -57,7 +60,37 @@ fn remove_old() {
 
 /// Whether the start-at-login service file is in place.
 pub fn installed() -> bool {
+    #[cfg(windows)]
+    return run_key().is_some_and(|k| k.get_string(RUN_NAME).is_ok());
+    #[cfg(not(windows))]
     unit_path().exists()
+}
+
+/// Where Windows keeps what it starts when this user logs in.
+#[cfg(windows)]
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const RUN_NAME: &str = "Cahoots Backup";
+
+#[cfg(windows)]
+fn run_key() -> Option<windows_registry::Key> {
+    windows_registry::CURRENT_USER.create(RUN_KEY).ok()
+}
+
+/// On Windows the daemon is started at login by an entry among this user's own settings. It
+/// names the windowed program when that is beside this one, as it opens no console.
+#[cfg(windows)]
+fn install_windows() -> Result<()> {
+    let exe = crate::os::program()?;
+    let quiet = exe.with_file_name("cahootsw.exe");
+    let starts = if quiet.is_file() { quiet } else { exe };
+    let key = run_key().ok_or_else(|| anyhow::anyhow!("cannot open this user's login settings"))?;
+    key.set_string(RUN_NAME, format!("\"{}\" daemon", starts.display()))?;
+    println!("Windows will start {} when you log in.", starts.display());
+    if starts.file_name().is_some_and(|n| n != "cahootsw.exe") {
+        println!("It opens a console window, as cahootsw.exe is not beside it.");
+    }
+    Ok(())
 }
 
 /// Whether this cahoots runs inside a container, where the container is what starts the
@@ -74,7 +107,8 @@ pub fn in_container() -> bool {
 /// own, over and over. False when there is no service or it looks after another home (it
 /// always runs the default one); the caller then starts the daemon itself.
 pub fn restart(home: &Path) -> bool {
-    if !installed() || home != crate::config::default_home() {
+    // Windows only starts it at login; there is nothing to ask to start it now.
+    if cfg!(windows) || !installed() || home != crate::config::default_home() {
         return false;
     }
     let done = if cfg!(target_os = "macos") {
@@ -86,11 +120,20 @@ pub fn restart(home: &Path) -> bool {
     done.is_ok_and(|o| o.status.success())
 }
 
+#[cfg(not(windows))]
 fn xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 pub fn install() -> Result<()> {
+    #[cfg(windows)]
+    return install_windows();
+    #[cfg(not(windows))]
+    install_unix()
+}
+
+#[cfg(not(windows))]
+fn install_unix() -> Result<()> {
     let exe = std::env::current_exe()?;
     let path = unit_path();
     remove_old();
@@ -155,6 +198,23 @@ pub fn install() -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
+    #[cfg(windows)]
+    return uninstall_windows();
+    #[cfg(not(windows))]
+    uninstall_unix()
+}
+
+#[cfg(windows)]
+fn uninstall_windows() -> Result<()> {
+    if let Some(key) = run_key() {
+        let _ = key.remove_value(RUN_NAME);
+    }
+    println!("Windows no longer starts cahoots when you log in.");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn uninstall_unix() -> Result<()> {
     remove_old();
     let path = unit_path();
     if cfg!(target_os = "macos") {

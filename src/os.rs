@@ -14,6 +14,20 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// The `cahoots` command's own file: this program, or the one beside it when this is the
+/// windowed program Windows has for the window. Both then name the same program, so a daemon
+/// either of them starts is the same daemon.
+pub fn program() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if exe.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("cahootsw")) {
+        let beside = exe.with_file_name(format!("cahoots{}", std::env::consts::EXE_SUFFIX));
+        if beside.is_file() {
+            return Ok(beside);
+        }
+    }
+    Ok(exe)
+}
+
 const HOME: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
 
 /// The user's own folder (`~`).

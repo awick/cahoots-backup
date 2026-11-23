@@ -12,6 +12,7 @@ rustix = { version = "1.1.6", features = ["fs", "process", "system"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1.11"
+windows-registry = "0.6.1"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -54,6 +55,14 @@ path = "src/lib.rs"
 name = "cahoots"
 path = "src/main.rs"
 
+# Windows only, built with `--features windowed`: the same program without a console, for
+# the window and for starting at login. A console program started from the desktop gets a
+# black console window of its own.
+[[bin]]
+name = "cahootsw"
+path = "src/cahootsw.rs"
+required-features = ["windowed"]
+
 [profile.release]
 opt-level = 3
 strip = true
@@ -70,3 +79,4 @@ codegen-units = 1
 default = ["gui"]
 # The graphical interface (`cahoots gui`). Build with --no-default-features to leave it out.
 gui = ["dep:eframe", "dep:rfd"]
+windowed = ["gui"]

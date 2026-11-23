@@ -19,7 +19,7 @@ const DONE: char = '\u{1}';
 /// Identifies a build by its executable's size and modification time, so a client can
 /// tell when the running daemon is older than itself.
 pub fn fingerprint() -> String {
-    std::env::current_exe()
+    crate::os::program()
         .and_then(std::fs::metadata)
         .map(|m| {
             let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());

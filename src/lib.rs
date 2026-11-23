@@ -494,7 +494,7 @@ fn spawn_daemon(home: &std::path::Path) -> Result<()> {
         return Ok(());
     }
     let log = fs::OpenOptions::new().create(true).append(true).open(home.join("daemon.log"))?;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    let mut cmd = std::process::Command::new(os::program()?);
     cmd.arg("daemon").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     os::detached(&mut cmd).spawn().context("cannot start the cahoots daemon")?;
     Ok(())
@@ -574,11 +574,30 @@ async fn tui_main(home: PathBuf) -> Result<()> {
     tui::run(home).await
 }
 
+fn main_with(cli: Cli) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().context("cannot start the runtime")?;
+    rt.block_on(real_main(cli))
+}
+
 /// The `cahoots` command.
 pub fn cli() {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("cannot start the runtime");
-    if let Err(e) = rt.block_on(real_main(Cli::parse())) {
+    if let Err(e) = main_with(Cli::parse()) {
         eprintln!("cahoots: {}", node::clean(&format!("{e:#}")));
+        std::process::exit(1);
+    }
+}
+
+/// The windowed program Windows has beside `cahoots`: the window when started bare, as from
+/// the Start menu, and otherwise the same commands with no console to print to (`daemon`,
+/// when starting at login).
+#[cfg(feature = "windowed")]
+pub fn windowed() {
+    let mut args: Vec<_> = std::env::args_os().collect();
+    if args.len() < 2 {
+        args.push("gui".into());
+    }
+    if let Err(e) = main_with(Cli::parse_from(args)) {
+        gui::alert(&node::clean(&format!("{e:#}")));
         std::process::exit(1);
     }
 }
