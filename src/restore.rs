@@ -10,20 +10,82 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs,
     io::{Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
 };
 
+/// Where an entry lands.
+struct Place {
+    /// The drive it goes back to, when restoring a Windows file in place on Windows.
+    drive: Option<u8>,
+    /// Its path below the restore folder, or below that drive.
+    path: PathBuf,
+    /// Whether its own name had to be changed for this system to keep it.
+    renamed: bool,
+}
+
+/// The drive a stored name stands for: a Windows path is recorded starting with `C:`.
+fn drive(name: &[u8]) -> Option<u8> {
+    (name.len() == 2 && name[1] == b':' && name[0].is_ascii_alphabetic()).then(|| name[0].to_ascii_uppercase())
+}
+
 /// Where an entry lands below the restore folder: under the name of the folder that was
 /// backed up (`~/Documents/a.txt` gives `Documents/a.txt`), or at its full original path
-/// when restoring in place or when two backed up folders share a name.
-fn rel(e: &Entry, roots: &[PathBuf]) -> PathBuf {
-    let p = e.path();
-    let base = roots.iter().find(|r| p.starts_with(r)).and_then(|r| r.parent());
-    p.strip_prefix(base.unwrap_or(Path::new("/"))).unwrap_or(&p).to_path_buf()
+/// when restoring in place or when two backed up folders share a name. A recorded path is
+/// names with `/` between them whatever system wrote it, so it is taken apart here and never
+/// by this system's own rules. None for one that tries to step out of the restore folder.
+fn rel(e: &Entry, roots: &[&[u8]], to_drives: bool) -> Option<Place> {
+    let p = &e.path[..];
+    let below = |r: &&[u8]| p == *r || (p.len() > r.len() && p.starts_with(r) && p[r.len()] == b'/');
+    let base = roots.iter().find(|r| below(r)).map_or(0, |r| r.iter().rposition(|b| *b == b'/').unwrap_or(0));
+    let mut place = Place { drive: None, path: PathBuf::new(), renamed: false };
+    let names = p[base..].split(|b| *b == b'/').filter(|n| !n.is_empty() && *n != b".");
+    for (i, name) in names.enumerate() {
+        if name == b".." {
+            return None;
+        }
+        place.renamed = false;
+        match drive(name).filter(|_| i == 0 && base == 0) {
+            Some(d) if to_drives => place.drive = Some(d),
+            // Anywhere else a drive becomes a folder named by its letter.
+            Some(d) => place.path.push((d as char).to_string()),
+            None => {
+                let (name, changed) = os::name(name);
+                place.path.push(name);
+                place.renamed = changed;
+            }
+        }
+    }
+    Some(place)
+}
+
+/// On a system where `A` and `a` are one name, a second file of a name would replace the
+/// first: it gets a number instead. `taken` holds what this restore has put where.
+fn free_name(
+    taken: &mut HashSet<(Option<u8>, String)>,
+    drive: Option<u8>,
+    parent: &Path,
+    name: &OsStr,
+) -> (OsString, bool) {
+    let mut free = name.to_os_string();
+    if !os::CASELESS {
+        return (free, false);
+    }
+    let (stem, ext) = (Path::new(name).file_stem().unwrap_or(name), Path::new(name).extension());
+    let mut n = 1;
+    while !taken.insert((drive, parent.join(&free).to_string_lossy().to_lowercase())) {
+        n += 1;
+        free = stem.to_os_string();
+        free.push(format!(" ({n})"));
+        if let Some(ext) = ext {
+            free.push(".");
+            free.push(ext);
+        }
+    }
+    (free, n > 1)
 }
 
 /// Folders this restore made, by device and inode, so only those get the recorded owner and
@@ -163,16 +225,33 @@ pub async fn run(
     roots: &[String],
     out: &Out,
 ) -> Result<()> {
-    let mut roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-    let names: std::collections::HashSet<_> = roots.iter().map(|r| r.file_name().map(|n| n.to_owned())).collect();
-    if to == Path::new("/") || names.len() != roots.len() {
+    // How the caller asks for every entry to go back to its full original path.
+    let in_place = to == Path::new("/");
+    let mut roots: Vec<&[u8]> = roots.iter().map(|r| r.trim_end_matches('/').as_bytes()).collect();
+    let names: HashSet<&[u8]> = roots.iter().map(|r| r.rsplit(|b| *b == b'/').next().unwrap_or(r)).collect();
+    if in_place || names.len() != roots.len() {
         roots.clear();
     }
-    let roots = &roots[..];
+    // In place, a Windows file goes back to its own drive, where this system has drives.
+    let to_drives = in_place && os::drive_root(b'C').is_some();
+    let places: Vec<Option<Place>> = entries.iter().map(|e| rel(e, &roots, to_drives)).collect();
     let root = os::is_root();
     // `to` is the folder the user chose, so links in it and its parents are followed on purpose.
     fs::create_dir_all(to).with_context(|| to.display().to_string())?;
-    let top = Dir::open(to, true).with_context(|| to.display().to_string())?;
+    let (all_to, all_top) = (to, Dir::open(to, true).with_context(|| to.display().to_string())?);
+    let mut drives: HashMap<u8, Option<(PathBuf, Dir)>> = HashMap::new();
+    for d in places.iter().flatten().filter_map(|p| p.drive) {
+        drives.entry(d).or_insert_with(|| {
+            let root = os::drive_root(d)?;
+            Dir::open(&root, true).ok().map(|dir| (root, dir))
+        });
+    }
+    let base = |drive: Option<u8>| -> Option<(&Path, &Dir)> {
+        match drive {
+            None => Some((all_to, &all_top)),
+            Some(d) => drives.get(&d)?.as_ref().map(|(root, dir)| (root.as_path(), dir)),
+        }
+    };
     let (mut files, mut bytes, mut skipped) = (0u64, 0u64, 0u64);
     let mut told = std::time::Instant::now();
     // A hole the backup skipped is stored as this chunk; it is skipped again here rather
@@ -181,57 +260,79 @@ pub async fn run(
     // Names this restore's half-written files apart from any other restore's.
     let (run_tag, mut tmp_count) = (format!("{:08x}", rand::random::<u32>()), 0u64);
     // Folders that could not be opened; everything below them is skipped.
-    let mut blocked: Vec<PathBuf> = Vec::new();
+    let mut blocked: HashMap<Option<u8>, Vec<PathBuf>> = HashMap::new();
     // The folder most recently written into, kept open for the files that follow in it.
-    let mut held: Option<(PathBuf, Dir)> = None;
+    let mut held: Option<(Option<u8>, PathBuf, Dir)> = None;
     let mut made = Made::new();
-    for e in &entries {
-        let path = rel(e, roots);
-        if blocked.iter().any(|b| path.starts_with(b)) {
+    let mut taken = HashSet::new();
+    for (e, place) in entries.iter().zip(&places) {
+        let Some(place) = place else {
+            out.say(format!("  skipped {}: unsafe path", e.show()));
+            skipped += 1;
+            continue;
+        };
+        let Some((to, top)) = base(place.drive) else {
+            out.say(format!("  skipped {}: its drive cannot be opened", e.show()));
+            skipped += 1;
+            continue;
+        };
+        let blocked = blocked.entry(place.drive).or_default();
+        if blocked.iter().any(|b| place.path.starts_with(b)) {
             skipped += 1;
             continue;
         }
         if e.kind == Kind::Dir {
-            if let Err((at, err)) = open_dir(&top, &path, Some(&mut made)) {
-                skip(out, to, &at, &err, Some(&mut blocked));
-                skipped += 1;
+            match open_dir(top, &place.path, Some(&mut made)) {
+                Ok(_) if place.renamed => {
+                    out.say(format!("  {} was restored as {}", e.show(), to.join(&place.path).display()))
+                }
+                Ok(_) => {}
+                Err((at, err)) => {
+                    skip(out, to, &at, &err, Some(blocked));
+                    skipped += 1;
+                }
             }
             continue;
         }
-        let (parent, name) = match (path.parent(), path.file_name()) {
+        let (parent, name) = match (place.path.parent(), place.path.file_name()) {
             (Some(p), Some(n)) => (p, n),
             _ => {
-                skip(out, to, &path, &anyhow!("unsafe path"), None);
+                skip(out, to, &place.path, &anyhow!("unsafe path"), None);
                 skipped += 1;
                 continue;
             }
         };
-        if held.as_ref().is_none_or(|(p, _)| p != parent) {
+        let (name, numbered) = free_name(&mut taken, place.drive, parent, name);
+        let (path, name) = (parent.join(&name), name.as_os_str());
+        let renamed =
+            (place.renamed || numbered).then(|| format!("  {} was restored as {}", e.show(), to.join(&path).display()));
+        if held.as_ref().is_none_or(|(d, p, _)| *d != place.drive || p != parent) {
             held = None;
-            match open_dir(&top, parent, Some(&mut made)) {
+            match open_dir(top, parent, Some(&mut made)) {
                 Ok(fd) => {
                     // A folder that was already there may hold what a restore that died left.
                     if !id(&fd).is_some_and(|i| made.contains(&i)) {
                         sweep(&fd);
                     }
-                    held = Some((parent.to_path_buf(), fd));
+                    held = Some((place.drive, parent.to_path_buf(), fd));
                 }
                 Err((at, err)) => {
-                    skip(out, to, &at, &err, Some(&mut blocked));
+                    skip(out, to, &at, &err, Some(blocked));
                     skipped += 1;
                     continue;
                 }
             }
         }
-        let dir = &held.as_ref().unwrap().1;
+        let dir = &held.as_ref().unwrap().2;
         match &e.kind {
             Kind::Dir => {}
-            Kind::Symlink(target) => {
-                if let Err(err) = place_link(dir, name, target, e, root) {
+            Kind::Symlink(target) => match place_link(dir, name, target, e, root) {
+                Ok(()) => renamed.into_iter().for_each(|line| out.say(line)),
+                Err(err) => {
                     skip(out, to, &path, &err, None);
                     skipped += 1;
                 }
-            }
+            },
             Kind::File { chunks, size } => {
                 let mut written = 0u64;
                 // Each restore writes under a name of its own: one still running in the daemon after
@@ -300,19 +401,21 @@ pub async fn run(
                 }
                 unfinished.dir = None;
                 files += 1;
+                renamed.into_iter().for_each(|line| out.say(line));
             }
         }
     }
     drop(held);
-    for e in entries.iter().rev().filter(|e| e.kind == Kind::Dir) {
+    for (e, place) in entries.iter().zip(&places).rev().filter(|(e, _)| e.kind == Kind::Dir) {
+        let Some((place, (_, top))) = place.as_ref().and_then(|p| Some((p, base(p.drive)?))) else { continue };
         // Re-opened by name, so checked to be the very folder made earlier.
-        match open_dir(&top, &rel(e, roots), None) {
+        match open_dir(top, &place.path, None) {
             Ok(fd) if id(&fd).is_some_and(|i| made.contains(&i)) => fd.finish(&recorded(e), root),
             Ok(fd) => fd.finish_existing(&recorded(e), root),
             Err(_) => {}
         }
     }
-    out.say(format!("restored {files} files ({}) into {}", human(bytes), to.display()));
+    out.say(format!("restored {files} files ({}) into {}", human(bytes), all_to.display()));
     if skipped > 0 {
         bail!("{skipped} entries could not be restored (listed above), so the restore is incomplete");
     }
@@ -324,6 +427,46 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    fn entry(path: &str) -> Entry {
+        Entry { path: path.as_bytes().to_vec(), mode: 0o100644, uid: 0, gid: 0, mtime: 0, ino: 0, kind: Kind::Dir }
+    }
+
+    #[test]
+    fn a_recorded_path_lands_the_same_way_on_every_system() {
+        let at = |path: &str, roots: &[&str], to_drives: bool| {
+            let roots: Vec<&[u8]> = roots.iter().map(|r| r.as_bytes()).collect();
+            rel(&entry(path), &roots, to_drives).map(|p| (p.drive, p.path.to_string_lossy().replace('\\', "/")))
+        };
+        let plain = |path: &str| Some((None, path.to_string()));
+        assert_eq!(at("/Users/me/Documents/a.txt", &["/Users/me/Documents"], false), plain("Documents/a.txt"));
+        assert_eq!(at("/Users/me/Documents", &["/Users/me/Documents"], false), plain("Documents"));
+        assert_eq!(at("/Users/me/Documents2/a", &["/Users/me/Documents"], false), plain("Users/me/Documents2/a"));
+        assert_eq!(at("/Users/me//Documents/./a.txt", &[], false), plain("Users/me/Documents/a.txt"));
+        assert_eq!(at("/etc/hosts", &[""], false), plain("etc/hosts"));
+        assert_eq!(at("/a/../b", &[], false), None);
+        // A Windows path: under its folder's name, or with its drive as a folder or as the drive.
+        assert_eq!(at("C:/Users/me/Documents/a.txt", &["C:/Users/me/Documents"], false), plain("Documents/a.txt"));
+        assert_eq!(at("D:/photos/a.jpg", &["D:"], false), plain("D/photos/a.jpg"));
+        assert_eq!(at("C:/Users/me/a.txt", &[], false), plain("C/Users/me/a.txt"));
+        assert_eq!(at("c:/Users/me/a.txt", &[], true), Some((Some(b'C'), "Users/me/a.txt".to_string())));
+    }
+
+    #[test]
+    fn a_second_file_of_a_name_gets_a_number_where_case_does_not_count() {
+        let mut taken = HashSet::new();
+        let mut name =
+            |n: &str| free_name(&mut taken, None, Path::new("d"), n.as_ref()).0.to_string_lossy().into_owned();
+        assert_eq!(name("Readme.txt"), "Readme.txt");
+        assert_eq!(name("other"), "other");
+        if os::CASELESS {
+            assert_eq!(name("README.TXT"), "README (2).TXT");
+            assert_eq!(name("readme.txt"), "readme (3).txt");
+            assert_eq!(name("OTHER"), "OTHER (2)");
+        } else {
+            assert_eq!(name("README.TXT"), "README.TXT");
+        }
+    }
 
     fn top(dir: &Path) -> Dir {
         fs::create_dir_all(dir).unwrap();

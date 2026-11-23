@@ -23,6 +23,9 @@ pub fn env_text(name: &str) -> Option<String> {
 /// Where a node keeps itself unless told otherwise: ~/.cahoots, or the folder an install
 /// from before the rename already lives in.
 pub fn default_home() -> PathBuf {
+    if let Some(dir) = crate::os::app_data() {
+        return dir.join("Cahoots");
+    }
     let user = crate::os::user_home().expect("HOME is not set");
     let (new, old) = (user.join(".cahoots"), user.join(".super-duper-backup"));
     if !new.exists() && old.join("identity.key").exists() { old } else { new }

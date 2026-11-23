@@ -47,6 +47,11 @@ pub mod control;
 mod files;
 pub use files::*;
 
+/// Where programs keep what belongs to this user, on a system that has such a place.
+pub fn app_data() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// This user's number, as launchd names its services.
 pub fn uid() -> u32 {
     rustix::process::getuid().as_raw()

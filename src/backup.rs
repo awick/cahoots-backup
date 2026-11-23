@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow, bail};
 use fastcdc::v2020::{FastCDC, StreamCDC};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
@@ -76,7 +76,9 @@ impl Excludes {
         let mut b = GlobSetBuilder::new();
         let list = cfg.list_for(set);
         for p in list.patterns.iter().map(String::as_str).chain([crate::config::ALWAYS_EXCLUDED]) {
-            b.add(Glob::new(p).map_err(|e| anyhow!("bad exclude pattern {p}: {e}"))?);
+            // Windows takes `A` and `a` for one name, so a pattern does too.
+            let glob = GlobBuilder::new(p).case_insensitive(cfg!(windows)).build();
+            b.add(glob.map_err(|e| anyhow!("bad exclude pattern {p}: {e}"))?);
         }
         let mut dirs = vec![home.to_path_buf(), cfg.store_dir(home)];
         dirs.extend(set.skip.iter().cloned());
@@ -1001,7 +1003,7 @@ async fn run_once(
         time: clock.timestamp(),
         nanos: clock.timestamp_subsec_nanos(),
         host: cfg.name.clone(),
-        roots: set.paths.iter().map(|p| p.display().to_string()).collect(),
+        roots: set.paths.iter().map(|p| String::from_utf8_lossy(&os::path_bytes(p)).into_owned()).collect(),
         index: scan.index.clone(),
         files: scan.files,
         bytes: scan.bytes,

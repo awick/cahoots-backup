@@ -45,3 +45,8 @@ pub use files::*;
 pub fn uid() -> u32 {
     0
 }
+
+/// Where programs keep what belongs to this user on this computer.
+pub fn app_data() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
+}

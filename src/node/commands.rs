@@ -842,8 +842,11 @@ impl Node {
         // A bare name such as node_modules means that name anywhere, when adding and
         // when removing alike; removing also takes the pattern exactly as listed.
         let typed = pattern.trim().to_string();
-        let pattern =
-            if typed.starts_with('/') || typed.starts_with("**/") { typed.clone() } else { format!("**/{typed}") };
+        let pattern = if typed.starts_with('/') || typed.starts_with("**/") || Path::new(&typed).is_absolute() {
+            typed.clone()
+        } else {
+            format!("**/{typed}")
+        };
         if typed.is_empty() || pattern == "**/" {
             bail!("the pattern is empty");
         }

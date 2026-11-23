@@ -258,3 +258,16 @@ pub fn path_bytes(p: &Path) -> Vec<u8> {
 pub fn bytes_path(b: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(b))
 }
+
+/// Whether `A` and `a` are one name here. Not asked of each disk: a restore treats them as two.
+pub const CASELESS: bool = false;
+
+/// A recorded name as this system keeps it, and whether it had to be changed.
+pub fn name(n: &[u8]) -> (OsString, bool) {
+    (OsStr::from_bytes(n).to_os_string(), false)
+}
+
+/// Where a Windows drive is. Nowhere, on this system.
+pub fn drive_root(_letter: u8) -> Option<PathBuf> {
+    None
+}

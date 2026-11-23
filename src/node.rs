@@ -1728,14 +1728,14 @@ impl Node {
         out: &Out,
     ) -> Result<Vec<(String, i64, Option<(u64, i64)>, Vec<String>)>> {
         let snaps = self.snapshots_from(from, out).await?;
+        let want = crate::os::path_bytes(Path::new(path));
         let mut last: Option<Option<u64>> = None;
         let mut list = vec![];
         for s in &snaps {
-            let cur =
-                self.load_index(s).await?.into_iter().find(|e| e.path == path.as_bytes()).and_then(|e| match &e.kind {
-                    Kind::File { size, chunks } => Some((sig(chunks, *size), *size, e.mtime)),
-                    _ => None,
-                });
+            let cur = self.load_index(s).await?.into_iter().find(|e| e.path == want).and_then(|e| match &e.kind {
+                Kind::File { size, chunks } => Some((sig(chunks, *size), *size, e.mtime)),
+                _ => None,
+            });
             let key = cur.map(|c| c.0);
             if last == Some(key) || (last.is_none() && key.is_none()) {
                 continue;

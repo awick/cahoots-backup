@@ -17,6 +17,8 @@ use std::{
 // Windows' own numbers for these.
 const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+/// Kept by a cloud service such as OneDrive and not on this disk: reading it would fetch it.
+const FILE_ATTRIBUTE_AWAY: u32 = 0x1000 | 0x4_0000 | 0x40_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_READ_ATTRIBUTES: u32 = 0x80;
@@ -40,7 +42,7 @@ fn info(f: &fs::File) -> io::Result<Meta> {
     // A link or junction stands for another name; any other reparse point is left alone.
     let kind = if md.file_type().is_symlink() {
         Kind::Link
-    } else if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    } else if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 || (md.is_file() && attrs & FILE_ATTRIBUTE_AWAY != 0) {
         Kind::Other
     } else if md.is_dir() {
         Kind::Dir
@@ -197,7 +199,22 @@ impl Dir {
     }
 
     pub fn rename(&self, from: &OsStr, to: &Dir, name: &OsStr) -> io::Result<()> {
-        fs::rename(self.child(from)?, to.child(name)?)
+        let (from, to) = (self.child(from)?, to.child(name)?);
+        match fs::rename(&from, &to) {
+            // Windows will not replace a read-only file, as the others do: it is made writable
+            // first. Only a plain file, never what a link there points at.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                let md = fs::symlink_metadata(&to)?;
+                if !md.is_file() || !md.permissions().readonly() {
+                    return Err(e);
+                }
+                let mut open = md.permissions();
+                open.set_readonly(false);
+                look(&to, false, FILE_WRITE_ATTRIBUTES)?.set_permissions(open)?;
+                fs::rename(&from, &to)
+            }
+            done => done,
+        }
     }
 
     pub fn remove_file(&self, name: &OsStr) -> io::Result<()> {
@@ -208,8 +225,15 @@ impl Dir {
         fs::remove_dir(self.child(name)?)
     }
 
-    pub fn symlink(&self, _name: &OsStr, _target: &[u8]) -> io::Result<()> {
-        not_yet()
+    /// Makes a link. Windows wants to know whether it points at a folder, and allows it at
+    /// all only to an administrator or with Developer Mode on.
+    pub fn symlink(&self, name: &OsStr, target: &[u8]) -> io::Result<()> {
+        let (link, target) = (self.child(name)?, bytes_path(target));
+        if fs::metadata(self.path.join(&target)).is_ok_and(|m| m.is_dir()) {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
     }
 
     /// A folder in the user's profile is already closed to other users.
@@ -283,13 +307,51 @@ pub fn allocated(f: &fs::File) -> io::Result<u64> {
     Ok(f.metadata()?.len())
 }
 
-/// A path as a restore point records it. To be settled when backup is written for Windows.
+/// A path as a restore point records it: `/` between names, as every system writes it, with
+/// the drive kept in front (`C:/Users/me`).
 pub fn path_bytes(p: &Path) -> Vec<u8> {
-    p.to_string_lossy().into_owned().into_bytes()
+    let text = p.to_string_lossy();
+    // The long form Windows itself hands out says the same without it.
+    let text = match (text.strip_prefix(r"\\?\UNC\"), text.strip_prefix(r"\\?\")) {
+        (Some(share), _) => format!(r"\\{share}"),
+        (None, Some(rest)) => rest.to_string(),
+        (None, None) => text.into_owned(),
+    };
+    text.replace('\\', "/").into_bytes()
 }
 
 pub fn bytes_path(b: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(b).into_owned())
+    PathBuf::from(String::from_utf8_lossy(b).replace('/', "\\"))
+}
+
+/// `A` and `a` are one name here.
+pub const CASELESS: bool = true;
+
+/// A recorded name as Windows can keep it, and whether it had to be changed: what Windows
+/// would refuse or read as something else is spelled out as `%` and its number.
+pub fn name(n: &[u8]) -> (OsString, bool) {
+    let text = String::from_utf8_lossy(n);
+    if plain(&text) {
+        let changed = matches!(text, std::borrow::Cow::Owned(_));
+        return (text.into_owned().into(), changed);
+    }
+    let spell = |c: char| format!("%{:02X}", c as u32);
+    let mut out = String::new();
+    for c in text.chars() {
+        if c.is_control() || r#"<>:"/\|?*%"#.contains(c) { out.push_str(&spell(c)) } else { out.push(c) }
+    }
+    if let Some(last) = out.pop() {
+        if last == '.' || last == ' ' { out.push_str(&spell(last)) } else { out.push(last) }
+    }
+    // A device's name, or no name at all.
+    if !plain(&out) {
+        out.insert(0, '%');
+    }
+    (out.into(), true)
+}
+
+pub fn drive_root(letter: u8) -> Option<PathBuf> {
+    Some(PathBuf::from(format!("{}:\\", letter as char)))
 }
 
 #[cfg(test)]
@@ -339,10 +401,35 @@ mod tests {
         held.create_file("x".as_ref()).unwrap();
         held.rename("x".as_ref(), &held, "y".as_ref()).unwrap();
         assert_eq!(held.stat("y".as_ref(), false).unwrap().kind, Kind::File);
+        // A read-only file is replaced like any other.
+        let mut shut = fs::metadata(dir.join("a/b/y")).unwrap().permissions();
+        shut.set_readonly(true);
+        fs::set_permissions(dir.join("a/b/y"), shut).unwrap();
+        fs::write(dir.join("a/b/new"), "new").unwrap();
+        held.rename("new".as_ref(), &held, "y".as_ref()).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("a/b/y")).unwrap(), "new");
         held.remove_file("y".as_ref()).unwrap();
         drop(held);
         fs::rename(dir.join("a"), dir.join("z")).unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recorded_paths_and_names_cross_over() {
+        assert_eq!(path_bytes(Path::new(r"C:\Users\me\a.txt")), b"C:/Users/me/a.txt");
+        assert_eq!(path_bytes(Path::new(r"\\?\C:\Users\me")), b"C:/Users/me");
+        assert_eq!(path_bytes(Path::new(r"\\?\UNC\nas\share\x")), b"//nas/share/x");
+        assert_eq!(bytes_path(b"C:/Users/me/a.txt"), Path::new(r"C:\Users\me\a.txt"));
+        let name = |n: &str| name(n.as_bytes());
+        assert_eq!(name("notes.txt"), ("notes.txt".into(), false));
+        assert_eq!(name("50% done"), ("50% done".into(), false));
+        assert_eq!(name("a:b"), ("a%3Ab".into(), true));
+        assert_eq!(name(r"back\slash"), ("back%5Cslash".into(), true));
+        assert_eq!(name("what?"), ("what%3F".into(), true));
+        assert_eq!(name("ends."), ("ends%2E".into(), true));
+        assert_eq!(name("NUL"), ("%NUL".into(), true));
+        assert_eq!(name("com1.txt"), ("%com1.txt".into(), true));
+        assert!(plain(name("a<b>|c*\t ").0.to_str().unwrap()));
     }
 
     #[test]
