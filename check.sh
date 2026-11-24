@@ -5,8 +5,14 @@ set -e
 cd "$(dirname "$0")"
 echo "== format" && cargo fmt --check
 echo "== lints" && cargo clippy --release --all-targets --features windowed --quiet -- -D warnings
-echo "== unit tests" && cargo test --release --quiet 2>&1 | grep -E "^test result|FAILED|panicked|error" || true
-cargo test --release --quiet >/dev/null 2>&1
+echo "== unit tests"
+# Quiet when they pass; when one fails, all it said, so the reason is there to read.
+if tests=$(cargo test --release --quiet 2>&1); then
+    echo "$tests" | grep -E "^test result"
+else
+    echo "$tests"
+    exit 1
+fi
 if [ "${1:-}" = quick ]; then
     echo "quick checks passed (GitHub runs the end-to-end, damage and cloud tests)"
     exit 0

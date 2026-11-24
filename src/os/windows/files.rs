@@ -727,7 +727,8 @@ mod tests {
         assert!(alone.status.success());
         let bare = held.sub("bare".as_ref()).unwrap().create_file("f".as_ref()).unwrap();
         finish_file(&bare, &r(0o100644), false);
-        assert!(only_mine(&dir.join("bare/f"), true), "{}", dacl(&dir.join("bare/f")));
+        let (file, folder) = (dacl(&dir.join("bare/f")), dacl(&dir.join("bare")));
+        assert!(only_mine(&dir.join("bare/f"), true), "the file has {file}, in a folder with {folder}");
         // This folder is on a disk of this computer's own; one reached as a share is not.
         assert!(held.local());
         drop((inside, bare, held));
