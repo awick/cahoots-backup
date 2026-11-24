@@ -471,7 +471,7 @@ pub fn inherit(f: &fs::File) -> io::Result<()> {
 
 /// Gives what `f` has open (with WRITE_DAC) the list `text` says: with `protected`, that
 /// and nothing from its folder; without, that and what its folder passes on.
-fn set_dacl(f: &fs::File, text: &str, protected: bool) -> io::Result<()> {
+pub fn set_dacl(f: &fs::File, text: &str, protected: bool) -> io::Result<()> {
     let sd = Descriptor::new(text)?;
     let (_, dacl) = parts(&sd)?;
     let how = if protected { PROTECTED_DACL_SECURITY_INFORMATION } else { UNPROTECTED_DACL_SECURITY_INFORMATION };

@@ -718,13 +718,14 @@ mod tests {
         // A folder that passes nothing on (its list is for itself alone) must not leave what
         // is restored into it open to nobody.
         held.make("bare".as_ref()).unwrap();
+        // Given its whole list here, not by taking away what it got from above: where a
+        // folder's entries are not marked as passed down (a GitHub runner's temporary folder),
+        // `icacls /inheritance:r` takes none of them away.
         let me = super::super::sys::user().unwrap();
-        let alone = std::process::Command::new("icacls")
-            .arg(dir.join("bare"))
-            .args(["/inheritance:r", "/grant:r", &format!("*{me}:F")])
-            .output()
-            .unwrap();
-        assert!(alone.status.success());
+        const READ_CONTROL_WRITE_DAC: u32 = 0x2_0000 | 0x4_0000;
+        let bare = look(&dir.join("bare"), false, READ_CONTROL_WRITE_DAC).unwrap();
+        super::super::sys::set_dacl(&bare, &format!("D:P(A;;FA;;;{me})"), true).unwrap();
+        drop(bare);
         let bare = held.sub("bare".as_ref()).unwrap().create_file("f".as_ref()).unwrap();
         finish_file(&bare, &r(0o100644), false);
         let (file, folder) = (dacl(&dir.join("bare/f")), dacl(&dir.join("bare")));
