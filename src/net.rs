@@ -455,6 +455,95 @@ pub async fn in_time<T>(name: &str, limit: Duration, f: impl Future<Output = Res
     }
 }
 
+/// How fast data has moved to and from each destination lately, for showing. A destination's
+/// bytes are counted in windows of FLOW_WINDOW; its speed is what the last whole window's
+/// worth came to, sliding: all of this window so far and the rest from the one before.
+#[derive(Default)]
+pub struct Flows(Mutex<HashMap<String, [Flow; 2]>>);
+
+const FLOW_WINDOW: Duration = Duration::from_secs(4);
+
+#[derive(Default, Clone, Copy)]
+struct Flow {
+    /// When the window being counted began.
+    start: Option<Instant>,
+    now: u64,
+    before: u64,
+}
+
+impl Flow {
+    /// Moves on to the window `at` falls in.
+    fn roll(&mut self, at: Instant) {
+        let Some(start) = self.start else {
+            self.start = Some(at);
+            return;
+        };
+        let windows = (at.saturating_duration_since(start).as_millis() / FLOW_WINDOW.as_millis()) as u32;
+        if windows >= 1 {
+            self.before = if windows == 1 { self.now } else { 0 };
+            self.now = 0;
+            self.start = Some(start + FLOW_WINDOW * windows);
+        }
+    }
+
+    fn rate(&mut self, at: Instant) -> u64 {
+        self.roll(at);
+        let Some(start) = self.start else { return 0 };
+        let part = at.saturating_duration_since(start).as_secs_f64() / FLOW_WINDOW.as_secs_f64();
+        ((self.before as f64 * (1.0 - part).max(0.0) + self.now as f64) / FLOW_WINDOW.as_secs_f64()) as u64
+    }
+}
+
+impl Flows {
+    fn add(&self, id: &str, way: usize, bytes: u64) {
+        let now = Instant::now();
+        let mut all = self.0.lock().unwrap();
+        let flow = &mut all.entry(id.to_string()).or_default()[way];
+        flow.roll(now);
+        flow.now += bytes;
+    }
+
+    /// This node sent a destination `bytes` more of a backup.
+    pub fn sent(&self, id: &str, bytes: u64) {
+        self.add(id, 0, bytes);
+    }
+
+    /// A friend sent this node `bytes` more.
+    pub fn got(&self, id: &str, bytes: u64) {
+        self.add(id, 1, bytes);
+    }
+
+    /// Bytes a second going to a destination and coming from it, just now.
+    pub fn rates(&self, id: &str) -> (u64, u64) {
+        let now = Instant::now();
+        match self.0.lock().unwrap().get_mut(id) {
+            Some([out, back]) => (out.rate(now), back.rate(now)),
+            None => (0, 0),
+        }
+    }
+}
+
+/// What a destination has taken of an upload, noted as it goes: `done` moves, so a slow
+/// destination can be told from a stuck one, and `flows` learns how fast it is going.
+#[derive(Clone)]
+pub struct Tick {
+    pub done: Arc<AtomicU64>,
+    flows: Arc<Flows>,
+    id: String,
+}
+
+impl Tick {
+    pub fn new(flows: &Arc<Flows>, id: &str) -> Tick {
+        Tick { done: Arc::new(AtomicU64::new(0)), flows: flows.clone(), id: id.to_string() }
+    }
+
+    /// The destination has `bytes` more.
+    pub fn took(&self, bytes: u64) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+        self.flows.sent(&self.id, bytes);
+    }
+}
+
 /// When a request last moved forward, and how many progress reports the friend may still send.
 struct Moved {
     at: Instant,
@@ -468,8 +557,10 @@ struct Moved {
     credit: u64,
     /// How long the request may go quiet: IDLE, but for tests.
     idle: Duration,
-    /// Bumped on each report, for a caller that watches a long upload move.
-    tick: Option<Arc<AtomicU64>>,
+    /// Told of each report, for a caller that watches a long upload move.
+    tick: Option<Tick>,
+    /// Bytes of our upload the friend has not yet reported reading.
+    owed: u64,
 }
 
 #[derive(Clone)]
@@ -490,6 +581,7 @@ impl Progress {
             credit,
             idle: IDLE,
             tick: None,
+            owed: 0,
         })))
     }
 
@@ -508,7 +600,9 @@ impl Progress {
 
     /// Lets the friend report progress on `bytes` more of our upload: once per piece, at most.
     fn expect(&self, bytes: usize) {
-        self.0.lock().unwrap().reports += (bytes / PIECE + 1) as u64;
+        let mut m = self.0.lock().unwrap();
+        m.reports += (bytes / PIECE + 1) as u64;
+        m.owed += bytes as u64;
     }
 
     /// The friend says it read another piece. Only as many reports as our upload can earn
@@ -519,8 +613,11 @@ impl Progress {
             bail!("more progress reports than the request allows");
         }
         (m.reports, m.at) = (m.reports - 1, Instant::now());
+        // A report is for one piece read, or what was left of a chunk shorter than one.
+        let read = m.owed.min(PIECE as u64);
+        m.owed -= read;
         if let Some(t) = &m.tick {
-            t.fetch_add(1, Ordering::Relaxed);
+            t.took(read);
         }
         Ok(())
     }
@@ -753,7 +850,7 @@ impl Peer {
     }
 
     /// Uploads chunks, bumping `tick` as the friend reports each piece it has read.
-    pub async fn put_chunks_ticking(&self, items: &[&(Id, Vec<u8>)], tick: Option<Arc<AtomicU64>>) -> Result<()> {
+    pub async fn put_chunks_ticking(&self, items: &[&(Id, Vec<u8>)], tick: Option<Tick>) -> Result<()> {
         if let Some(b) = self.cloud() {
             return self.named(b.put_chunks(items, self.quota(), tick).await);
         }
@@ -763,6 +860,9 @@ impl Peer {
             return blocking(move || {
                 for (id, data) in &items {
                     st.put_chunk(&me, id, data, quota).map_err(|e| anyhow!("{name}: {e}"))?;
+                    if let Some(t) = &tick {
+                        t.took(data.len() as u64);
+                    }
                 }
                 Ok(())
             })
@@ -1109,6 +1209,7 @@ async fn read_paced(
         let n = (buf.len() - at).min(PIECE);
         tokio::time::sleep(node.guard.owe(&friend.id, n + extra, kbps, all_kbps)).await;
         r.read_exact(&mut buf[at..at + n]).await?;
+        node.flows.got(&friend.id, n as u64);
         // The sender hears its data is moving however slow the limit, so only a silent node is given up on.
         if report {
             proto::send(s, &Resp::Progress).await?;
@@ -1389,6 +1490,37 @@ mod tests {
         let (took, why) = trickled(SNAPSHOT_LISTING, unit, unit * 10, 0).await;
         assert!(why.contains("no answer"), "{why}");
         assert!(took < unit * 2, "{took:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn how_fast_a_destination_goes_is_what_the_last_window_came_to() {
+        let flows = Flows::default();
+        assert_eq!(flows.rates("bob"), (0, 0));
+        let second = Duration::from_secs(1);
+        let per_second = 1 << 20;
+        // A steady megabyte a second out, and nothing back.
+        for _ in 0..12 {
+            flows.sent("bob", per_second);
+            tokio::time::sleep(second).await;
+        }
+        let (out, back) = flows.rates("bob");
+        assert!(out.abs_diff(per_second) < per_second / 4, "{out}");
+        assert_eq!(back, 0);
+        assert_eq!(flows.rates("alice"), (0, 0), "each destination has its own");
+        // What comes in is counted apart from what goes out.
+        flows.got("bob", per_second);
+        assert!(flows.rates("bob").1 > 0);
+        // It stops: the speed falls away within two windows, and stays at nothing.
+        tokio::time::sleep(FLOW_WINDOW * 2).await;
+        assert_eq!(flows.rates("bob"), (0, 0));
+        tokio::time::sleep(FLOW_WINDOW * 50).await;
+        assert_eq!(flows.rates("bob"), (0, 0));
+        // An upload's progress feeds it, a piece at a time.
+        let flows = Arc::new(flows);
+        let tick = Tick::new(&flows, "bob");
+        tick.took(PIECE as u64);
+        assert_eq!(tick.done.load(Ordering::Relaxed), 1);
+        assert!(flows.rates("bob").0 > 0);
     }
 
     #[test]

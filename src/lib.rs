@@ -12,6 +12,7 @@ mod cloud;
 mod config;
 mod control;
 mod crypto;
+mod dests;
 #[cfg(feature = "gui")]
 mod gui;
 mod net;
@@ -299,6 +300,17 @@ enum FriendCmd {
         /// Also delete the data they stored here
         #[arg(long)]
         purge: bool,
+    },
+    /// Give a friend, drive or cloud storage another name on this computer
+    Rename { name: String, to: String },
+    /// What removed friends still have stored on this computer; with a name and --delete,
+    /// delete it
+    Removed {
+        /// The removed friend's name, or the start of its id
+        who: Option<String>,
+        /// Delete what they stored here
+        #[arg(long)]
+        delete: bool,
     },
     /// Set how many GB a friend may store on this computer
     Quota { name: String, gb: u64 },
@@ -780,6 +792,17 @@ async fn real_main(cli: Cli) -> Result<()> {
         C::Destinations => Cmd::Friends,
         C::Destination { cmd } => match cmd {
             FriendCmd::Rm { name, purge } => Cmd::FriendRemove { name, purge },
+            FriendCmd::Rename { name, to } => Cmd::FriendRename { name, to },
+            FriendCmd::Removed { who: None, delete: false } => Cmd::Removed,
+            FriendCmd::Removed { who: Some(who), delete: true } => Cmd::RemovedDelete { who },
+            FriendCmd::Removed { who: None, delete: true } => {
+                bail!("say whose: cahoots destination removed NAME --delete")
+            }
+            FriendCmd::Removed { who: Some(_), delete: false } => {
+                bail!(
+                    "to delete what they stored here add --delete; without a name, `cahoots destination removed` lists them"
+                )
+            }
             FriendCmd::Quota { name, gb } => Cmd::FriendQuota { name, gb },
             FriendCmd::Limit { name, kbps } => Cmd::FriendLimit { name, kbps },
             FriendCmd::BackupTo { name, on } => Cmd::FriendBackupTo { name, on },

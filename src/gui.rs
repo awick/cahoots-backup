@@ -7,6 +7,7 @@
 use crate::{
     config::{BackupSet, Config, Friend, is_builtin_list, mbps, parse_mbps},
     control,
+    dests::{self, SORTS, Sort},
     node::{CloudAdd, Cmd, Secret, SetEdit, Tune},
     snapshot::{human, when},
     tui::{Item, Listing, ago, list_dir, name, parse_listing, tilde, until},
@@ -136,6 +137,11 @@ struct Gui {
     /// The confirm button that was clicked once and is waiting for its second click.
     armed: Option<(String, Instant)>,
 
+    // Friends page: the order it is in, and the friend being removed, who is asked about.
+    dest_sort: Sort,
+    dest_backward: bool,
+    removing: Option<String>,
+
     // Backup page: the set being edited and the folder picker.
     edit: Option<(String, Tab)>,
     root: String,
@@ -184,6 +190,9 @@ impl Gui {
             popup: None,
             fields: HashMap::new(),
             armed: None,
+            dest_sort: Sort::Added,
+            dest_backward: false,
+            removing: None,
             edit: None,
             root,
             hidden: false,
@@ -1411,8 +1420,9 @@ impl Gui {
         ui.heading("Friends");
         ui.weak("Friends' computers that your backups go to, and drives and cloud storage of your own.");
         ui.add_space(4.0);
+        let filter = if self.cfg.friends.len() > 1 { self.dest_order(ui) } else { String::new() };
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let all = self.cfg.friends.clone();
+            let all = dests::arrange(&self.cfg.friends, &self.ov, self.dest_sort, self.dest_backward, &filter);
             // Friends come first. A drive or a bucket is kept on this page too, but under its
             // own heading: it is nobody's friend.
             let groups = [
@@ -1428,7 +1438,8 @@ impl Gui {
                 ui.add_space(2.0);
                 let mine: Vec<&Friend> = all.iter().filter(|f| f.kind() == kind).collect();
                 if mine.is_empty() {
-                    ui.weak(none);
+                    let any = self.cfg.friends.iter().any(|f| f.kind() == kind);
+                    ui.weak(if any { "None with that in its name." } else { none });
                     ui.add_space(4.0);
                 }
                 for f in mine {
@@ -1441,7 +1452,67 @@ impl Gui {
                     _ => self.add_cloud_box(ui),
                 }
             }
+            self.removed_friends(ui);
         });
+    }
+
+    /// The row that puts the page in order and narrows it down; gives the text to narrow by.
+    fn dest_order(&mut self, ui: &mut egui::Ui) -> String {
+        let typed = ui
+            .horizontal(|ui| {
+                ui.weak("Sort by");
+                egui::ComboBox::from_id_salt("dest-sort").selected_text(self.dest_sort.label()).show_ui(ui, |ui| {
+                    for (sort, label) in SORTS {
+                        ui.selectable_value(&mut self.dest_sort, sort, label);
+                    }
+                });
+                ui.toggle_value(&mut self.dest_backward, "Reversed")
+                    .on_hover_text("Names run A to Z and amounts largest first; this turns the order round.");
+                ui.add_space(12.0);
+                let text = self.fields.entry("dest-filter".into()).or_default();
+                ui.add(egui::TextEdit::singleline(text).desired_width(200.0).hint_text("show only names with..."));
+                if !text.is_empty() && ui.button("Clear").clicked() {
+                    text.clear();
+                }
+                text.trim().to_string()
+            })
+            .inner;
+        ui.add_space(4.0);
+        typed
+    }
+
+    /// What friends who were removed still have stored on this computer, each with a way to
+    /// delete it.
+    fn removed_friends(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let removed = self.ov["removed"].as_array().cloned().unwrap_or_default();
+        if removed.is_empty() {
+            return;
+        }
+        ui.add_space(14.0);
+        ui.label(RichText::new("Removed friends").strong().size(19.0));
+        ui.weak("What friends you removed still have stored on this computer.");
+        ui.add_space(2.0);
+        for r in removed {
+            let Some(id) = r["id"].as_str() else { continue };
+            let name = r["name"].as_str().map_or_else(|| format!("node {}...", &id[..id.len().min(12)]), String::from);
+            ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&name).strong());
+                    let used = r["used"].as_u64().map_or("counting...".into(), human);
+                    let at = r["at"].as_i64().map(|t| format!(" · removed {}", ago(Some(t)))).unwrap_or_default();
+                    ui.weak(format!("{used} stored here{at}"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let hint = "Deletes what they stored here. It cannot be brought back.";
+                        if self.confirm(ui, &format!("purge-{id}"), "Delete", hint) {
+                            self.save(&ctx, Cmd::RemovedDelete { who: id.to_string() });
+                        }
+                    });
+                });
+            });
+            ui.add_space(4.0);
+        }
     }
 
     /// One friend, drive or bucket: how it stands, and its settings in rows.
@@ -1455,11 +1526,19 @@ impl Gui {
             ui.horizontal(|ui| {
                 Self::dot(ui, self.dest_dot(&f.name));
                 ui.label(RichText::new(&f.name).strong().size(17.0));
+                if f.is_friend() && dests::theirs(f) != f.name {
+                    ui.weak(format!("calls itself {}", dests::theirs(f)));
+                }
                 if !f.backup_to {
                     ui.colored_label(YELLOW, "not in use");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let mut about = vec![f.kind().to_string(), o["state"].as_str().unwrap_or("checking").to_string()];
+                    for (key, doing) in [("rate_out", "sending"), ("rate_in", "receiving")] {
+                        if let Some(rate) = o[key].as_u64().filter(|r| *r > 0) {
+                            about.push(format!("{doing} {}/s", human(rate)));
+                        }
+                    }
                     if o["closed"] == true {
                         about.push("takes no backups from you".into());
                     }
@@ -1480,6 +1559,20 @@ impl Gui {
             let (had_days, had_last) =
                 (shown(f.retention.as_ref().map(|r| r.keep_days)), shown(f.retention.as_ref().map(|r| r.keep_last)));
             Self::rows(ui, ("dest", &f.name), |ui| {
+                ui.weak("Name");
+                ui.horizontal(|ui| {
+                    let text = self.fields.entry(key("name")).or_insert_with(|| f.name.clone());
+                    ui.add(egui::TextEdit::singleline(text).desired_width(160.0));
+                    let to: String =
+                        text.chars().filter(|c| c.is_alphanumeric() || "-_.".contains(*c)).take(32).collect();
+                    let taken = to != f.name && self.cfg.friends.iter().any(|x| x.name == to);
+                    if ui.add_enabled(!to.is_empty() && to != f.name && !taken, egui::Button::new("Rename")).clicked() {
+                        self.save(&ctx, Cmd::FriendRename { name: f.name.clone(), to });
+                        self.fields.retain(|k, _| !k.ends_with(&format!("-{}", f.name)));
+                    }
+                    ui.weak(if taken { "that name is taken" } else { "what this computer calls it" });
+                });
+                ui.end_row();
                 ui.weak("You use");
                 let there = match (o["used_there"].as_u64(), o["quota_there"].as_u64()) {
                     (Some(u), Some(q)) => format!("{} of {} there", human(u), human(q)),
@@ -1589,10 +1682,47 @@ impl Gui {
                 }
                 // What removes things sits together on the right; each asks to be clicked twice.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // A friend being removed: what they store here is kept or deleted, as asked.
+                    if f.is_friend() && self.removing.as_deref() == Some(f.name.as_str()) {
+                        // "their 12.3 GB", or before it has been counted, "what they store here".
+                        let stored = o["used_here"].as_u64().map(human);
+                        let stored = stored.map_or("what they store here".to_string(), |s| format!("their {s}"));
+                        let mut remove = None;
+                        if ui.button("Cancel").clicked() {
+                            self.removing = None;
+                        }
+                        let delete = RichText::new(format!("Delete {stored}")).color(Color32::WHITE);
+                        if ui
+                            .add(egui::Button::new(delete).fill(RED))
+                            .on_hover_text("It cannot be brought back.")
+                            .clicked()
+                        {
+                            remove = Some(true);
+                        }
+                        let keep = ui.button(format!("Keep {stored}")).on_hover_text(
+                            "It stays on this computer, listed under Removed friends, until you delete it.",
+                        );
+                        if keep.clicked() {
+                            remove = Some(false);
+                        }
+                        ui.label(format!("Remove {}?", f.name));
+                        if let Some(purge) = remove {
+                            self.removing = None;
+                            self.save(&ctx, Cmd::FriendRemove { name: f.name.clone(), purge });
+                        }
+                        return;
+                    }
                     let clean = |dry_run| Cmd::DestClean { name: f.name.clone(), dry_run };
-                    let hint = "Stops using this destination. What is stored there is left in place.";
-                    if self.confirm(ui, &format!("remove-{}", f.name), "Remove", hint) {
-                        self.save(&ctx, Cmd::FriendRemove { name: f.name.clone(), purge: false });
+                    if f.is_friend() {
+                        let hint = "Stops using this friend. You are asked what to do with what they store here.";
+                        if ui.button("Remove").on_hover_text(hint).clicked() {
+                            self.removing = Some(f.name.clone());
+                        }
+                    } else {
+                        let hint = "Stops using this destination. What is stored there is left in place.";
+                        if self.confirm(ui, &format!("remove-{}", f.name), "Remove", hint) {
+                            self.save(&ctx, Cmd::FriendRemove { name: f.name.clone(), purge: false });
+                        }
                     }
                     let hint = "Deletes from here the restore points of sets that are no longer sent here.";
                     if self.confirm(ui, &format!("clean-{}", f.name), "Clean up", hint) {

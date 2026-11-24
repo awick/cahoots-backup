@@ -169,6 +169,17 @@ pub enum Cmd {
         name: String,
         purge: bool,
     },
+    /// Gives a destination another name on this computer.
+    FriendRename {
+        name: String,
+        to: String,
+    },
+    /// What removed friends still have stored here.
+    Removed,
+    /// Deletes what one removed friend, by name or id, still has stored here.
+    RemovedDelete {
+        who: String,
+    },
     FriendLimit {
         name: String,
         kbps: u64,
@@ -389,6 +400,8 @@ pub struct Node {
     down: Mutex<HashMap<String, Instant>>,
     /// Defences for the listening side: counters and limits for unknown and known callers.
     pub guard: net::Guard,
+    /// How fast data is moving to and from each destination.
+    pub flows: Arc<net::Flows>,
     /// What each backup set is doing right now, for the home screen.
     running: Mutex<HashMap<String, String>>,
     /// Recent activity, newest last.
@@ -450,6 +463,13 @@ impl Node {
     }
 }
 
+/// A friend that was removed while what they stored here was kept.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Removed {
+    pub name: String,
+    pub at: i64,
+}
+
 fn refuse_reserved(name: &str) -> Result<()> {
     if crate::config::reserved(name) {
         bail!("\"{name}\" has a special meaning in destination lists; choose another name");
@@ -464,6 +484,7 @@ fn add_friend(c: &mut Config, id: &str, name: &str, relay: Option<String>, addrs
         return f.name.clone();
     }
     // The name is the friend's choice, so a reserved word quietly becomes a plain one.
+    let theirs = name;
     let base = Some(clean_name(name)).filter(|b| !crate::config::reserved(b)).unwrap_or_else(|| "friend".into());
     let mut name = base.clone();
     let mut n = 2;
@@ -484,6 +505,7 @@ fn add_friend(c: &mut Config, id: &str, name: &str, relay: Option<String>, addrs
         drive_key: None,
         cloud: None,
         retention: None,
+        theirs: Some(clean_name(theirs)),
     });
     name
 }
@@ -560,6 +582,7 @@ impl Node {
             clouds: Default::default(),
             down: Default::default(),
             guard: Default::default(),
+            flows: Default::default(),
             running: Default::default(),
             log: Default::default(),
             probes: Default::default(),
@@ -622,6 +645,46 @@ impl Node {
 
     pub fn friend(&self, id: &str) -> Option<Friend> {
         self.cfg.lock().unwrap().friends.iter().find(|f| f.id == id && f.is_friend()).cloned()
+    }
+
+    fn removed_path(&self) -> PathBuf {
+        self.home.join("removed.json")
+    }
+
+    /// Friends removed while what they stored here was kept, by node id.
+    fn removed(&self) -> HashMap<String, Removed> {
+        fs::read(self.removed_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// Notes a friend as removed with their data kept, or (None) as no longer so: back as a
+    /// friend, or their data deleted.
+    fn note_removed(&self, id: &str, as_what: Option<Removed>) {
+        let mut all = self.removed();
+        let changed = match as_what {
+            Some(r) => all.insert(id.to_string(), r).is_none(),
+            None => all.remove(id).is_some(),
+        };
+        if changed {
+            let _ = write_private(&self.removed_path(), &serde_json::to_vec(&all).unwrap_or_default());
+        }
+    }
+
+    /// What is still stored here for nodes that are not friends (any more): their id, what
+    /// is known of who they were, and how much it is, once counted. Empty folders are not listed.
+    pub fn leftovers(self: &Arc<Self>) -> Vec<(String, Option<Removed>, Option<u64>)> {
+        let friends: HashSet<String> = self.cfg().friends.into_iter().map(|f| f.id).collect();
+        let mut names = self.removed();
+        let mut all: Vec<_> = self
+            .store
+            .owners()
+            .into_iter()
+            .filter(|o| !friends.contains(o))
+            .map(|o| (names.remove(&o), self.stored_here(&o), o))
+            .filter(|(_, used, _)| *used != Some(0))
+            .map(|(who, used, o)| (o, who, used))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
     }
 
     fn forgotten_path(&self) -> PathBuf {
@@ -1112,6 +1175,7 @@ impl Node {
         })?;
         let mine = mine.ok_or_else(|| anyhow!("that invite is invalid, already used or expired"))?;
         self.store.allow(remote);
+        self.note_removed(remote, None);
         self.paired.notify_waiters();
         Ok(mine)
     }
@@ -1994,7 +2058,17 @@ impl Node {
                     "used_here": if f.is_friend() { self.stored_here(&f.id) } else { None },
                     "last_in": if f.is_friend() { self.store.last_snapshot(&f.id) } else { None },
                     "last_out": ok.get(&f.id),
+                    "theirs": f.theirs,
+                    "rate_out": self.flows.rates(&f.id).0,
+                    "rate_in": self.flows.rates(&f.id).1,
                 })
+            })
+            .collect();
+        let removed: Vec<_> = self
+            .leftovers()
+            .into_iter()
+            .map(|(id, who, used)| {
+                json!({ "id": id, "name": who.as_ref().map(|w| w.name.clone()), "at": who.map(|w| w.at), "used": used })
             })
             .collect();
         let kit = crate::recovery::state(&self.home, &c).describe();
@@ -2022,6 +2096,7 @@ impl Node {
             "turned_away": self.guard.rejected.load(std::sync::atomic::Ordering::Relaxed),
             "sets": sets,
             "dests": dests,
+            "removed": removed,
         })
     }
 
@@ -2183,6 +2258,9 @@ impl Node {
             Cmd::Join { ticket } => self.join(&ticket, out).await,
             Cmd::Friends => self.show_destinations(out).await,
             Cmd::FriendRemove { name, purge } => self.remove_destination(name, purge, out).await,
+            Cmd::FriendRename { name, to } => self.rename_destination(name, to, out).await,
+            Cmd::Removed => self.show_removed(out).await,
+            Cmd::RemovedDelete { who } => self.delete_removed(who, out).await,
             Cmd::FriendLimit { name, kbps } => self.limit_friend(name, kbps, out).await,
             Cmd::FriendQuota { name, gb } => self.set_quota(name, gb, out).await,
             Cmd::FriendBackupTo { name, on } => self.use_destination(name, on, out).await,

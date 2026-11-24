@@ -108,6 +108,10 @@ pub struct Friend {
     /// The per-file version limit does not apply here; that stays with the set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<Retention>,
+    /// What a friend calls their own computer, as they said when the two were paired. `name`
+    /// starts out as that, and is this computer's to change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theirs: Option<String>,
 }
 
 fn d_region() -> String {
@@ -721,6 +725,7 @@ mod tests {
             drive_key: None,
             cloud: None,
             retention: None,
+            theirs: None,
             path: drive.then(|| PathBuf::from("/tmp")),
         }
     }

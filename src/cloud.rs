@@ -17,10 +17,7 @@ use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream};
 use rusty_s3::{Credentials, S3Action, UrlStyle, actions::ListObjectsV2};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Mutex,
     time::Duration,
 };
 
@@ -415,7 +412,7 @@ impl Bucket {
         Ok(())
     }
 
-    pub async fn put_chunks(&self, items: &[&(Id, Vec<u8>)], quota: u64, tick: Option<Arc<AtomicU64>>) -> Result<()> {
+    pub async fn put_chunks(&self, items: &[&(Id, Vec<u8>)], quota: u64, tick: Option<crate::net::Tick>) -> Result<()> {
         self.room(items.iter().map(|(_, d)| d.len() as u64).sum(), quota).await?;
         let tick = &tick;
         let puts: Vec<BoxFuture<'_, Result<()>>> = items
@@ -426,7 +423,7 @@ impl Bucket {
                     // Counted as each one lands, so a batch that fails part way is still counted right.
                     self.adjust(data.len() as i64);
                     if let Some(t) = tick {
-                        t.fetch_add(1, Ordering::Relaxed);
+                        t.took(data.len() as u64);
                     }
                     Ok(())
                 }) as BoxFuture<'_, Result<()>>

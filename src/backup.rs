@@ -763,7 +763,7 @@ async fn lane(
     limit: usize,
     kbps: u64,
     remote: u64,
-    done: Arc<AtomicU64>,
+    tick: net::Tick,
 ) -> Result<Vec<Id>> {
     let mut added = vec![];
     let mut open = true;
@@ -788,9 +788,9 @@ async fn lane(
         let items: Vec<&(Id, Vec<u8>)> = batch.iter().map(|i| &**i).collect();
         // Each piece the friend reads counts as progress, so a slow but steady friend is never
         // taken for a stuck one, however long one batch takes it.
-        peer.put_chunks_ticking(&items, Some(done.clone())).await?;
+        peer.put_chunks_ticking(&items, Some(tick.clone())).await?;
         added.extend(batch.iter().map(|i| i.0));
-        done.fetch_add(1, Ordering::Relaxed);
+        tick.done.fetch_add(1, Ordering::Relaxed);
         if kbps > 0 && peer.is_remote() {
             // Hold the average upload rate, shared by the remote destinations, to the limit;
             // local drives do not count.
@@ -1063,8 +1063,9 @@ async fn run_once(
         .iter()
         .map(|t| {
             let (ltx, lrx) = mpsc::channel(LANE_DEPTH);
-            let done = Arc::new(AtomicU64::new(0));
-            let (peer, out, kbps, d) = (t.peer.clone(), out.clone(), cfg.upload_kbps, done.clone());
+            let tick = net::Tick::new(&node.flows, &t.peer.friend.id);
+            let done = tick.done.clone();
+            let (peer, out, kbps, d) = (t.peer.clone(), out.clone(), cfg.upload_kbps, tick);
             let task = tokio::spawn(async move {
                 let name = peer.friend.name.clone();
                 let r = lane(peer, lrx, batch_limit, kbps, remote, d).await;

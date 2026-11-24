@@ -8,6 +8,7 @@
 use crate::{
     config::{BackupSet, Config, DEFAULT_SET, STANDARD, is_builtin_list, mbps, parse_mbps},
     control,
+    dests::{self, Sort},
     node::{CloudAdd, Cmd, SetEdit, Tune},
     snapshot::{human, parse_when, when},
 };
@@ -275,7 +276,11 @@ enum Prompt {
     ApplyExclusions(String),
     /// A history rule ("days" or "last") for one destination.
     DestKeep(String, &'static str),
-    Remove(String),
+    /// Removing a destination; for a friend, how much they store here, to ask about.
+    Remove(String, Option<String>),
+    RenameDest(String),
+    DestFilter,
+    RemovedDelete,
     Every(String),
     Quota(String),
     InLimit(String),
@@ -323,6 +328,12 @@ enum Act {
     KitInfo,
     UseDest,
     RemoveDest,
+    RenameDest,
+    DestSort,
+    DestReverse,
+    DestFilter,
+    RemovedLook,
+    RemovedDelete,
     Pick,
     RestorePicked,
     Search,
@@ -465,6 +476,12 @@ struct App {
     set_dests: ListState,
     rules: ListState,
     dests: ListState,
+    /// The destinations the Friends page lists, in its order: its menu and cursor count in
+    /// these. Every destination is still in `cfg.friends`.
+    shown: Vec<crate::config::Friend>,
+    dest_sort: Sort,
+    dest_backward: bool,
+    dest_filter: String,
     settings: ListState,
     restore: RestoreView,
     /// Restore from this destination only; None means any of them.
@@ -506,6 +523,12 @@ impl App {
         if self.cfg.set(&self.set).is_none() {
             self.set = self.cfg.sets.first().map(|b| b.name.clone()).unwrap_or_else(|| DEFAULT_SET.into());
         }
+        self.arrange();
+    }
+
+    /// Puts the Friends page in the order, and down to the names, asked for.
+    fn arrange(&mut self) {
+        self.shown = dests::arrange(&self.cfg.friends, &self.ov, self.dest_sort, self.dest_backward, &self.dest_filter);
     }
 
     async fn apply(&mut self, cmd: Cmd) {
@@ -962,7 +985,7 @@ impl App {
     }
 
     fn picked_dest(&self) -> Option<crate::config::Friend> {
-        self.cfg.friends.get(self.dests.selected().unwrap_or(0)).cloned()
+        self.shown.get(self.dests.selected().unwrap_or(0)).cloned()
     }
 
     /// The items of one menu level, with current values shown where there is one.
@@ -1038,16 +1061,32 @@ impl App {
                 v
             }
             Kind::Dests => {
-                let mut v: Vec<_> = self.cfg.friends.iter().map(|f| go(&f.name, Kind::Dest(f.name.clone()))).collect();
+                let mut v: Vec<_> = self.shown.iter().map(|f| go(&f.name, Kind::Dest(f.name.clone()))).collect();
                 v.push(act("+ Invite a friend".into(), Act::Invite));
                 v.push(act("+ Accept an invite".into(), Act::Accept));
                 v.push(act("+ Add a drive or folder".into(), Act::AddDrive));
                 v.push(act("+ Add cloud storage (S3, B2, ...)".into(), Act::AddCloud));
+                if self.cfg.friends.len() > 1 {
+                    v.push(act(format!("Sort by: {}", self.dest_sort.label()), Act::DestSort));
+                    v.push(act(
+                        format!("Reversed: {}", if self.dest_backward { "yes" } else { "no" }),
+                        Act::DestReverse,
+                    ));
+                    let only =
+                        if self.dest_filter.is_empty() { "all".into() } else { format!("\"{}\"", self.dest_filter) };
+                    v.push(act(format!("Show only names with: {only}"), Act::DestFilter));
+                }
+                let removed = self.ov["removed"].as_array().map_or(0, |r| r.len());
+                if removed > 0 {
+                    v.push(act(format!("Removed friends with data here: {removed}"), Act::RemovedLook));
+                    v.push(act("Delete a removed friend's data".into(), Act::RemovedDelete));
+                }
                 v
             }
             Kind::Dest(n) => {
                 let Some(f) = self.cfg.friends.iter().find(|f| &f.name == n) else { return vec![] };
                 let mut v = vec![
+                    act(format!("Name: {}", f.name), Act::RenameDest),
                     act(format!("In use: {}", if f.backup_to { "yes" } else { "no" }), Act::UseDest),
                     act(format!("Back up every: {} min", f.interval_secs(&self.cfg) / 60), Act::Pace),
                 ];
@@ -1215,11 +1254,11 @@ impl App {
             }
             Kind::Dests => {
                 self.page = DESTS;
-                self.dests.select(Some(sel.min(self.cfg.friends.len().saturating_sub(1))));
+                self.dests.select(Some(sel.min(self.shown.len().saturating_sub(1))));
             }
             Kind::Dest(n) => {
                 self.page = DESTS;
-                self.dests.select(self.cfg.friends.iter().position(|f| &f.name == n));
+                self.dests.select(self.shown.iter().position(|f| &f.name == n));
             }
             Kind::Settings => {
                 self.page = SETTINGS;
@@ -1394,10 +1433,24 @@ impl App {
                     None => (Prompt::Cloud(vec![]), String::new()),
                 });
             }
+            Act::DestSort => {
+                self.dest_sort = self.dest_sort.next();
+                self.arrange();
+            }
+            Act::DestReverse => {
+                self.dest_backward = !self.dest_backward;
+                self.arrange();
+            }
+            Act::DestFilter => self.input = Some((Prompt::DestFilter, self.dest_filter.clone())),
+            Act::RemovedLook => {
+                self.start("looking", |ex, _| async move { Done::Popup(lines_or_error(ex.call(Cmd::Removed).await)) });
+            }
+            Act::RemovedDelete => self.input = Some((Prompt::RemovedDelete, String::new())),
             Act::Pace
             | Act::Quota
             | Act::InLimit
             | Act::RemoveDest
+            | Act::RenameDest
             | Act::UseDest
             | Act::DestDays
             | Act::DestLast
@@ -1424,7 +1477,14 @@ impl App {
                     Act::Quota => self.input = Some((Prompt::Quota(f.name), String::new())),
                     Act::InLimit if !f.is_friend() => self.status = "only a friend has a speed limit".into(),
                     Act::InLimit => self.input = Some((Prompt::InLimit(f.name), String::new())),
-                    Act::RemoveDest => self.input = Some((Prompt::Remove(f.name), String::new())),
+                    Act::RemoveDest => {
+                        let o =
+                            self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == f.name.as_str()));
+                        let stored = o.and_then(|o| o["used_here"].as_u64()).map_or("what".to_string(), human);
+                        self.input =
+                            Some((Prompt::Remove(f.name.clone(), f.is_friend().then_some(stored)), String::new()));
+                    }
+                    Act::RenameDest => self.input = Some((Prompt::RenameDest(f.name.clone()), f.name)),
                     _ => self.apply(Cmd::FriendBackupTo { name: f.name, on: !f.backup_to }).await,
                 }
             }
@@ -1527,7 +1587,7 @@ impl App {
             (BACKUP, Sub::Sets) if d != 0 => step(&mut self.sets, self.cfg.sets.len() + 1),
             (BACKUP, Sub::Dests) if d != 0 => step(&mut self.set_dests, self.cfg.friends.len()),
             (BACKUP, Sub::Rules) if d != 0 => step(&mut self.rules, RULES.len()),
-            (DESTS, _) if d != 0 => step(&mut self.dests, self.cfg.friends.len()),
+            (DESTS, _) if d != 0 => step(&mut self.dests, self.shown.len()),
             (SETTINGS, _) if d != 0 => step(&mut self.settings, GENERAL.len()),
             (HISTORY | STATUS, _) if d != 0 => {
                 self.scroll = (self.scroll as isize - d).clamp(0, self.text.len() as isize) as usize
@@ -1659,7 +1719,7 @@ impl App {
 
     async fn submit(&mut self, prompt: Prompt, text: String) {
         // Blank is an answer for a pause, and for the optional folder inside a bucket.
-        let optional = matches!(&prompt, Prompt::Setting("pause"))
+        let optional = matches!(&prompt, Prompt::Setting("pause") | Prompt::DestFilter)
             || matches!(&prompt, Prompt::Cloud(v) if v.len() == 4 || v.len() == 5);
         if text.is_empty() && !optional {
             return;
@@ -1806,12 +1866,45 @@ impl App {
                     );
                 }
             }
-            Prompt::Remove(name) => {
-                if text.eq_ignore_ascii_case("yes") {
-                    self.apply(Cmd::FriendRemove { name, purge: false }).await;
+            // A friend is removed with what they store here kept or deleted, as typed; a drive
+            // or cloud storage holds nothing of anyone else's.
+            Prompt::Remove(name, stored) => {
+                let purge = match (stored, text.to_ascii_lowercase().as_str()) {
+                    (Some(_), "keep") | (None, "yes") => Some(false),
+                    (Some(_), "delete") => Some(true),
+                    _ => None,
+                };
+                if let Some(purge) = purge {
+                    self.apply(Cmd::FriendRemove { name, purge }).await;
                     self.dests.select(Some(0));
                 }
             }
+            Prompt::RenameDest(name) => {
+                let to: String = text.chars().filter(|c| c.is_alphanumeric() || "-_.".contains(*c)).take(32).collect();
+                if to.is_empty() {
+                    self.status = "use letters and digits for a name".into();
+                } else {
+                    match self.exec.call(Cmd::FriendRename { name: name.clone(), to: to.clone() }).await {
+                        Ok(_) => {
+                            // Follow it to its new name so the menu stays where it was.
+                            for level in self.stack.iter_mut() {
+                                if matches!(&level.0, Kind::Dest(n) if *n == name) {
+                                    level.0 = Kind::Dest(to.clone());
+                                }
+                            }
+                            self.status = "saved".into();
+                        }
+                        Err(e) => self.status = format!("{e:#}"),
+                    }
+                    self.reload().await;
+                }
+            }
+            Prompt::DestFilter => {
+                self.dest_filter = text.trim().to_string();
+                self.arrange();
+                self.dests.select(Some(0));
+            }
+            Prompt::RemovedDelete => self.apply(Cmd::RemovedDelete { who: text.trim().to_string() }).await,
             Prompt::Setting(key) => {
                 if !self.set_setting(key, &text).await {
                     self.status = "that value does not fit this setting".into();
@@ -2147,7 +2240,7 @@ impl App {
         let dim = Style::new().fg(Color::DarkGray);
         let mut items: Vec<ListItem> = vec![];
         let mut group = "";
-        for x in &self.cfg.friends {
+        for x in &self.shown {
             let o = self.ov["dests"].as_array().and_then(|a| a.iter().find(|d| d["name"] == x.name.as_str()));
             let get = |k: &str| o.map(|o| o[k].clone()).unwrap_or(Value::Null);
             let (dot, color) = self.dest_state(&x.name);
@@ -2164,6 +2257,18 @@ impl App {
                 (Some(u), None) => format!("{} there", human(u)),
                 _ => "not known yet".to_string(),
             };
+            let link =
+                [("rate_out", "sending"), ("rate_in", "receiving")].iter().fold(link, |link, (key, doing)| match get(
+                    key,
+                )
+                .as_u64()
+                .filter(|r| *r > 0)
+                {
+                    Some(rate) => format!("{link}, {doing} {}/s", human(rate)),
+                    None => link,
+                });
+            let own = dests::theirs(x);
+            let link = if x.is_friend() && own != x.name { format!(", calls itself {own}{link}") } else { link };
             let off = if x.backup_to { "" } else { "   NOT IN USE" };
             // The first card of each kind carries that group's heading.
             let mut lines = vec![];
@@ -2217,7 +2322,13 @@ impl App {
             items.push(ListItem::new(Text::from(lines)));
         }
         let block = Block::bordered().title(" Friends, and drives and cloud storage of your own ").border_style(focus);
-        if items.is_empty() {
+        if items.is_empty() && !self.cfg.friends.is_empty() {
+            let text = format!(
+                "None has \"{}\" in its name.\n\nChange that from the menu on the left: Show only names with.",
+                self.dest_filter
+            );
+            f.render_widget(Paragraph::new(text).block(block), area);
+        } else if items.is_empty() {
             let text = "No friends yet, and no drive or cloud storage of your own.\n\n  i  invite a friend (you send them a one-time code)\n  a  accept an invite a friend sent you\n  d  add a local drive or folder\n\nCloud storage (S3, B2 and the like) is added from the menu on the left.";
             f.render_widget(Paragraph::new(text).block(block), area);
         } else {
@@ -2522,7 +2633,15 @@ impl App {
                 Prompt::CleanDest(n) => {
                     format!(" Type yes to delete from {n} the restore points of sets no longer sent there ")
                 }
-                Prompt::Remove(n) => format!(" Type yes to remove {n} (data already stored is left in place) "),
+                Prompt::Remove(n, Some(stored)) => {
+                    format!(" Remove {n}: type keep to keep the {stored} they store here, or delete to delete it ")
+                }
+                Prompt::Remove(n, None) => format!(" Type yes to remove {n} (what is stored there is left in place) "),
+                Prompt::RenameDest(n) => format!(" What this computer calls {n} "),
+                Prompt::DestFilter => " Show only names containing (blank: all) ".into(),
+                Prompt::RemovedDelete => {
+                    " Whose data to delete: the removed friend's name, or the start of its id ".into()
+                }
                 Prompt::Setting("hours") | Prompt::Setting("set-hours") => {
                     " Backup hours, such as 22-7, or 'always' ".into()
                 }
@@ -2689,6 +2808,10 @@ pub async fn run(home: PathBuf) -> Result<()> {
         set_dests: ListState::default(),
         rules: ListState::default(),
         dests: ListState::default(),
+        shown: vec![],
+        dest_sort: Sort::Added,
+        dest_backward: false,
+        dest_filter: String::new(),
         settings: ListState::default(),
         restore: RestoreView::default(),
         source: None,

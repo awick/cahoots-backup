@@ -305,6 +305,7 @@ impl Node {
             drive_key: None,
             cloud: None,
             retention: None,
+            theirs: None,
         };
         let peer = Peer { friend: placeholder, link: Link::Remote(conn.clone()) };
         if !net::offline() {
@@ -314,6 +315,7 @@ impl Node {
         let theirs = peer.pair(Req::Pair { token: t.token, name: self.cfg().name, relay, addrs }).await?;
         let name = self.update(|c| add_friend(c, &id, &theirs, relay_hint, hints))?;
         self.store.allow(&id);
+        self.note_removed(&id, None);
         // The friend keeps this connection for its own requests to us, so they are answered on
         // it from now on: without that it would see us as unreachable until one side restarted.
         if let Some(me) = self.me.upgrade() {
@@ -461,15 +463,92 @@ impl Node {
                 ));
                 continue;
             }
+            // What they call themselves, where this computer calls them something else.
+            let theirs = f.theirs.as_ref().filter(|t| **t != f.name).map(|t| format!(" (calls itself {t})"));
             out.say(format!(
-                "{:<16} quota {} GB, using {}{}  {}",
+                "{:<16} quota {} GB, using {}{}{}  {}",
                 f.name,
                 f.quota_gb,
                 self.stored_here(&f.id).map_or("counting...".into(), human),
                 if f.backup_to { "" } else { ", not backing up to them" },
+                theirs.unwrap_or_default(),
                 f.id
             ));
         }
+        Ok(())
+    }
+
+    /// Gives a destination another name on this computer. A friend's own name for their
+    /// computer is kept beside it.
+    pub(super) async fn rename_destination(&self, name: String, to: String, out: &Out) -> Result<()> {
+        if !to.chars().any(|c| c.is_alphanumeric()) {
+            bail!("use letters and digits for a name");
+        }
+        let to = clean_name(&to);
+        refuse_reserved(&to)?;
+        let c = self.cfg();
+        if !c.friends.iter().any(|f| f.name == name) {
+            bail!("no destination named {name}");
+        }
+        if to == name {
+            return Ok(());
+        }
+        if c.friends.iter().any(|f| f.name == to) {
+            bail!("the name {to} is already used by another destination");
+        }
+        self.update(|c| {
+            // Sets name the destinations they go to.
+            for d in c.sets.iter_mut().flat_map(|b| b.destinations.iter_mut()).filter(|d| **d == name) {
+                *d = to.clone();
+            }
+            if let Some(f) = c.friends.iter_mut().find(|f| f.name == name) {
+                // One paired before their own name was kept: it is the name they have had till now.
+                if f.is_friend() && f.theirs.is_none() {
+                    f.theirs = Some(name.clone());
+                }
+                f.name = to.clone();
+            }
+        })?;
+        out.say(format!("{name} is now called {to} on this computer"));
+        Ok(())
+    }
+
+    /// What removed friends still have stored here.
+    pub(super) async fn show_removed(self: &Arc<Self>, out: &Out) -> Result<()> {
+        let left = self.leftovers();
+        if left.is_empty() {
+            out.say("nothing is stored here for anyone who is not a friend");
+            return Ok(());
+        }
+        for (id, who, used) in &left {
+            let name = who.as_ref().map_or("(name not known)", |w| w.name.as_str());
+            let at = who.as_ref().map(|w| format!(", removed {}", when(w.at))).unwrap_or_default();
+            out.say(format!("{name:<16} {}{at}  {id}", used.map_or("counting...".into(), human)));
+        }
+        out.say("delete one with `cahoots destination removed NAME --delete` (its name, or the start of its id)");
+        Ok(())
+    }
+
+    /// Deletes what one removed friend still has stored here: named as it was, or by its id
+    /// or the start of it. Never a friend's: those are not among `leftovers`.
+    pub(super) async fn delete_removed(self: &Arc<Self>, who: String, out: &Out) -> Result<()> {
+        let left = self.leftovers();
+        let named = |l: &&(String, Option<crate::node::Removed>, Option<u64>)| {
+            l.1.as_ref().is_some_and(|w| w.name == who) || l.0 == who || (who.len() >= 8 && l.0.starts_with(&who))
+        };
+        let (id, was, used) = match left.iter().filter(named).collect::<Vec<_>>()[..] {
+            [one] => one.clone(),
+            [] => bail!("nothing is stored here for a removed friend called {who} (see `cahoots destination removed`)"),
+            _ => bail!("more than one removed friend is called {who}: give the start of its id instead"),
+        };
+        let (node, owner) = (self.clone(), id.clone());
+        tokio::task::spawn_blocking(move || node.store.forget_owner(&owner)).await??;
+        self.note_removed(&id, None);
+        let name = was.map_or_else(|| id[..12].to_string(), |w| w.name);
+        out.say(format!(
+            "deleted what {name} stored here{}",
+            used.map(|u| format!(" ({})", human(u))).unwrap_or_default()
+        ));
         Ok(())
     }
 
@@ -505,13 +584,17 @@ impl Node {
         }
         if purge {
             self.store.forget_owner(&f.id)?;
+            self.note_removed(&f.id, None);
+        } else {
+            // Remembered by name, so what they left can be shown and deleted later.
+            self.note_removed(&f.id, Some(crate::node::Removed { name: name.clone(), at: now() }));
         }
         out.say(format!(
             "removed {name}{}",
             if purge {
                 " and deleted the data they stored here"
             } else {
-                " (their stored data was left in place; use --purge to delete it)"
+                " (what they stored here was kept: `cahoots destination removed` lists it and deletes it)"
             }
         ));
         Ok(())
@@ -1014,6 +1097,7 @@ impl Node {
                 drive_key: None,
                 cloud: None,
                 retention: None,
+                theirs: None,
             });
         })?;
         out.say(format!("{name} added: backups also go to {} (encrypted like everything else). When the drive is unplugged it is skipped and catches up later.", dir.display()));
@@ -1090,6 +1174,7 @@ impl Node {
                 drive_key: None,
                 cloud: Some(cloud),
                 retention: None,
+                theirs: None,
             }),
         })?;
         out.say(format!(

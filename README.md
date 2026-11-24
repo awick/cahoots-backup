@@ -489,6 +489,9 @@ Everything the TUI and GUI do, and a few things only the command line does.
 | `cahoots skip PATH [--remove]` | leave one folder or file out of the set that backs it up |
 | `cahoots set NAME --rename NEW` | rename a backup set; its restore points stay with it |
 | `cahoots destination backup-to NAME false` | stop using a destination |
+| `cahoots destination rename NAME NEW` | what your computer calls a friend, drive or cloud storage; a friend's own name for theirs is still shown |
+| `cahoots destination rm NAME [--purge]` | remove a destination; `--purge` also deletes what that friend stored on your computer |
+| `cahoots destination removed` / `cahoots destination removed NAME --delete` | what removed friends still have stored on your computer, and deleting it |
 | `cahoots destination clean NAME [--dry-run]` | after taking a destination off a set: delete that set's restore points there and the chunks only they used |
 | `cahoots verify --set NAME` | the same checks for one backup set (also on each set in the TUI and GUI) |
 | `cahoots verify [--full]` | check friends still hold your data and it decrypts; repairs damage from another friend |

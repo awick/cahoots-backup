@@ -379,4 +379,25 @@ cp -p flip.saved data/flip
 a backup --set default | grep -q "created on" || fail "going back to an earlier state made no restore point"
 a restore latest data/flip --to flipped >/dev/null
 [ "$(cat flipped/data/flip)" = v1 ] || fail "latest does not hold the files as they are now"
+step "another name for a friend"
+a set default --to bob >/dev/null
+a destination rename bob robert | grep -q "bob is now called robert" || fail "rename a friend"
+a destinations | grep -q "^robert .*calls itself bob" || fail "a renamed friend does not show both its names"
+a sets | grep -q "robert" || fail "a set did not follow its destination to the new name"
+a destination rename robert alice-usb >/dev/null
+a destination rename alice-usb all 2>/dev/null && fail "a destination took a name with a special meaning"
+echo more >data/after-rename
+a backup --set default | grep -q "created on" || fail "backup to a renamed friend"
+a destination rename alice-usb bob >/dev/null
+b destination rename alice alice 2>/dev/null || fail "renaming to the same name is not an error"
+
+step "what a removed friend stored is kept until deleted"
+b destination removed | grep -q "nothing is stored here" || fail "something listed for removed friends before any was removed"
+b destination rm alice | grep -q "was kept" || fail "removing a friend did not say their data was kept"
+b destination removed >removed.out
+grep -q "^alice .*removed " removed.out || fail "what a removed friend stored is not listed: $(cat removed.out)"
+b destination removed nobody --delete 2>/dev/null && fail "deleted the data of someone never removed"
+b destination removed alice --delete | grep -q "deleted what alice stored here" || fail "delete a removed friend's data"
+b destination removed | grep -q "nothing is stored here" || fail "a removed friend's data was not deleted"
+[ -z "$(find bob/store -type f 2>/dev/null)" ] || fail "files of a removed friend are still in the store"
 echo "end-to-end test passed"

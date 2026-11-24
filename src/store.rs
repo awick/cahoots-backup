@@ -566,6 +566,21 @@ impl Store {
             .and_then(|t| Some(t.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64))
     }
 
+    /// Everyone who has a folder here, whether or not they are still a friend.
+    pub fn owners(&self) -> Vec<String> {
+        let Ok(root) = self.open_dir(&self.root, false) else { return vec![] };
+        let mut all = vec![];
+        root.each_name(|name, kind| {
+            if matches!(kind, Kind::Dir | Kind::Unknown)
+                && let Some(owner) = name.to_str().filter(|n| check_owner(n).is_ok())
+            {
+                all.push(owner.to_string());
+            }
+            true
+        });
+        all
+    }
+
     /// Deletes everything an owner stored here and refuses more until `allow` is called for them.
     pub fn forget_owner(&self, owner: &str) -> Result<()> {
         check_owner(owner)?;
