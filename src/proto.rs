@@ -89,10 +89,6 @@ pub async fn send<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Re
     write_blob(w, &postcard::to_stdvec(msg)?).await
 }
 
-pub async fn recv<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T> {
-    recv_max(r, MAX_MSG).await
-}
-
 pub async fn recv_max<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R, max: usize) -> Result<T> {
     Ok(postcard::from_bytes(&read_blob(r, max).await?.unwrap_or_default())?)
 }

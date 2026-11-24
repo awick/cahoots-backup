@@ -35,6 +35,47 @@ const MAX_SNAPS: usize = 50_000;
 const MAX_SNAPS_BYTES: u64 = (MAX_MSG - (1 << 20)) as u64;
 /// Most pages one listing takes: enough for the most objects a node keeps, a thousand a page.
 const MAX_PAGES: u64 = (MAX_IDS + MAX_SNAPS as u64) / 1000 + 1000;
+/// A listing may take this long in all, and more for each page of the objects it is expected
+/// to hold, so storage that pages slowly, a fresh token each time, cannot hold a run up
+/// without end.
+///
+/// DECIDED, AFTER GOING BOTH WAYS: how long a page may take. With no deadline, storage that
+/// paged for ever held a run for as long as it liked. With 2 seconds a page (what storage on
+/// a fast link needs), a large bucket on a slow link could never be listed: a million names
+/// at 5 seconds a page ran out of time on every run, and the destination looked gone for
+/// good. So a page gets what it takes at the slowest pace a friend's link is allowed
+/// (`net::SLOW_DOWN`, about 7 KB/s): a page of a thousand names is about 300 KB, so 45
+/// seconds. That is time a listing may use, not time it takes, and it is only earned by the
+/// names actually sent (`earned_time`), so storage that sends few or none gets LIST_TIME and
+/// two pages (690 seconds) at most. The cost: storage that sends its thousand names every 45
+/// seconds may hold the first full listing of a bucket, before its count is known (at
+/// EXPECT_OBJECTS), for about 52 hours, where 2 seconds a page allowed about 2.
+#[cfg(not(test))]
+const LIST_TIME: Duration = Duration::from_secs(600);
+#[cfg(test)]
+const LIST_TIME: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const PAGE_TIME: Duration = Duration::from_secs(45);
+#[cfg(test)]
+const PAGE_TIME: Duration = Duration::from_millis(1);
+/// Objects a node is expected to keep in one place, for a listing of everything there before
+/// one has been counted.
+const EXPECT_OBJECTS: u64 = 1 << 22;
+
+/// How long a listing expected to hold `objects` names may take in all.
+fn list_time(objects: u64) -> Duration {
+    LIST_TIME + PAGE_TIME * (objects / 1000 + 1).min(MAX_PAGES) as u32
+}
+
+/// How long a listing expected to hold `expected` names may have taken once it has sent
+/// `seen`: no more than `list_time` of what is expected, and only as much of that as the
+/// names it has sent, and the page on its way, have earned. A storage that pages slowly with
+/// few or no names a page so earns no more than LIST_TIME, even before anything has been
+/// counted there and much is expected, while one that sends its thousand a page is never near it.
+fn earned_time(expected: u64, seen: u64) -> Duration {
+    list_time(expected).min(list_time(seen.saturating_add(1000)))
+}
+
 /// A sealed chunk is a format byte, a nonce and a tag around at most this much.
 const MIN_SEALED: u64 = 1 + 24 + 16;
 const MAX_SEALED: usize = MAX_BLOB + 64;
@@ -54,6 +95,8 @@ pub struct Bucket {
     local: bool,
     /// Bytes stored, learned from a listing and kept current as we add and remove.
     used: Mutex<Option<u64>>,
+    /// Objects the last listing of everything found, for the time the next may take.
+    objects: Mutex<Option<u64>>,
     /// One count of the bucket at a time; the others wait for its answer.
     counting: tokio::sync::Mutex<()>,
     /// Restore point records already downloaded, by id, with the version tag the storage gave.
@@ -126,6 +169,7 @@ impl Bucket {
             place: format!("{} at {host}", c.bucket),
             local,
             used: Mutex::new(None),
+            objects: Mutex::new(None),
             counting: Default::default(),
             snaps: Mutex::new(HashMap::new()),
         })
@@ -223,8 +267,12 @@ impl Bucket {
     }
 
     /// Every object under a prefix: its name, size and version tag. Listings come a thousand
-    /// at a time and are handed over as they arrive; `each` returns false to stop early.
-    async fn list(&self, prefix: &str, mut each: impl FnMut(&str, u64, &str) -> bool) -> Result<()> {
+    /// at a time and are handed over as they arrive; `each` returns false to stop early. One
+    /// expected to hold about `objects` names gets `list_time` of them at most, however it
+    /// pages, and only as much as the names it sends earn (see `earned_time`).
+    async fn list(&self, prefix: &str, objects: u64, mut each: impl FnMut(&str, u64, &str) -> bool) -> Result<()> {
+        let (start, mut seen) = (tokio::time::Instant::now(), 0u64);
+        let late = || anyhow!("the storage took too long to list what it holds");
         let mut token: Option<String> = None;
         // A storage that hands back any token it gave before, or pages without end, is never done.
         let mut tokens = HashSet::new();
@@ -235,12 +283,18 @@ impl Bucket {
                 action.with_continuation_token(t.clone());
             }
             let url = action.sign(SIGNED_FOR);
-            let r = self.send("list the bucket", || self.http.get(url.as_str())).await?;
-            if !r.status().is_success() {
-                return Err(Self::fail("list the bucket", r).await);
-            }
-            let text = String::from_utf8(Self::body(r, MAX_PAGE).await?).map_err(|_| anyhow!("unreadable listing"))?;
+            let page = async {
+                let r = self.send("list the bucket", || self.http.get(url.as_str())).await?;
+                if !r.status().is_success() {
+                    return Err(Self::fail("list the bucket", r).await);
+                }
+                Self::body(r, MAX_PAGE).await
+            };
+            let until = start + earned_time(objects, seen);
+            let body = tokio::time::timeout_at(until, page).await.map_err(|_| late())??;
+            let text = String::from_utf8(body).map_err(|_| anyhow!("unreadable listing"))?;
             let page = ListObjectsV2::parse_response(&text).map_err(|e| anyhow!("unreadable listing: {e}"))?;
+            seen = seen.saturating_add(page.contents.len() as u64);
             for o in &page.contents {
                 // A name outside what was asked for is not ours to act on.
                 if o.key.starts_with(prefix) && !each(&o.key, o.size.unwrap_or(0), o.etag.as_deref().unwrap_or("")) {
@@ -274,7 +328,7 @@ impl Bucket {
     /// Proves the endpoint, bucket and keys work for reading, writing and deleting, and that
     /// the bucket is not open to anyone (as one squatted under a name we picked may be).
     pub async fn check(&self) -> Result<()> {
-        self.list(&self.base, |_, _, _| false).await?;
+        self.list(&self.base, 0, |_, _, _| false).await?;
         if !self.local {
             let mut action = self.bucket.list_objects_v2(None);
             action.with_prefix(self.base.clone());
@@ -294,14 +348,27 @@ impl Bucket {
         if let Some(u) = *self.used.lock().unwrap() {
             return Ok(u);
         }
-        let mut total = 0u64;
-        self.list(&self.base, |_, size, _| {
+        let (mut total, mut seen) = (0u64, 0u64);
+        self.list(&self.base, self.expect(0), |_, size, _| {
             total = total.saturating_add(size);
+            seen += 1;
             true
         })
         .await?;
-        *self.used.lock().unwrap() = Some(total);
+        (*self.used.lock().unwrap(), *self.objects.lock().unwrap()) = (Some(total), Some(seen));
         Ok(total)
+    }
+
+    /// Objects a listing of everything here may honestly hold, when `asked` chunks are known
+    /// of: those and all the restore point records there may be, or what the last such listing
+    /// found and a quarter more, whichever is more. Before any has been counted, as many as a
+    /// node is expected to keep. Never what the storage now sends.
+    fn expect(&self, asked: u64) -> u64 {
+        let asked = asked.saturating_add(MAX_SNAPS as u64);
+        match *self.objects.lock().unwrap() {
+            Some(n) => asked.max(n.saturating_add(n / 4)),
+            None => asked.max(EXPECT_OBJECTS),
+        }
     }
 
     /// Counts the bucket again: the running total runs high after chunks are deleted.
@@ -311,11 +378,12 @@ impl Bucket {
     }
 
     /// Hands each chunk stored here to `each` as the listing arrives; the caller decides what to
-    /// keep, so storage that lists ids it never stored cannot make this node hold them.
-    pub async fn list_chunks(&self, mut each: impl FnMut(Id)) -> Result<()> {
+    /// keep, so storage that lists ids it never stored cannot make this node hold them. The
+    /// listing gets the time one of `expect` chunks, or of what was last counted here, may take.
+    pub async fn list_chunks(&self, expect: u64, mut each: impl FnMut(Id)) -> Result<()> {
         let chunks = format!("{}chunks/", self.base);
         let (mut total, mut seen) = (0u64, 0u64);
-        self.list(&self.base, |key, size, _| {
+        self.list(&self.base, self.expect(expect), |key, size, _| {
             total = total.saturating_add(size);
             seen += 1;
             // Only what could be a sealed chunk counts as one stored.
@@ -331,7 +399,7 @@ impl Bucket {
         if seen > MAX_IDS {
             bail!("implausible chunk count");
         }
-        *self.used.lock().unwrap() = Some(total);
+        (*self.used.lock().unwrap(), *self.objects.lock().unwrap()) = (Some(total), Some(seen));
         Ok(())
     }
 
@@ -402,7 +470,7 @@ impl Bucket {
     pub async fn list_snapshots(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let prefix = format!("{}snapshots/", self.base);
         let (mut found, mut listed): (Vec<(String, String)>, u64) = (vec![], 0);
-        self.list(&prefix, |key, size, etag| {
+        self.list(&prefix, MAX_SNAPS as u64, |key, size, etag| {
             let id = &key[prefix.len()..];
             if check_snap(id).is_ok() && size <= MAX_SNAPSHOT as u64 {
                 found.push((id.to_string(), etag.to_string()));
@@ -446,6 +514,9 @@ impl Bucket {
                 if held > MAX_SNAPS_BYTES {
                     return Err(too_big());
                 }
+                // Kept as each arrives, so a listing given up on half way (see
+                // `net::snapshots_time`) does not fetch them all again the next time.
+                self.snaps.lock().unwrap().insert(id.clone(), (etag.clone(), b.clone()));
                 keep.insert(id.clone(), (etag, b.clone()));
                 out.push((id, b));
             }
@@ -468,6 +539,91 @@ impl Bucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listing_has_a_deadline_by_what_is_expected() {
+        assert_eq!(list_time(0), LIST_TIME + PAGE_TIME);
+        assert_eq!(list_time(1_000_000), LIST_TIME + PAGE_TIME * 1001);
+        // However many objects are expected, never more than the pages a listing may take.
+        assert_eq!(list_time(u64::MAX), LIST_TIME + PAGE_TIME * MAX_PAGES as u32);
+    }
+
+    #[test]
+    fn a_listing_earns_its_time_by_the_names_it_sends() {
+        // Nothing sent yet: the first page's worth, however much is expected.
+        assert_eq!(earned_time(EXPECT_OBJECTS, 0), list_time(1000));
+        // A storage that pages without names earns no more as it goes on.
+        assert_eq!(earned_time(EXPECT_OBJECTS, 0), LIST_TIME + PAGE_TIME * 2);
+        // One that sends its names earns time for them, up to what is expected.
+        assert_eq!(earned_time(EXPECT_OBJECTS, 1_000_000), list_time(1_001_000));
+        assert_eq!(earned_time(5000, 1_000_000), list_time(5000));
+    }
+
+    #[test]
+    fn a_full_listing_is_given_the_time_the_last_one_needed() {
+        let c = Cloud {
+            endpoint: "http://127.0.0.1:9".into(),
+            bucket: "b".into(),
+            region: "us-east-1".into(),
+            prefix: String::new(),
+            access_key: "a".into(),
+            secret_key: "s".into(),
+            path_style: true,
+            ca_pem: None,
+        };
+        let b = Bucket::open(&c, "me").unwrap();
+        // Before anything is counted there, as many as a node is expected to keep.
+        assert_eq!(b.expect(10), EXPECT_OBJECTS);
+        // After, what was found and a quarter more, however few chunks the caller asks about.
+        *b.objects.lock().unwrap() = Some(8_000_000);
+        assert_eq!(b.expect(10), 10_000_000);
+        assert_eq!(b.expect(20_000_000), 20_000_000 + MAX_SNAPS as u64);
+    }
+
+    /// A storage that keeps paging, slowly and with a fresh token each time, is given up on
+    /// once the listing's time is up rather than when its pages run out.
+    #[tokio::test]
+    async fn a_slow_endless_listing_is_given_up_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut n = 0u64;
+            while let Ok((mut c, _)) = server.accept().await {
+                n += 1;
+                let body = format!(
+                    "<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <MaxKeys>1000</MaxKeys><IsTruncated>true</IsTruncated><NextContinuationToken>t{n}</NextContinuationToken>\
+                     </ListBucketResult>"
+                );
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = c.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = c.write_all(format!("{head}{body}").as_bytes()).await;
+                });
+            }
+        });
+        let c = Cloud {
+            endpoint: format!("http://127.0.0.1:{port}"),
+            bucket: "b".into(),
+            region: "us-east-1".into(),
+            prefix: String::new(),
+            access_key: "a".into(),
+            secret_key: "s".into(),
+            path_style: true,
+            ca_pem: None,
+        };
+        let b = Bucket::open(&c, "me").unwrap();
+        let t = std::time::Instant::now();
+        let err = b.list_snapshots().await.unwrap_err();
+        assert!(format!("{err:#}").contains("too long"), "{err:#}");
+        assert!(t.elapsed() < list_time(MAX_SNAPS as u64) + Duration::from_secs(1), "{:?}", t.elapsed());
+    }
 
     #[test]
     fn plain_http_is_only_for_this_computer() {

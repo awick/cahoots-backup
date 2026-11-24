@@ -1715,8 +1715,7 @@ impl App {
                 }
             }
             Prompt::Drive => {
-                let home = crate::os::home_text().unwrap_or_default();
-                let typed = text.replacen('~', &home, 1);
+                let typed = crate::os::expand_home(&text);
                 match crate::os::real_path(&typed) {
                     Ok(path) if path.is_dir() => {
                         let name = path
@@ -1745,19 +1744,13 @@ impl App {
                 let (name, endpoint, bucket, region, prefix, ca) = (next(), next(), next(), next(), next(), next());
                 let ca_pem = match ca.as_str() {
                     "" => None,
-                    path => {
-                        match std::fs::read_to_string(path.replacen(
-                            '~',
-                            &crate::os::home_text().unwrap_or_default(),
-                            1,
-                        )) {
-                            Ok(pem) => Some(pem),
-                            Err(e) => {
-                                self.status = format!("cannot read the CA certificate file {path}: {e}");
-                                return;
-                            }
+                    path => match std::fs::read_to_string(crate::os::expand_home(path)) {
+                        Ok(pem) => Some(pem),
+                        Err(e) => {
+                            self.status = format!("cannot read the CA certificate file {path}: {e}");
+                            return;
                         }
-                    }
+                    },
                 };
                 let cmd = Cmd::CloudAdd(CloudAdd {
                     name,

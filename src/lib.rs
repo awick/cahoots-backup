@@ -1,7 +1,9 @@
 // Copyright Andy Wick
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
+// No unchecked code, with one exception, which says why: `os::windows::sys`, the calls into
+// Windows that the standard library has no safe form of.
+#![deny(unsafe_code)]
 // Nested `if let` reads more clearly here than long let-chains.
 #![allow(clippy::collapsible_if)]
 
@@ -110,8 +112,10 @@ enum C {
     },
     /// Print a one-time invite for a friend
     Invite,
-    /// Accept a friend's invite
-    Join { ticket: String },
+    /// Accept a friend's invite. Run it bare and paste the invite when asked (or pipe it in with
+    /// `-`, or set CAHOOTS_TICKET): an invite on the command line can be seen by other users of
+    /// this computer while it runs
+    Join { ticket: Option<String> },
     /// List destinations: friends and drives
     #[command(alias = "friends")]
     Destinations,
@@ -415,6 +419,32 @@ fn passphrase(new: bool) -> Result<String> {
     Ok(p)
 }
 
+/// The invite to join with: the one given, else CAHOOTS_TICKET, else a line read from what is
+/// piped in, else one pasted when asked. `-` asks for what is piped in, whatever CAHOOTS_TICKET
+/// holds. Only the first is seen by other users of this computer (in the list of what runs),
+/// so the rest are what the help suggests.
+fn invite(given: Option<String>) -> Result<String> {
+    use std::io::{BufRead, IsTerminal};
+    let piped = given.as_deref() == Some("-");
+    let text = match given.filter(|t| t != "-") {
+        Some(t) => t,
+        None => match config::env_text("TICKET").filter(|_| !piped) {
+            Some(t) => t,
+            None if std::io::stdin().is_terminal() => rpassword::prompt_password("Invite (it is not shown): ")?,
+            None => {
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                line
+            }
+        },
+    };
+    let ticket = text.trim().trim_start_matches("cahoots join ").trim_start_matches("sdb join ").trim();
+    if ticket.is_empty() {
+        bail!("no invite given: paste the one your friend sent (it starts with cahoots1)");
+    }
+    Ok(ticket.to_string())
+}
+
 /// A speed in MB/s from the command line, as KB/s.
 fn speed(text: &str) -> Result<u64, String> {
     config::parse_mbps(text).ok_or_else(|| "a speed is a number of MB/s such as 0.5 or 20 (0 = unlimited)".to_string())
@@ -493,6 +523,11 @@ fn spawn_daemon(home: &std::path::Path) -> Result<()> {
     if service::restart(home) {
         return Ok(());
     }
+    start_daemon(home)
+}
+
+/// Starts the daemon apart from this program, with daemon.log to write to.
+fn start_daemon(home: &std::path::Path) -> Result<()> {
     let log = fs::OpenOptions::new().create(true).append(true).open(home.join("daemon.log"))?;
     let mut cmd = std::process::Command::new(os::program()?);
     cmd.arg("daemon").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
@@ -563,13 +598,20 @@ async fn run(cmd: Cmd) -> Result<()> {
     control::client(daemon_stream(&home).await?, &cmd).await
 }
 
-async fn tui_main(home: PathBuf) -> Result<()> {
+/// Sets up a new node in `home` for the first start of a screen.
+fn first_run(home: &std::path::Path) -> Result<()> {
     if !home.join("identity.key").exists() {
-        fs::create_dir_all(&home)?;
-        os::private_dir(&home)?;
-        Identity::generate().save(&home)?;
-        Config::new(hostname()).save(&home)?;
+        config::check_new_home(home)?;
+        fs::create_dir_all(home)?;
+        os::private_dir(home)?;
+        Identity::generate().save(home)?;
+        Config::new(hostname()).save(home)?;
     }
+    Ok(())
+}
+
+async fn tui_main(home: PathBuf) -> Result<()> {
+    first_run(&home)?;
     drop(daemon_stream(&home).await?);
     tui::run(home).await
 }
@@ -596,7 +638,15 @@ pub fn windowed() {
     if args.len() < 2 {
         args.push("gui".into());
     }
-    if let Err(e) = main_with(Cli::parse_from(args)) {
+    let cli = Cli::parse_from(args);
+    // Started at login it has nowhere to print, so the daemon would leave no log: it is
+    // started again with daemon.log to write to, as any other command starts it.
+    #[cfg(windows)]
+    let done =
+        if matches!(cli.cmd, C::Daemon) && os::no_output() { start_daemon(&config::home()) } else { main_with(cli) };
+    #[cfg(not(windows))]
+    let done = main_with(cli);
+    if let Err(e) = done {
         gui::alert(&node::clean(&format!("{e:#}")));
         std::process::exit(1);
     }
@@ -606,9 +656,7 @@ async fn real_main(cli: Cli) -> Result<()> {
     let home = config::home();
     let cmd = match cli.cmd {
         C::Init { name, port, store } => {
-            if home.join("identity.key").exists() {
-                bail!("{} is already set up", home.display());
-            }
+            config::check_new_home(&home)?;
             let name = name.unwrap_or_else(hostname);
             if config::reserved(&name) {
                 bail!("\"{name}\" has a special meaning in destination lists; choose another name");
@@ -619,10 +667,14 @@ async fn real_main(cli: Cli) -> Result<()> {
             let mut cfg = Config::new(name);
             cfg.port = port.unwrap_or(cfg.port);
             cfg.store_dir = store.map(|s| std::path::absolute(&s)).transpose()?;
+            // Made now, when it is chosen: the daemon only opens it (see `Node::start`).
+            if let Some(dir) = &cfg.store_dir {
+                fs::create_dir_all(dir).with_context(|| format!("cannot make {}", dir.display()))?;
+            }
             cfg.save(&home)?;
             println!("Set up \"{}\" in {}", cfg.name, home.display());
             println!(
-                "Next: `cahoots add <folder>`, `cahoots invite` (or `cahoots join <invite>`), `cahoots service install`."
+                "Next: `cahoots add <folder>`, `cahoots invite` (or `cahoots join`, then paste their invite), `cahoots service install`."
             );
             println!(
                 "Then run `cahoots recovery export <file>` and keep that file somewhere other than this computer."
@@ -633,12 +685,7 @@ async fn real_main(cli: Cli) -> Result<()> {
         C::Tui => return tui_main(home).await,
         #[cfg(feature = "gui")]
         C::Gui => {
-            if !home.join("identity.key").exists() {
-                fs::create_dir_all(&home)?;
-                os::private_dir(&home)?;
-                Identity::generate().save(&home)?;
-                Config::new(hostname()).save(&home)?;
-            }
+            first_run(&home)?;
             drop(daemon_stream(&home).await?);
             return gui::run(home);
         }
@@ -729,7 +776,7 @@ async fn real_main(cli: Cli) -> Result<()> {
             Cmd::Skip { path: os::real_path(&path).unwrap_or(std::path::absolute(&path)?), set, remove }
         }
         C::Invite => Cmd::Invite,
-        C::Join { ticket } => Cmd::Join { ticket },
+        C::Join { ticket } => Cmd::Join { ticket: invite(ticket)? },
         C::Destinations => Cmd::Friends,
         C::Destination { cmd } => match cmd {
             FriendCmd::Rm { name, purge } => Cmd::FriendRemove { name, purge },

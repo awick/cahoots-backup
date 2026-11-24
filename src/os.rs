@@ -40,6 +40,21 @@ pub fn home_text() -> Option<String> {
     std::env::var(HOME).ok()
 }
 
+/// A typed path with `~` at its start filled in: `~` alone or before a separator, never one
+/// inside a name, as a Windows short name has (`ANDYWI~1`).
+pub fn expand_home(typed: &str) -> String {
+    fill_home(typed, home_text().as_deref())
+}
+
+fn fill_home(typed: &str, home: Option<&str>) -> String {
+    match (typed.strip_prefix('~'), home) {
+        (Some(rest), Some(home)) if rest.chars().next().is_none_or(std::path::is_separator) => {
+            format!("{home}{rest}")
+        }
+        _ => typed.to_string(),
+    }
+}
+
 /// What a name in a folder is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -78,4 +93,27 @@ pub struct Recorded {
     #[cfg_attr(windows, allow(dead_code))]
     pub gid: u32,
     pub mtime: i64,
+}
+
+impl Recorded {
+    /// Whether it was closed to everyone but its owner: no permissions for its group or for
+    /// others. A restore keeps it so where permissions are kept another way (Windows).
+    pub fn private(&self) -> bool {
+        self.mode & 0o077 == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fill_home;
+
+    #[test]
+    fn only_a_tilde_at_the_start_is_the_home() {
+        let home = Some("/home/me");
+        assert_eq!(fill_home("~", home), "/home/me");
+        assert_eq!(fill_home("~/x", home), "/home/me/x");
+        assert_eq!(fill_home("/a/ANDYWI~1/x", home), "/a/ANDYWI~1/x");
+        assert_eq!(fill_home("~other/x", home), "~other/x");
+        assert_eq!(fill_home("~/x", None), "~/x");
+    }
 }

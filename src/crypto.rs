@@ -120,12 +120,27 @@ pub fn kit_seal_key(key: &[u8; 32], salt: &[u8; 16], plain: &[u8], node: &str) -
 }
 
 pub fn kit_open(pass: &str, kit: &str) -> Result<Vec<u8>> {
+    let kit = kit_read(kit)?;
+    kit_decrypt(&kit_key(pass, &hex::decode(&kit.salt)?)?, &kit)
+}
+
+/// Opens a kit with the key its passphrase and salt made.
+pub fn kit_open_key(key: &[u8; 32], kit: &str) -> Result<Vec<u8>> {
+    kit_decrypt(key, &kit_read(kit)?)
+}
+
+/// A kit this cahoots can read. Its format is checked before anything else is done with it,
+/// the slow making of the key included, so a newer kit says what it is at once.
+fn kit_read(kit: &str) -> Result<Kit> {
     let kit: Kit = serde_json::from_str(kit).map_err(|_| anyhow!("not a recovery kit"))?;
     if kit.format != "super-duper-backup recovery kit v1" {
         bail!("this recovery kit ({}) needs a newer cahoots", kit.format);
     }
-    let key = kit_key(pass, &hex::decode(&kit.salt)?)?;
-    decrypt(&cipher(&key), b"sdb-recovery-kit", &hex::decode(&kit.data)?)
+    Ok(kit)
+}
+
+fn kit_decrypt(key: &[u8; 32], kit: &Kit) -> Result<Vec<u8>> {
+    decrypt(&cipher(key), b"sdb-recovery-kit", &hex::decode(&kit.data)?)
         .map_err(|_| anyhow!("wrong passphrase or damaged recovery kit"))
 }
 

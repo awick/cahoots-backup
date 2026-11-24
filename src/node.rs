@@ -419,6 +419,23 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Closes a folder of the home to other users, as homes set up by older releases, or left
+/// open since, are not. One another account owns is not used: whoever owns it could open it
+/// to themselves again at any time. One that cannot be closed for another reason (a disk
+/// that keeps no permissions of its own) is used, and `warnings` says so.
+fn private_home(dir: &Path, warnings: &mut Vec<String>) -> Result<()> {
+    match crate::os::private_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            bail!("cannot keep {} private to you, so it is not used; check who owns it: {e}", dir.display())
+        }
+        Err(e) => {
+            warnings.push(format!("{} cannot be kept private to you ({e}), so it is used as it is", dir.display()));
+            Ok(())
+        }
+    }
+}
+
 fn clean_name(name: &str) -> String {
     let s: String = name.chars().filter(|c| c.is_alphanumeric() || "-_.".contains(*c)).take(32).collect();
     if s.is_empty() { "friend".into() } else { s }
@@ -509,11 +526,30 @@ impl Node {
         let cfg = Config::load(&home)?;
         let ident = Identity::load(&home)?;
         let secret = SecretKey::from_bytes(&Identity::bytes(&ident.secret)?);
+        let (store_dir, min_free) = (cfg.store_dir(&home), cfg.min_free_gb.saturating_mul(1 << 30));
+        // The store in the home is made if it is missing. One put elsewhere is only opened: it
+        // was made when it was chosen, and making it again while its drive is away would
+        // start an empty store on whatever disk lies under where the drive goes.
+        let own_store = cfg.store_dir.is_none();
+        // Disk work, and on Windows the first time a walk of all under the home: off the async
+        // workers. The store goes first: closed with a list of its own, it is left alone when the
+        // home passes its list down, and so not gone through twice.
+        let (home, store, warnings) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let store = Store::new_or_shut(store_dir, min_free, own_store);
+            let mut warnings: Vec<String> = store.warning.iter().cloned().collect();
+            let cache = home.join("cache");
+            for dir in [&home, &cache] {
+                fs::create_dir_all(dir)?;
+                private_home(dir, &mut warnings)?;
+            }
+            Ok((home, store, warnings))
+        })
+        .await??;
         let endpoint = net::bind(secret, cfg.port, cfg.upnp).await?;
         let master = Identity::bytes(&ident.master)?;
         let node = Arc::new_cyclic(|me| Node {
             me: me.clone(),
-            store: Store::new(cfg.store_dir(&home), cfg.min_free_gb.saturating_mul(1 << 30)),
+            store,
             keys: Arc::new(Keys::new(&master)),
             home,
             cfg: Mutex::new(cfg),
@@ -540,6 +576,10 @@ impl Node {
             watching,
             last_backup: Mutex::new(None),
         });
+        for w in warnings {
+            eprintln!("cahoots: {w}");
+            node.note(w);
+        }
         let router = Router::builder(endpoint).accept(ALPN, Handler(node.clone())).spawn();
         Ok((node, router))
     }
@@ -680,9 +720,30 @@ impl Node {
                 Ok(_) => bail!("{}: {} is a link or a file, refusing to use it", f.name, dir.display()),
                 Err(_) => bail!("{}: drive is not connected ({} not found)", f.name, dir.display()),
             }
+            // Closed to other users before anything is written in it, the disk's mark included,
+            // off the async workers: the first time, that may go through every file on it.
+            let known = self.drives.lock().unwrap().get(&dir).cloned();
+            let store = match known {
+                Some(s) => s,
+                None => {
+                    // A disk that says it is not the one that was added is refused before
+                    // anything on it is changed. One whose mark cannot be read yet is checked after.
+                    let marked = self.cfg().friends.iter().any(|x| x.id == f.id && x.drive_key.is_some());
+                    if marked && read_mark(&dir).is_some() {
+                        self.check_drive(f, &dir)?;
+                    }
+                    let at = dir.clone();
+                    let store = tokio::task::spawn_blocking(move || Store::new(at, 0)).await?;
+                    let store = Arc::new(store.with_context(|| f.name.clone())?);
+                    if let Some(w) = &store.warning {
+                        eprintln!("cahoots: {}: {w}", f.name);
+                        self.note(format!("{}: {w}", f.name));
+                    }
+                    store
+                }
+            };
             self.check_drive(f, &dir)?;
-            let store =
-                self.drives.lock().unwrap().entry(dir.clone()).or_insert_with(|| Arc::new(Store::new(dir, 0))).clone();
+            let store = self.drives.lock().unwrap().entry(dir).or_insert(store).clone();
             return Ok(Peer { friend: f.clone(), link: Link::Drive(store, self.id()) });
         }
         if let Some(c) = &f.cloud {
@@ -747,12 +808,37 @@ impl Node {
             }
         }
         // Also some others, so the chunks an interrupted backup already sent are not sent again.
-        let l = peer.list_chunks(Arc::new(ours), KNOWN_OTHERS).await?;
+        let l = self.list_chunks(peer, Arc::new(ours), KNOWN_OTHERS).await?;
         let mut set = l.have;
         set.extend(l.other);
         let set = Arc::new(set);
         self.known.lock().await.insert(peer.friend.id.clone(), (Instant::now(), set.clone()));
         Ok(set)
+    }
+
+    /// Lists the chunks a destination holds for us (see `Peer::list_chunks`), in the time a
+    /// listing as long as it may honestly be can take: by what this node asks about, and by
+    /// how many it listed last time, which is kept for the next.
+    async fn list_chunks(&self, peer: &Peer, wanted: Arc<HashSet<Id>>, others: usize) -> Result<net::Listing> {
+        // Held only while the record is read or written, never over the listing itself.
+        static RECORD: Mutex<()> = Mutex::new(());
+        let path = self.home.join("cache").join("listed.json");
+        let counts = || -> HashMap<String, u64> {
+            fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        };
+        let last = {
+            let _r = RECORD.lock().unwrap_or_else(|e| e.into_inner());
+            counts().get(&peer.friend.id).copied().unwrap_or(0)
+        };
+        let expect = net::expected_ids(wanted.len() + others, last);
+        let listing = peer.list_chunks(wanted, others, expect);
+        let l = net::in_time(&peer.friend.name, net::listing_time(expect), listing).await?;
+        let _r = RECORD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = counts();
+        all.insert(peer.friend.id.clone(), l.count);
+        let _ = self.cache();
+        let _ = write_private(&path, &serde_json::to_vec(&all).unwrap_or_default());
+        Ok(l)
     }
 
     pub async fn set_known(&self, id: &str, set: Arc<HashSet<Id>>) {
@@ -790,9 +876,18 @@ impl Node {
     }
 
     pub fn save_index(&self, set: &str, entries: &[Entry]) -> Result<()> {
-        fs::create_dir_all(self.home.join("cache"))?;
-        fs::write(self.last_index_path(set), zstd::encode_all(&snapshot::encode_index(entries)?[..], 3)?)?;
-        Ok(())
+        self.cache()?;
+        write_private(&self.last_index_path(set), &zstd::encode_all(&snapshot::encode_index(entries)?[..], 3)?)
+    }
+
+    /// The folder caches go in, made private if it is new: an index names every file backed up.
+    pub(crate) fn cache(&self) -> Result<PathBuf> {
+        let dir = self.home.join("cache");
+        if !dir.is_dir() {
+            fs::create_dir_all(&dir)?;
+            crate::os::private_dir(&dir).with_context(|| format!("cannot keep {} private", dir.display()))?;
+        }
+        Ok(dir)
     }
 
     pub async fn load_index(&self, snap: &Snap) -> Result<Vec<Entry>> {
@@ -804,8 +899,8 @@ impl Node {
         }
         let buf = self.fetch(&snap.friends(), &snap.m.index).await?.concat();
         let entries = snapshot::decode_index(&buf)?;
-        fs::create_dir_all(path.parent().unwrap())?;
-        fs::write(&path, zstd::encode_all(&buf[..], 3)?)?;
+        self.cache()?;
+        write_private(&path, &zstd::encode_all(&buf[..], 3)?)?;
         Ok(entries)
     }
 
@@ -866,7 +961,9 @@ impl Node {
         let mut live = vec![];
         let gone = self.forgotten();
         for p in peers {
-            let list = match p.list_snapshots().await {
+            // One at a time, each in bounded time: a destination that trickles its listing
+            // cannot hold up a prune, a check or a restore, nor the backups waiting for them.
+            let list = match net::in_time(&p.friend.name, net::snapshots_time(), p.list_snapshots()).await {
                 Ok(l) => l,
                 Err(e) => {
                     out.say(format!("  {e:#}"));
@@ -1037,7 +1134,7 @@ impl Node {
             }
             uses.add_to(&s.id, &mut live);
         }
-        let l = peer.list_chunks(Arc::new(live), MAX_DEAD).await?;
+        let l = self.list_chunks(peer, Arc::new(live), MAX_DEAD).await?;
         Ok((l.have, l.other, l.count))
     }
 
@@ -1100,7 +1197,7 @@ impl Node {
         let peer = self.peer_patient(&f).await?;
         let gone = self.forgotten();
         let mut held: Vec<Snap> = vec![];
-        for (id, blob) in peer.list_snapshots().await? {
+        for (id, blob) in net::in_time(&f.name, net::snapshots_time(), peer.list_snapshots()).await? {
             if gone.contains(&id) || gone.contains(&format!("{}|{id}", f.id)) {
                 continue;
             }
@@ -1522,9 +1619,8 @@ impl Node {
             }
         }
         let path = self.index_path(&s.id, &s.m.index);
-        fs::create_dir_all(path.parent().unwrap())?;
-        fs::write(path, zstd::encode_all(&buf[..], 3)?)?;
-        Ok(())
+        self.cache()?;
+        write_private(&path, &zstd::encode_all(&buf[..], 3)?)
     }
 
     /// Checks what friends hold for us and repairs damaged or missing chunks from another friend.
@@ -1595,7 +1691,7 @@ impl Node {
         }
         // Only what these restore points use is kept from the listing.
         let refs = Arc::new(refs);
-        let listing = p.list_chunks(refs.clone(), 0).await?;
+        let listing = self.list_chunks(p, refs.clone(), 0).await?;
         let (have, listed) = (Arc::new(listing.have), listing.count);
         // A check of one set saw only that set's chunks: it adds to what is known rather than
         // replacing it, or the other sets' next backups would send everything again.
@@ -1635,7 +1731,8 @@ impl Node {
                 told = Instant::now();
                 out.say(format!("  ... {}: checked {done} of {} chunks", p.friend.name, ids.len()));
             }
-            for (id, blob) in batch.iter().zip(p.get_chunks(batch).await?) {
+            let blobs = net::in_time(&p.friend.name, net::fetch_time(batch.len()), p.get_chunks(batch)).await?;
+            for (id, blob) in batch.iter().zip(blobs) {
                 match blob.ok_or_else(|| anyhow!("missing")).and_then(|b| self.keys.open(id, &b)) {
                     Ok(d) => read += d.len() as u64,
                     Err(_) => bad.push(*id),
@@ -1775,13 +1872,13 @@ impl Node {
             m.insert(id.clone(), now());
             m.insert(format!("{set}|{id}"), now());
         }
-        let _ = fs::create_dir_all(self.home.join("cache"));
-        let _ = fs::write(self.state_path(), serde_json::to_vec(&m).unwrap_or_default());
+        let _ = self.cache();
+        let _ = write_private(&self.state_path(), &serde_json::to_vec(&m).unwrap_or_default());
         let path = self.home.join("cache").join("set-stats.json");
         let mut stats: HashMap<String, (u64, u64, i64)> =
             fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         stats.insert(set.to_string(), (files, bytes, now()));
-        let _ = fs::write(path, serde_json::to_vec(&stats).unwrap_or_default());
+        let _ = write_private(&path, &serde_json::to_vec(&stats).unwrap_or_default());
     }
 
     /// Checks on every destination in the background so the home screen never waits.
@@ -1948,8 +2045,8 @@ impl Node {
         let mut all: HashMap<String, i64> =
             fs::read(self.jobs_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         all.insert(job.to_string(), now());
-        let _ = fs::create_dir_all(self.home.join("cache"));
-        let _ = fs::write(self.jobs_path(), serde_json::to_vec(&all).unwrap_or_default());
+        let _ = self.cache();
+        let _ = write_private(&self.jobs_path(), &serde_json::to_vec(&all).unwrap_or_default());
     }
 
     /// Whether a job last run at `last` and wanted every `every` seconds is due at `now`. A
@@ -1964,10 +2061,36 @@ impl Node {
         fs::read(self.state_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
+    /// Tries a shut store again (see `Store::ready`) off the async workers, so what `warnings`
+    /// says of it is current and not as the last friend to ask found it.
+    pub async fn recheck_store(&self) {
+        if self.store.shut().is_none() {
+            return;
+        }
+        if let Some(me) = self.me.upgrade() {
+            let _ = tokio::task::spawn_blocking(move || me.store_ready()).await;
+        }
+    }
+
+    /// `Store::ready`, passing on, as a start does, why a store that has just opened could not
+    /// be closed to other users. Disk work: not on the async workers.
+    pub fn store_ready(&self) -> bool {
+        let ready = self.store.ready();
+        if let Some(w) = self.store.late_warning() {
+            eprintln!("cahoots: {w}");
+            self.note(w);
+        }
+        ready
+    }
+
     /// Things the owner should know about: backups that have gone stale in either direction.
+    /// What it says of this node's store is as last found: `recheck_store` first.
     pub fn warnings(&self) -> Vec<String> {
         let c = self.cfg();
         let mut w = vec![];
+        if let Some(why) = self.store.shut() {
+            w.push(format!("friends cannot back up to or restore from this computer: {why}"));
+        }
         for b in c.sets.iter().filter(|b| !b.paths.is_empty() && b.destinations.iter().all(|d| d == NOWHERE)) {
             if !b.destinations.is_empty() {
                 w.push(format!("set {} has no destination and is not being backed up", b.name));
@@ -1987,8 +2110,14 @@ impl Node {
             }
         }
         if let Some(c) = crate::recovery::copy_load(&self.home) {
-            if let Some(e) = c.error {
+            // What the last try found says more than that it waits.
+            if let Some(e) = &c.error {
                 w.push(format!("the recovery kit could not be copied to {}: {e}", c.folder.display()));
+            } else if c.unchecked() {
+                w.push(format!(
+                    "the recovery kit copy in {} was set up by an older release and waits until the kit there can be read to check it",
+                    c.folder.display()
+                ));
             }
         }
         if c.warn_after_days == 0 {

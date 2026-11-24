@@ -4,7 +4,7 @@
 use crate::{
     config::{BackupSet, Config, Friend},
     crypto::{Id, Keys},
-    net::Peer,
+    net::{self, Peer},
     node::{Node, Out},
     os,
     snapshot::{self, Entry, Kind, Manifest, human},
@@ -41,6 +41,13 @@ const MAX_HOLES: u64 = 2 << 40;
 /// `truncate` or `ln` calls grow every index without bound. Files unchanged since the last
 /// restore point are counted first, so new ones cannot push them out.
 const RUN_FREE_IDS: u64 = 1 << 20;
+/// Most files, folders and links one set's restore point lists, and most bytes of their names
+/// (and link targets). Far beyond a real set, but a few empty files with long names cost
+/// next to no disk and each would add its name to every index, so past this they are left
+/// out, and said to be, rather than let an index grow without bound or past what a destination
+/// takes (MAX_SNAPSHOT). Files unchanged since the last restore point are counted first.
+const MAX_ENTRIES: u64 = 20_000_000;
+const MAX_NAME_BYTES: u64 = 2 << 30;
 /// Most empty space read as zeros in one file: holes too small to skip, and every hole
 /// on a filesystem that cannot say where they are.
 const MAX_ZEROS_READ: u64 = 16 << 30;
@@ -87,16 +94,27 @@ impl Excludes {
 
     /// For a walk that never enters a folder it has left out.
     pub fn is_excluded(&self, p: &Path) -> bool {
-        self.dirs.iter().any(|d| p.starts_with(d)) || self.globs.is_match(p)
+        self.dirs.iter().any(|d| within(p, d, cfg!(windows))) || self.globs.is_match(p)
     }
 
     /// For a path met on its own, such as a file change below `root`: left out itself, or inside
     /// something the walk from `root` would skip. Folders above the root are not looked at, as
     /// the walk never meets them.
     pub fn covers(&self, p: &Path, root: &Path) -> bool {
-        self.dirs.iter().any(|d| p.starts_with(d))
+        self.dirs.iter().any(|d| within(p, d, cfg!(windows)))
             || p.ancestors().take_while(|a| a.starts_with(root)).any(|a| self.globs.is_match(a))
     }
+}
+
+/// Whether `p` is `dir` or inside it. Windows takes `A` and `a` for one name (`caseless`), and
+/// a folder typed as `d:\backups` is walked as `D:\Backups`.
+fn within(p: &Path, dir: &Path, caseless: bool) -> bool {
+    if !caseless {
+        return p.starts_with(dir);
+    }
+    let fold = |c: std::path::Component| c.as_os_str().to_string_lossy().to_lowercase();
+    let mut p = p.components();
+    dir.components().all(|d| p.next().is_some_and(|c| fold(c) == fold(d)))
 }
 
 struct Scan {
@@ -146,6 +164,11 @@ impl Scanner {
 
     fn have(&self, ids: &[Id]) -> bool {
         ids.iter().all(|id| self.sent.contains(id) || self.known.iter().all(|k| k.contains(id)))
+    }
+
+    /// Whether at least one destination of this run holds every one of `ids`.
+    fn held_whole(&self, ids: &[Id]) -> bool {
+        self.known.iter().any(|k| ids.iter().all(|id| self.sent.contains(id) || k.contains(id)))
     }
 }
 
@@ -201,6 +224,7 @@ fn scan(
     };
     let mut entries: Vec<Option<Entry>> = vec![];
     let mut free = Free::new(RUN_FREE_IDS, sc.keys.chunk_id(&vec![0; MAX_CHUNK]));
+    let mut room = Room::new(MAX_ENTRIES, MAX_NAME_BYTES).keep(&prev);
     // The chunks of each file with more than one name, so a further link is not read again.
     let mut linked: HashMap<(u64, u64), (u64, Vec<Id>)> = HashMap::new();
     let refuse = |res: &mut Scan, path: &[u8]| {
@@ -220,6 +244,14 @@ fn scan(
             }
         };
         let (md, path) = (&f.md, os::path_bytes(&f.path));
+        let named = path.len() + f.link.as_ref().map_or(0, |t| t.len());
+        if !room.take(named, prev.contains_key(&path)) {
+            if room.refused == 1 {
+                out.say(format!("  NOT BACKED UP {}: {ROOM_FULL}", f.path.display()));
+            }
+            res.refused += 1;
+            continue;
+        }
         let kind = match f.ft {
             os::Kind::Dir => Kind::Dir,
             os::Kind::Link => match f.link {
@@ -228,14 +260,25 @@ fn scan(
             },
             os::Kind::File => {
                 let link = (md.nlink > 1).then_some((md.dev, md.ino));
-                let reuse = prev.get(&path).and_then(|p| match &p.kind {
-                    Kind::File { size, chunks }
-                        if *size == md.size && p.mtime == md.mtime && p.ino == md.ino && sc.have(chunks) =>
-                    {
-                        Some(chunks.clone())
+                let same = prev.get(&path).and_then(|p| match &p.kind {
+                    Kind::File { size, chunks } if *size == md.size && p.mtime == md.mtime && p.ino == md.ino => {
+                        Some(chunks)
                     }
                     _ => None,
                 });
+                // DECIDED, AFTER GOING BOTH WAYS: what an unchanged online-only file needs to
+                // stay in the backup. It cannot be read again without fetching it, so the rule
+                // for other files (every destination has every chunk, or it is read and sent
+                // again) does not fit. Two rules were tried and each was a bug:
+                //  - Needing every destination to hold it took every such file out of the new
+                //    restore points, everywhere, the day a destination was added.
+                //  - Needing nothing listed files that no destination of the run held (the
+                //    one that did was removed), so a restore point promised what nothing
+                //    could restore, and said nothing.
+                // So: it stays if at least one destination of this run holds all of it. Where
+                // another lacks chunks, `verify` (which the daemon runs) copies them over from
+                // that one. If none holds all of it, it is left out and counted as not fetched.
+                let reuse = same.filter(|c| if md.away { sc.held_whole(c) } else { sc.have(c) }).cloned();
                 match reuse {
                     Some(chunks) => {
                         if !free.take(link, &chunks) {
@@ -339,6 +382,9 @@ fn scan(
         }
     }
     DEFERRED.lock().unwrap().insert(set, left);
+    if room.refused > 1 {
+        out.say(format!("  NOT BACKED UP: {} more files and folders, for the same reason", room.refused - 1));
+    }
 
     res.entries = entries.into_iter().flatten().collect();
     res.entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -349,6 +395,52 @@ fn scan(
     }
     res.new_bytes = sc.new_bytes;
     Ok(res)
+}
+
+const ROOM_FULL: &str = "this set already has as many files and folders as one restore point holds \
+     (split it into smaller sets); it and others after it were left out";
+
+/// Counts the entries a run lists, and the bytes of their names (see MAX_ENTRIES). Those that
+/// were in the last restore point have room kept for them, so new ones cannot push them out.
+struct Room {
+    entries: u64,
+    bytes: u64,
+    /// Entries turned away so far.
+    refused: u64,
+}
+
+impl Room {
+    fn new(entries: u64, bytes: u64) -> Self {
+        Room { entries, bytes, refused: 0 }
+    }
+
+    /// Keeps room for all the last restore point listed, before the walk meets any of it:
+    /// taken off as they came, new entries met first would use up the room of known ones
+    /// met later, which are let in all the same, and the set would outgrow its bounds.
+    fn keep(mut self, prev: &HashMap<Vec<u8>, Entry>) -> Self {
+        for e in prev.values() {
+            let link = if let Kind::Symlink(t) = &e.kind { t.len() } else { 0 };
+            self.entries = self.entries.saturating_sub(1);
+            self.bytes = self.bytes.saturating_sub((e.path.len() + link) as u64 + 64);
+        }
+        self
+    }
+
+    /// Whether one more entry with `name` bytes of names fits. One that was in the last
+    /// restore point is always let in: `keep` made room for it.
+    fn take(&mut self, name: usize, known: bool) -> bool {
+        if known {
+            return true;
+        }
+        let name = name as u64 + 64;
+        if self.entries == 0 || name > self.bytes {
+            self.refused += 1;
+            return false;
+        }
+        self.entries -= 1;
+        self.bytes -= name;
+        true
+    }
 }
 
 const FREE_FULL: &str = "this set already has as many sparse files and extra hard links as one restore point holds";
@@ -715,8 +807,26 @@ struct Lane {
     done: Arc<AtomicU64>,
 }
 
+/// A restore point's record no destination would take is not sent, and the run says why
+/// rather than leave every destination to refuse it.
+fn fits(sealed: &[u8]) -> Result<()> {
+    if sealed.len() > crate::proto::MAX_SNAPSHOT {
+        bail!(
+            "this set's restore point record would be {}, more than the {} a destination takes: \
+             the set lists too many files and folders; split it into smaller sets",
+            human(sealed.len() as u64),
+            human(crate::proto::MAX_SNAPSHOT as u64)
+        );
+    }
+    Ok(())
+}
+
+/// How a destination given up on for taking too long is named (see `net::in_time`).
+const TOO_SLOW: &str = "is too slow";
+const TOO_SLOW_LEFT_OUT: &str = "is too slow and was left out of this backup; it catches up next time";
+
 fn too_slow(t: &mut Target, out: &Out) {
-    out.say(format!("  {} is too slow and was left out of this backup; it catches up next time", t.peer.friend.name));
+    out.say(format!("  {} {TOO_SLOW_LEFT_OUT}", t.peer.friend.name));
     t.failed = Some("too slow".into());
 }
 
@@ -823,6 +933,8 @@ enum Probed {
     Full,
     /// A friend who takes no backups from this node.
     Closed,
+    /// One that took longer to answer than a destination may, and is left out of this run.
+    Slow,
 }
 
 async fn run_once(
@@ -851,21 +963,38 @@ async fn run_once(
     let mut full = vec![];
     // All destinations are contacted at once, so a slow or silent one does not hold up the rest.
     let names = &cfg;
+    // Each in bounded time, by what this node expects to hear rather than by what the
+    // destination sends: one that trickles its answers is left out, as a lane that does is.
     let probes = futures::future::join_all(friends.iter().map(|f| async move {
-        let peer = node.peer_patient(f).await?;
-        let closed = !peer.accepts().await;
-        node.set_closed(&f.id, closed);
-        if closed {
-            return Ok(Probed::Closed);
-        }
-        let (used, quota) = peer.usage().await?;
-        if used > quota {
-            return Ok(Probed::Full);
-        }
-        let known = node.known(&peer, false).await?;
-        let newest = peer
-            .list_snapshots()
-            .await?
+        let ask = async {
+            let peer = node.peer_patient(f).await?;
+            let closed = !peer.accepts().await;
+            node.set_closed(&f.id, closed);
+            if closed {
+                return Ok(Err(Probed::Closed));
+            }
+            let (used, quota) = peer.usage().await?;
+            Ok::<_, anyhow::Error>(if used > quota { Err(Probed::Full) } else { Ok(peer) })
+        };
+        // Only a friend's answers are short. A drive's first count reads every file on it, and
+        // cloud storage's lists the whole bucket under a deadline of its own.
+        let asked = if f.is_friend() { tokio::time::timeout(net::ask_time(), ask).await } else { Ok(ask.await) };
+        let peer = match asked {
+            Err(_) => return Ok(Probed::Slow),
+            Ok(r) => match r? {
+                Ok(peer) => peer,
+                Err(probed) => return Ok(probed),
+            },
+        };
+        // Its listing is bounded by the chunks this node knows of (see `Node::known`).
+        let known = match node.known(&peer, false).await {
+            Err(e) if format!("{e:#}").contains(TOO_SLOW) => return Ok(Probed::Slow),
+            r => r?,
+        };
+        let Ok(listed) = tokio::time::timeout(net::snapshots_time(), peer.list_snapshots()).await else {
+            return Ok(Probed::Slow);
+        };
+        let newest = listed?
             .into_iter()
             .filter(|(id, _)| !gone.contains(id) && !gone.contains(&format!("{}|{id}", f.id)))
             .filter_map(|(id, blob)| {
@@ -897,6 +1026,7 @@ async fn run_once(
                 closed += 1;
                 out.say(format!("  {} does not accept backups from this computer: nothing is sent there", f.name));
             }
+            Ok(Probed::Slow) => out.say(format!("  {} {TOO_SLOW_LEFT_OUT}", f.name)),
             Err(e) => out.say(format!("  {} is unreachable: {e:#}", f.name)),
         }
     }
@@ -1089,6 +1219,7 @@ async fn run_once(
         None => {
             let id = hex::encode(rand::random::<[u8; 8]>());
             let sealed = node.keys.seal_raw(id.as_bytes(), &snapshot::encode_manifest(&manifest)?)?;
+            fits(&sealed)?;
             (id, sealed)
         }
     };
@@ -1173,6 +1304,70 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn an_online_only_file_needs_one_destination_that_holds_all_of_it() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (a, b) = ([1; 32], [2; 32]);
+        let known = |ids: &[Id]| Arc::new(ids.iter().copied().collect::<HashSet<Id>>());
+        let keys = Arc::new(Keys::new(&[7; 32]));
+        let mut sc = Scanner {
+            keys,
+            known: vec![known(&[a, b]), known(&[a])],
+            sent: HashSet::new(),
+            tx,
+            new_bytes: 0,
+            zero: None,
+        };
+        assert!(sc.held_whole(&[a, b]) && !sc.have(&[a, b]));
+        // Spread over two destinations, neither with all of it, it is not held.
+        sc.known = vec![known(&[a]), known(&[b])];
+        assert!(!sc.held_whole(&[a, b]));
+        sc.known = vec![];
+        assert!(!sc.held_whole(&[a]));
+    }
+
+    #[test]
+    fn its_own_folders_are_left_out_however_their_names_are_typed() {
+        let (dir, typed) = (Path::new("/Data/Backups"), Path::new("/data/BACKUPS/aa/chunk"));
+        assert!(within(Path::new("/Data/Backups/aa"), dir, false) && within(dir, dir, false));
+        assert!(!within(typed, dir, false));
+        assert!(within(typed, dir, true) && within(Path::new("/DATA/backups"), dir, true));
+        // A name that only starts the same is another folder, and so is the one above.
+        assert!(!within(Path::new("/data/backups2/x"), dir, true) && !within(Path::new("/data"), dir, true));
+    }
+
+    #[test]
+    fn a_set_lists_only_so_many_entries_and_names() {
+        let mut r = Room::new(3, 1000);
+        assert!(r.take(10, false) && r.take(10, false) && r.take(10, false));
+        assert!(!r.take(10, false), "a fourth new entry");
+        // One the last restore point had still gets in.
+        assert!(r.take(10, true));
+        assert_eq!(r.refused, 1);
+        // Long names use up the room as surely as many entries do.
+        let mut r = Room::new(100, 1000);
+        assert!(r.take(800, false));
+        assert!(!r.take(800, false));
+        assert!(r.take(10, false));
+        // What the last restore point listed has its room kept, wherever the walk meets it:
+        // new entries met first do not get it as well.
+        let known = |p: &str| {
+            let path = p.as_bytes().to_vec();
+            (path.clone(), Entry { path, mode: 0, uid: 0, gid: 0, mtime: 0, ino: 0, kind: Kind::Dir })
+        };
+        let mut r = Room::new(3, 1000).keep(&HashMap::from([known("/z/a"), known("/z/b")]));
+        assert!(r.take(10, false));
+        assert!(!r.take(10, false), "a second new entry, with two known still to come");
+        assert!(r.take(4, true) && r.take(4, true));
+    }
+
+    #[test]
+    fn a_record_too_large_for_a_destination_is_not_sent() {
+        assert!(fits(&vec![0; crate::proto::MAX_SNAPSHOT]).is_ok());
+        let err = fits(&vec![0; crate::proto::MAX_SNAPSHOT + 1]).unwrap_err();
+        assert!(format!("{err:#}").contains("split it into smaller sets"), "{err:#}");
+    }
 
     #[cfg(unix)]
     #[test]

@@ -99,6 +99,11 @@ impl Dir {
         Ok(rfs::mkdirat(&self.0, name, Mode::RWXU)?)
     }
 
+    /// The same: every folder made here is its owner's alone until it is finished.
+    pub fn make_private(&self, name: &OsStr) -> io::Result<()> {
+        self.make(name)
+    }
+
     /// The folder itself.
     pub fn meta(&self) -> io::Result<Meta> {
         Ok(meta(&rfs::fstat(&self.0)?))
@@ -146,8 +151,28 @@ impl Dir {
         Ok(rfs::openat(&self.0, name, NEW, Mode::RUSR | Mode::WUSR)?.into())
     }
 
+    /// The same, for a store's files: here a file's own mode is all there is.
+    pub fn create_plain(&self, name: &OsStr) -> io::Result<fs::File> {
+        self.create_file(name)
+    }
+
     pub fn rename(&self, from: &OsStr, to: &Dir, name: &OsStr) -> io::Result<()> {
         Ok(rfs::renameat(&self.0, from, &to.0, name)?)
+    }
+
+    /// The same, but never replacing what is there, under its own name or any other the disk
+    /// counts as the same (`README` for `readme`, on a disk where case does not count).
+    pub fn rename_new(&self, from: &OsStr, to: &Dir, name: &OsStr) -> io::Result<()> {
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        match rfs::renameat_with(&self.0, from, &to.0, name, rfs::RenameFlags::NOREPLACE) {
+            // A disk (or a system) that cannot be asked to: looked at just before instead.
+            Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP) => {}
+            done => return Ok(done?),
+        }
+        if rfs::statat(&to.0, name, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        self.rename(from, to, name)
     }
 
     pub fn remove_file(&self, name: &OsStr) -> io::Result<()> {
@@ -158,13 +183,28 @@ impl Dir {
         Ok(rfs::unlinkat(&self.0, name, AtFlags::REMOVEDIR)?)
     }
 
-    pub fn symlink(&self, name: &OsStr, target: &[u8]) -> io::Result<()> {
+    /// Makes a link here that will be moved into `_into`, the folder its target is read from.
+    pub fn symlink(&self, name: &OsStr, target: &[u8], _into: &Dir) -> io::Result<()> {
         Ok(rfs::symlinkat(OsStr::from_bytes(target), &self.0, name)?)
     }
 
-    /// Leaves the folder open to its owner alone.
+    /// Leaves the folder open to its owner alone. One on a disk that keeps no permissions of
+    /// its own (FAT, as Linux mounts it) is left as it is, if it is this user's, as there is
+    /// nothing to set; one another user owns is refused.
     pub fn set_private(&self) -> io::Result<()> {
-        Ok(rfs::fchmod(&self.0, Mode::RWXU)?)
+        match rfs::fchmod(&self.0, Mode::RWXU) {
+            Err(Errno::PERM | Errno::NOTSUP | Errno::ROFS)
+                if rfs::fstat(&self.0).is_ok_and(|st| st.st_uid == rustix::process::geteuid().as_raw()) =>
+            {
+                Ok(())
+            }
+            done => Ok(done?),
+        }
+    }
+
+    /// The same for a store: on Unix nobody but its owner (and root) opens a private folder.
+    pub fn set_private_store(&self) -> io::Result<()> {
+        self.set_private()
     }
 
     /// Puts what was recorded back on a folder this restore made.
@@ -222,6 +262,11 @@ pub fn finish_file(f: &fs::File, r: &Recorded, root: bool) {
     finish(f, r, root)
 }
 
+/// A Unix disk leaves holes where a file is skipped over by itself.
+pub fn set_sparse(_f: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
 /// Whether this process may give files to other owners.
 pub fn is_root() -> bool {
     rustix::process::geteuid().is_root()
@@ -259,9 +304,6 @@ pub fn path_bytes(p: &Path) -> Vec<u8> {
 pub fn bytes_path(b: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(b))
 }
-
-/// Whether `A` and `a` are one name here. Not asked of each disk: a restore treats them as two.
-pub const CASELESS: bool = false;
 
 /// A recorded name as this system keeps it, and whether it had to be changed.
 pub fn name(n: &[u8]) -> (OsString, bool) {

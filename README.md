@@ -58,7 +58,7 @@ Or from the command line:
 cahoots init --name andy
 cahoots add ~/Documents ~/Pictures
 cahoots invite                         # prints `cahoots join cahoots1...` to send to a friend
-cahoots join cahoots1...                   # what the friend runs (or you, with their invite)
+cahoots join                           # what the friend runs, pasting the invite when asked
 cahoots service install                # run the daemon at login (launchd / systemd)
 cahoots recovery export                # writes NAME.cahoots-recovery-kit; keep it OFF this computer
 ```
@@ -66,6 +66,10 @@ cahoots recovery export                # writes NAME.cahoots-recovery-kit; keep 
 One invite pairs both directions. The daemon watches your folders and creates a
 restore point shortly after files stop changing. Every command is listed under
 [Commands](#commands), further down.
+
+`cahoots join cahoots1...` works too, but while it runs other users of the computer can
+see the invite in the list of running programs. `cahoots join` alone asks for it,
+`cahoots join -` reads it from what is piped in, and `CAHOOTS_TICKET` can carry it.
 
 ## Recovering on a new computer
 
@@ -245,7 +249,7 @@ Every `cahoots` command works through `docker exec`:
 
 ```bash
 docker exec cahoots cahoots invite                        # a code to send to a friend
-docker exec cahoots cahoots join cahoots1...                  # or accept theirs
+docker exec -it cahoots cahoots join                      # or accept theirs, pasted when asked
 docker exec cahoots cahoots destination quota andy 500    # how much a friend may store
 docker exec cahoots cahoots status
 docker exec -it cahoots cahoots tui                       # the interface in the terminal

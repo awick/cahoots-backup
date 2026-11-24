@@ -370,9 +370,89 @@ const SLOW_UP: u64 = PIECE as u64;
 /// Their reply has no speed limit behind it: about 7 KB/s, slower than any link worth using.
 const SLOW_DOWN: u64 = 2 << 20;
 
+/// What a short answer (Ok, an error, Paired, Usage, Version, Accepts, a progress report) is
+/// expected to come to, and all the time it earns.
+const SHORT: usize = 4 << 10;
+/// Most bytes of a short answer. An error may run longer than SHORT (a path or two in it),
+/// and still arrives, but in no more time; anything longer still is not one and is refused.
+const SHORT_MAX: usize = 64 << 10;
+/// Most of an error a node sends a friend: more than enough to say what went wrong.
+const ERR_SENT: usize = 2000;
+/// What a listing of restore points is expected to come to: thousands of records. A longer
+/// one still arrives, but must come faster than the slowest pace for the rest.
+const SNAPSHOT_LISTING: u64 = 4 * SLOW_DOWN;
+/// Ids a chunk listing may hold beyond those expected, before the rest must come faster than
+/// the slowest pace.
+const LIST_SLACK: u64 = 16 * ID_BATCH as u64;
+
 /// How long a request may take in all, having moved `sent` and `got` bytes so far.
 fn allowed(sent: u64, got: u64) -> Duration {
-    IDLE.mul_f64(1.0 + sent as f64 / SLOW_UP as f64 + got as f64 / SLOW_DOWN as f64)
+    allowed_by(IDLE, sent, got)
+}
+
+/// The same, for a request that may go quiet for `idle` at a time.
+fn allowed_by(idle: Duration, sent: u64, got: u64) -> Duration {
+    idle.mul_f64(1.0 + sent as f64 / SLOW_UP as f64 + got as f64 / SLOW_DOWN as f64)
+}
+
+/// The longest a destination may take over an answer this node expects to be `bytes` long,
+/// whatever it sends: the time that answer may take at the slowest pace allowed.
+fn ceiling(bytes: u64) -> Duration {
+    allowed(0, bytes.saturating_add(SHORT as u64))
+}
+
+/// Bytes of a chunk listing of `ids` ids, framing included.
+fn listing_bytes(ids: u64) -> u64 {
+    let ids = ids.saturating_add(LIST_SLACK);
+    ids.saturating_mul(32).saturating_add((ids / ID_BATCH as u64 + 1) * 4)
+}
+
+/// The longest one destination may take to answer a few short questions, as before a backup:
+/// a connection and two or three short answers, each of which may take IDLE.
+pub fn ask_time() -> Duration {
+    IDLE * 3
+}
+
+/// The longest one destination may take to list its restore points.
+pub fn snapshots_time() -> Duration {
+    ceiling(SNAPSHOT_LISTING)
+}
+
+/// How many chunk ids a destination may honestly list for us, when this node asks about
+/// `asked` of them and the destination listed `last` the time before. It lists all it holds
+/// for us, not only those asked about: the chunks of older restore points too, and those not
+/// yet cleaned up. So, whichever is more: what this node asks about twice over, or what the
+/// destination really listed last time and a quarter more for what was sent since. Never what
+/// it now says it holds, so one that trickles its listing is given up on in a time this node
+/// picks, growing only with what the destination did send before.
+pub fn expected_ids(asked: usize, last: u64) -> u64 {
+    (asked as u64).saturating_mul(2).max(last.saturating_add(last / 4))
+}
+
+/// The longest one destination may take to list its chunks, expected to be `ids` of them
+/// (see `expected_ids`).
+pub fn listing_time(ids: u64) -> Duration {
+    ceiling(listing_bytes(ids))
+}
+
+/// What `n` chunks may come to at most: each as large as a chunk may be sent (MAX_BLOB, a
+/// chunk cut at its largest and sealed, with room to spare).
+fn fetch_bytes(n: usize) -> u64 {
+    (n as u64).saturating_mul(MAX_BLOB as u64)
+}
+
+/// The longest one destination may take to send `n` chunks.
+pub fn fetch_time(n: usize) -> Duration {
+    ceiling(fetch_bytes(n))
+}
+
+/// Gives up on one destination that takes longer than `limit` over `f`, so it cannot hold
+/// up a run, the destinations after it, or the jobs waiting for the run to end.
+pub async fn in_time<T>(name: &str, limit: Duration, f: impl Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(limit, f).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("{name} is too slow: it did not answer within {} minutes", limit.as_secs().div_ceil(60))),
+    }
 }
 
 /// When a request last moved forward, and how many progress reports the friend may still send.
@@ -383,6 +463,11 @@ struct Moved {
     sent: u64,
     got: u64,
     reports: u64,
+    /// Bytes of the answer that earn time: what this node expects it to come to. What the
+    /// friend sends beyond that buys nothing, so a request has a ceiling it picks, not them.
+    credit: u64,
+    /// How long the request may go quiet: IDLE, but for tests.
+    idle: Duration,
     /// Bumped on each report, for a caller that watches a long upload move.
     tick: Option<Arc<AtomicU64>>,
 }
@@ -391,9 +476,21 @@ struct Moved {
 struct Progress(Arc<Mutex<Moved>>);
 
 impl Progress {
-    fn new() -> Self {
+    /// For a request whose answer this node expects to be at most `credit` bytes long.
+    fn new(credit: u64) -> Self {
         let now = Instant::now();
-        Progress(Arc::new(Mutex::new(Moved { at: now, bytes: 0, start: now, sent: 0, got: 0, reports: 0, tick: None })))
+        let credit = credit.saturating_add(SHORT as u64);
+        Progress(Arc::new(Mutex::new(Moved {
+            at: now,
+            bytes: 0,
+            start: now,
+            sent: 0,
+            got: 0,
+            reports: 0,
+            credit,
+            idle: IDLE,
+            tick: None,
+        })))
     }
 
     fn moved(&self, n: usize, sent: bool) {
@@ -428,10 +525,12 @@ impl Progress {
         Ok(())
     }
 
-    /// How long the request has been quiet, and how much longer its pace lets it run.
-    fn idle(&self) -> (Duration, Duration) {
+    /// How long the request has been quiet, how much longer its pace lets it run, and how
+    /// long it may go quiet.
+    fn idle(&self) -> (Duration, Duration, Duration) {
         let m = self.0.lock().unwrap();
-        (m.at.elapsed(), allowed(m.sent, m.got).saturating_sub(m.start.elapsed()))
+        let left = allowed_by(m.idle, m.sent, m.got.min(m.credit)).saturating_sub(m.start.elapsed());
+        (m.at.elapsed(), left, m.idle)
     }
 }
 
@@ -464,6 +563,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watch<S> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
+/// See `Peer::within`.
+async fn within<T>(name: &str, p: &Progress, f: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::pin!(f);
+    loop {
+        let (idle, left, most) = p.idle();
+        if idle >= most {
+            bail!("{name}: no answer in time");
+        }
+        if left.is_zero() {
+            bail!("{name}: answering too slowly");
+        }
+        tokio::select! {
+            r = &mut f => return r,
+            _ = tokio::time::sleep((most - idle).min(left)) => {}
+        }
     }
 }
 
@@ -507,20 +624,7 @@ impl Peer {
     /// pace it may keep, so neither a silent nor a trickling one can hold everything else up,
     /// while a slow but steady one is waited for.
     async fn within<T>(&self, p: &Progress, f: impl Future<Output = Result<T>>) -> Result<T> {
-        tokio::pin!(f);
-        loop {
-            let (idle, left) = p.idle();
-            if idle >= IDLE {
-                bail!("{}: no answer in time", self.friend.name);
-            }
-            if left.is_zero() {
-                bail!("{}: answering too slowly", self.friend.name);
-            }
-            tokio::select! {
-                r = &mut f => return r,
-                _ = tokio::time::sleep((IDLE - idle).min(left)) => {}
-            }
-        }
+        within(&self.friend.name, p, f).await
     }
 
     /// "direct to 1.2.3.4:5", "through the relay" or "local drive".
@@ -562,10 +666,10 @@ impl Peer {
         Ok((s, r))
     }
 
-    /// The friend's answer, after any progress reports that come ahead of it.
-    async fn reply(&self, r: &mut Watch<RecvStream>) -> Result<Resp> {
+    /// The friend's answer, at most `max` bytes, after any progress reports that come ahead of it.
+    async fn reply(&self, r: &mut Watch<RecvStream>, max: usize) -> Result<Resp> {
         loop {
-            match proto::recv(r).await.map_err(|e| anyhow!("{}: {e}", self.friend.name))? {
+            match proto::recv_max(r, max).await.map_err(|e| anyhow!("{}: {e}", self.friend.name))? {
                 Resp::Progress => r.1.report().map_err(|e| anyhow!("{}: {e}", self.friend.name))?,
                 Resp::Err(e) => bail!("{}: {}", self.friend.name, e.chars().take(300).collect::<String>()),
                 resp => return Ok(resp),
@@ -574,11 +678,16 @@ impl Peer {
     }
 
     async fn simple(&self, req: Req) -> Result<Resp> {
-        let p = Progress::new();
+        // Only a listing of restore points is long; every other answer is short.
+        let (credit, max) = match req {
+            Req::ListSnapshots => (SNAPSHOT_LISTING, proto::MAX_MSG),
+            _ => (0, SHORT_MAX),
+        };
+        let p = Progress::new(credit);
         self.within(&p, async {
             let (mut s, mut r) = self.open(&req, &p).await?;
             let _ = s.0.finish();
-            self.reply(&mut r).await
+            self.reply(&mut r, max).await
         })
         .await
     }
@@ -594,8 +703,9 @@ impl Peer {
     /// up to `others` of the rest are handed back (to delete), and anything beyond is only counted.
     /// Memory so follows what this node itself knows, never what the other side claims to hold: a
     /// listing is the one reply whose size it picks, and names on a drive or in a bucket can be
-    /// planted. Past what it could plausibly hold, the listing is refused.
-    pub async fn list_chunks(&self, wanted: Arc<HashSet<Id>>, others: usize) -> Result<Listing> {
+    /// planted. Past what it could plausibly hold, the listing is refused. It earns the time a
+    /// listing of `expect` ids may take (see `expected_ids`), and no more.
+    pub async fn list_chunks(&self, wanted: Arc<HashSet<Id>>, others: usize, expect: u64) -> Result<Listing> {
         let implausible = || anyhow!("{}: implausible chunk count", self.friend.name);
         let mut l = Listing { wanted, others, have: HashSet::new(), other: vec![], count: 0 };
         if let Some((st, me)) = self.store() {
@@ -612,16 +722,17 @@ impl Peer {
             return if l.count > most { Err(implausible()) } else { Ok(l) };
         }
         if let Some(b) = self.cloud() {
-            self.named(b.list_chunks(|id| l.take([id])).await)?;
+            self.named(b.list_chunks(expect, |id| l.take([id])).await)?;
             return Ok(l);
         }
         let (used, quota) = self.usage().await?;
         let most = plausible(used.max(quota));
-        let p = Progress::new();
+        // Time is earned by what this node expects, not by what the friend lists.
+        let p = Progress::new(listing_bytes(expect));
         self.within(&p, async {
             let (mut s, mut r) = self.open(&Req::ListChunks, &p).await?;
             let _ = s.0.finish();
-            let Resp::Ok = self.reply(&mut r).await? else { bail!("unexpected reply") };
+            let Resp::Ok = self.reply(&mut r, SHORT_MAX).await? else { bail!("unexpected reply") };
             // Counted as they arrive, repeats included: time grows only with what is sent.
             loop {
                 let ids = proto::read_ids(&mut r).await?;
@@ -657,7 +768,7 @@ impl Peer {
             })
             .await?;
         }
-        let p = Progress::new();
+        let p = Progress::new(0);
         p.0.lock().unwrap().tick = tick;
         self.within(&p, async {
             let (mut s, mut r) = self.open(&Req::PutChunks { count: items.len() as u32 }, &p).await?;
@@ -673,7 +784,7 @@ impl Peer {
                 let _ = s.0.finish();
                 Ok::<_, anyhow::Error>(())
             };
-            match tokio::try_join!(send, self.reply(&mut r))? {
+            match tokio::try_join!(send, self.reply(&mut r, SHORT_MAX))? {
                 ((), Resp::Ok) => Ok(()),
                 _ => bail!("unexpected reply"),
             }
@@ -689,11 +800,11 @@ impl Peer {
         if let Some(b) = self.cloud() {
             return self.named(b.get_chunks(ids).await);
         }
-        let p = Progress::new();
+        let p = Progress::new(fetch_bytes(ids.len()));
         self.within(&p, async {
             let (mut s, mut r) = self.open(&Req::GetChunks { ids: ids.to_vec() }, &p).await?;
             let _ = s.0.finish();
-            self.reply(&mut r).await?;
+            self.reply(&mut r, SHORT_MAX).await?;
             let mut out = Vec::with_capacity(ids.len());
             for _ in ids {
                 out.push(proto::read_blob(&mut r, MAX_BLOB).await?);
@@ -872,6 +983,7 @@ impl Default for Guard {
 
 /// What a friend is told when this node takes no backups.
 const CLOSED: &str = "this computer does not accept backups from friends";
+const AWAY: &str = "this computer cannot get at the folder it keeps friends' backups in right now";
 /// The pace entry shared by all friends; no friend has an empty id.
 const EVERYONE: &str = "";
 const MAX_STRANGERS: usize = 4;
@@ -954,7 +1066,7 @@ pub async fn serve_conn(node: Arc<Node>, conn: Connection, remote: String) {
         tokio::spawn(async move {
             let _slot = slot;
             if let Err(e) = serve(&node, &remote, &mut s, &mut r, MAX_REQUEST).await {
-                let _ = proto::send(&mut s, &Resp::Err(format!("{e:#}"))).await;
+                let _ = proto::send(&mut s, &Resp::Err(format!("{e:#}").chars().take(ERR_SENT).collect())).await;
             }
             let _ = s.finish();
         });
@@ -1033,6 +1145,14 @@ async fn serve(node: &Arc<Node>, remote: &str, s: &mut SendStream, r: &mut RecvS
         bail!("you are not on this node's friend list");
     };
     crate::store::check_owner(remote)?;
+    // Asked each time, so a store on a drive that was away is used again once it is back. Only
+    // a shut one is tried again, which touches the disk; an open one is open.
+    if !matches!(req, Req::Version | Req::Accepts) && node.store.shut().is_some() {
+        let n = node.clone();
+        if !blocking(move || n.store_ready()).await? {
+            bail!(AWAY);
+        }
+    }
     let quota = friend.quota_gb.saturating_mul(1 << 30);
     let accepting = node.accepting();
     match req {
@@ -1230,6 +1350,77 @@ mod tests {
         let kept = public_only(Item::new(info, "test", None)).into_endpoint_addr();
         assert_eq!(kept.ip_addrs().collect::<Vec<_>>(), [&public]);
         assert_eq!(kept.relay_urls().map(|u| u.to_string()).collect::<Vec<_>>(), ["https://relay.example.com/"]);
+    }
+
+    /// Runs `within` against a friend that sends `step` bytes every `every` and never finishes,
+    /// on a time scale where IDLE is `unit`; returns how long it was given and what it was told.
+    async fn trickled(credit: u64, unit: Duration, every: Duration, step: usize) -> (Duration, String) {
+        let p = Progress::new(credit);
+        p.0.lock().unwrap().idle = unit;
+        let feed = p.clone();
+        let friend = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                feed.moved(step, false);
+            }
+        });
+        let t = Instant::now();
+        let r = within("friend", &p, std::future::pending::<Result<()>>()).await;
+        friend.abort();
+        (t.elapsed(), format!("{:#}", r.unwrap_err()))
+    }
+
+    // On a stopped clock, which runs on only when every task waits: a busy machine cannot
+    // make a friend that keeps pace look late.
+    #[tokio::test(start_paused = true)]
+    async fn what_a_friend_sends_buys_no_more_time_than_expected() {
+        let unit = Duration::from_millis(40);
+        // A short answer trickled a step at a time, never quiet: given up on after about IDLE,
+        // however much the friend would go on sending.
+        let (took, why) = trickled(0, unit, unit / 4, STEP).await;
+        assert!(why.contains("too slowly"), "{why}");
+        assert!(took < unit * 2, "{took:?}");
+        // A listing earns the time its expected size may take, and no more: here a friend that
+        // keeps up the slowest pace allowed and more, for ever.
+        let (took, why) = trickled(2 * SLOW_DOWN, unit, unit / 4, (SLOW_DOWN / 2) as usize).await;
+        assert!(why.contains("too slowly"), "{why}");
+        assert!(took >= unit * 3 - unit / 2 && took < unit * 5, "{took:?}");
+        // A silent one is given up on after IDLE.
+        let (took, why) = trickled(SNAPSHOT_LISTING, unit, unit * 10, 0).await;
+        assert!(why.contains("no answer"), "{why}");
+        assert!(took < unit * 2, "{took:?}");
+    }
+
+    #[test]
+    fn ceilings_follow_what_this_node_expects() {
+        // Short questions and a listing of restore points take minutes, not hours.
+        assert!(ask_time() <= IDLE * 3);
+        assert!(snapshots_time() < IDLE * 6);
+        // A chunk listing gets the time this node's own count of chunks may take at the slowest pace.
+        let few = listing_time(0);
+        assert!(few < IDLE * 3, "{few:?}");
+        let many = listing_time(1 << 20);
+        assert!(many > IDLE * 16 && many < IDLE * 19, "{many:?}");
+        // Chunks by the most one may come to: 8 of them, 48 MiB, at the slowest pace.
+        assert!(fetch_time(8) > IDLE * 25 && fetch_time(8) < IDLE * 26, "{:?}", fetch_time(8));
+    }
+
+    #[test]
+    fn a_listing_is_expected_to_hold_what_the_destination_listed_before() {
+        // Asked about few (a check of one small set), it still gets the time the destination's
+        // last listing of all it holds for us may take, and a quarter more.
+        assert_eq!(expected_ids(1000, 0), 2000);
+        assert_eq!(expected_ids(1000, 1 << 20), (1 << 20) + (1 << 18));
+        assert!(listing_time(expected_ids(1000, 1 << 20)) > IDLE * 20);
+        // Asked about more than it held then, by what is asked about, twice over.
+        assert_eq!(expected_ids(1 << 20, 1000), 2 << 20);
+    }
+
+    #[tokio::test]
+    async fn a_destination_past_its_time_is_too_slow() {
+        let err = in_time("bob", Duration::from_millis(20), std::future::pending::<Result<()>>()).await.unwrap_err();
+        assert!(format!("{err:#}").starts_with("bob is too slow"), "{err:#}");
+        assert_eq!(in_time("bob", Duration::from_secs(5), async { Ok(7) }).await.unwrap(), 7);
     }
 
     #[test]

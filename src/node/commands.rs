@@ -71,6 +71,7 @@ impl Node {
     }
 
     pub(super) async fn show_overview(self: &Arc<Self>, out: &Out) -> Result<()> {
+        self.recheck_store().await;
         out.say(self.overview().to_string());
         Ok(())
     }
@@ -107,6 +108,7 @@ impl Node {
 
     pub(super) async fn status(self: &Arc<Self>, out: &Out) -> Result<()> {
         let c = self.cfg();
+        self.recheck_store().await;
         for w in self.warnings() {
             out.say(format!("WARNING:  {w}"));
         }
@@ -258,6 +260,7 @@ impl Node {
         out.say("");
         out.say(format!("  cahoots join {ticket}"));
         out.say("");
+        out.say("(They can also run `cahoots join` alone and paste it when asked, which keeps it out of sight of others on their computer.)");
         if self.daemon {
             out.say("The daemon will accept it whenever they join.");
         } else {
@@ -599,13 +602,13 @@ impl Node {
                 ok.insert(format!("{to}|{}", &key[prefix.len()..]), v);
             }
         }
-        let _ = fs::write(self.state_path(), serde_json::to_vec(&ok).unwrap_or_default());
+        let _ = crate::config::write_private(&self.state_path(), &serde_json::to_vec(&ok).unwrap_or_default());
         let stats_path = self.home.join("cache").join("set-stats.json");
         let mut stats: HashMap<String, (u64, u64, i64)> =
             fs::read(&stats_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if let Some(v) = stats.remove(&name) {
             stats.insert(to.clone(), v);
-            let _ = fs::write(stats_path, serde_json::to_vec(&stats).unwrap_or_default());
+            let _ = crate::config::write_private(&stats_path, &serde_json::to_vec(&stats).unwrap_or_default());
         }
         self.update(|c| {
             if let Some(b) = c.sets.iter_mut().find(|b| b.name == name) {
@@ -976,6 +979,16 @@ impl Node {
         fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
         if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
             bail!("{} is a link or a file; choose a real folder", dir.display());
+        }
+        // Closed to other users from the start; one that cannot be (a share, say) is still
+        // used, as `peer` does, and the user told.
+        let store = tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            move || crate::store::Store::new(dir, 0)
+        })
+        .await??;
+        if let Some(w) = store.warning {
+            out.say(format!("warning: {w}"));
         }
         let name = clean_name(&name);
         refuse_reserved(&name)?;

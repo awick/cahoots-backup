@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")"
 echo "== format" && cargo fmt --check
-echo "== lints" && cargo clippy --release --all-targets --quiet -- -D warnings
+echo "== lints" && cargo clippy --release --all-targets --features windowed --quiet -- -D warnings
 echo "== unit tests" && cargo test --release --quiet 2>&1 | grep -E "^test result|FAILED|panicked|error" || true
 cargo test --release --quiet >/dev/null 2>&1
 if [ "${1:-}" = quick ]; then

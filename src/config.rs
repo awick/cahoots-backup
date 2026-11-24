@@ -408,12 +408,59 @@ impl Config {
     }
 }
 
+/// What a node keeps in its home besides identity.key. A home that holds any of them but no
+/// identity.key was not set up by cahoots on this computer (someone else may have made it, to
+/// have a node write its secrets where they can reach them, or a kit copy go where they choose).
+const NODE_FILES: &[&str] = &[
+    "config.toml",
+    "recovery-copy.json",
+    "recovery-kit.json",
+    "forgotten.json",
+    "pipe",
+    "sock-path",
+    "cahoots.sock",
+    "sdb.sock",
+    "cache",
+    "store",
+];
+
+/// Refuses to set up a node in a folder that already holds a node's files but no identity.key.
+pub fn check_new_home(home: &Path) -> Result<()> {
+    if home.join("identity.key").exists() {
+        anyhow::bail!("{} is already set up", home.display());
+    }
+    if let Some(f) = NODE_FILES.iter().find(|f| fs::symlink_metadata(home.join(f)).is_ok()) {
+        // A store may be all that is left of a node that lost its key: it holds friends' backups.
+        let advice = if *f == "store" {
+            "Move it away and try again. If it holds what friends back up to this computer, put it back \
+             afterwards: deleting it would delete their backups"
+        } else {
+            "Move it away (or delete it) and try again"
+        };
+        anyhow::bail!(
+            "{} already holds {f} but no identity.key: it was not set up here, and may have been prepared by \
+             someone else. {advice}",
+            home.display()
+        );
+    }
+    Ok(())
+}
+
 /// Writes a file only its owner can read. The temporary file is new, private from the
 /// start and never opened through a link someone else left in the folder.
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    write_new(path, data, crate::os::create_private)
+}
+
+/// Writes a file that leaves this computer (see `os::create_carried`).
+pub fn write_carried(path: &Path, data: &[u8]) -> Result<()> {
+    write_new(path, data, crate::os::create_carried)
+}
+
+fn write_new(path: &Path, data: &[u8], create: fn(&Path) -> std::io::Result<fs::File>) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension(format!("tmp{:016x}", rand::random::<u64>()));
-    let mut f = crate::os::create_private(&tmp)?;
+    let mut f = create(&tmp)?;
     let done = f.write_all(data).and_then(|_| fs::rename(&tmp, path));
     if done.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -606,6 +653,24 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_home_someone_else_prepared_is_not_set_up() {
+        let home = std::env::temp_dir().join(format!("sdb-test-newhome-{}", rand::random::<u64>()));
+        assert!(check_new_home(&home).is_ok(), "a folder not there yet");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("daemon.log"), "").unwrap();
+        assert!(check_new_home(&home).is_ok(), "a log of a daemon that could not start");
+        for planted in ["recovery-copy.json", "pipe", "config.toml"] {
+            fs::write(home.join(planted), "{}").unwrap();
+            let err = check_new_home(&home).unwrap_err();
+            assert!(format!("{err:#}").contains(planted), "{err:#}");
+            fs::remove_file(home.join(planted)).unwrap();
+        }
+        fs::write(home.join("identity.key"), "{}").unwrap();
+        assert!(format!("{:#}", check_new_home(&home).unwrap_err()).contains("already set up"));
+        fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn speeds_are_typed_in_mb_a_second_with_decimals() {

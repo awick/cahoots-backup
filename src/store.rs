@@ -58,6 +58,16 @@ pub struct Store {
     walks: Locks,
     /// Owners whose data was deleted on purpose; nothing is stored for them until they pair again.
     banned: Mutex<HashSet<String>>,
+    /// Why the store could not be closed to other users, for the caller to pass on.
+    pub warning: Option<String>,
+    /// Why the store cannot be used at all, until `ready` finds it can (see `new_or_shut`).
+    shut: Mutex<Option<String>>,
+    /// Held by the one caller trying a shut store again.
+    opening: Mutex<()>,
+    /// What `warning` would have said of a shut store that `ready` then opened, until taken.
+    late_warning: Mutex<Option<String>>,
+    /// Whether a root that is missing is made (see `new_or_shut`).
+    make: bool,
 }
 
 /// What a stored file counts against a quota: never less than a disk block,
@@ -134,18 +144,92 @@ impl Store {
         self.min_free.store(bytes, Ordering::Relaxed);
     }
 
-    pub fn new(root: PathBuf, min_free: u64) -> Self {
-        if fs::create_dir_all(&root).is_ok() {
-            // Through a handle that refuses a link, so a link swapped in cannot redirect the change.
-            let _ = Dir::open(&root, false).and_then(|d| d.set_private());
+    /// Opens the store at `root`, making it first if need be, and closes it to other users.
+    /// One that cannot be closed (a share, a folder another account owns, as a drive's is
+    /// when it moves to a new computer) is still used, with a `warning`: all kept in it is
+    /// sealed, and refusing it would cut off the backups and restores it holds. One this
+    /// account may not open at all fails, saying how to get it back.
+    pub fn new(root: PathBuf, min_free: u64) -> Result<Self> {
+        let warning = Self::open(&root, true)?;
+        Ok(Self::with(root, min_free, true, warning, None))
+    }
+
+    /// As `new`, but a store that cannot be opened is given all the same, shut: nothing is
+    /// kept in or read from it until `ready` finds it can be opened. For this node's own
+    /// store, which may sit on a drive that is away: its own backups do not need it, so it
+    /// must not keep the node from starting. Without `make`, a folder that is missing is not
+    /// made, here or by `ready`: the store is shut until it is there.
+    pub fn new_or_shut(root: PathBuf, min_free: u64, make: bool) -> Self {
+        match Self::open(&root, make) {
+            Ok(warning) => Self::with(root, min_free, make, warning, None),
+            Err(e) => Self::with(root, min_free, make, None, Some(format!("{e:#}"))),
         }
+    }
+
+    /// Whether the store can be used. One that was shut is tried again each time, by one
+    /// caller at a time and outside the lock `shut` takes on the async workers: the try is
+    /// disk work, and on a share that is away it can hang.
+    pub fn ready(&self) -> bool {
+        if self.shut.lock().unwrap().is_none() {
+            return true;
+        }
+        let Ok(_one) = self.opening.try_lock() else { return false };
+        let found = Self::open(&self.root, self.make);
+        if let Ok(Some(warning)) = &found {
+            *self.late_warning.lock().unwrap() = Some(warning.clone());
+        }
+        let mut shut = self.shut.lock().unwrap();
+        *shut = found.err().map(|e| format!("{e:#}"));
+        shut.is_none()
+    }
+
+    /// The warning of a store that was shut and has since opened (see `ready`), once.
+    pub fn late_warning(&self) -> Option<String> {
+        self.late_warning.lock().unwrap().take()
+    }
+
+    /// Why the store cannot be used, as last found.
+    pub fn shut(&self) -> Option<String> {
+        self.shut.lock().unwrap().clone()
+    }
+
+    /// Makes the folder if need be (with `make`) and closes it to other users; gives why it
+    /// could not be closed.
+    fn open(root: &Path, make: bool) -> Result<Option<String>> {
+        if make {
+            fs::create_dir_all(root).map_err(|e| anyhow!("cannot make {}: {e}", root.display()))?;
+        } else if !root.is_dir() {
+            bail!("{} is not there: connect the drive it is on, or make the folder if it is new", root.display());
+        }
+        // Through a handle that refuses a link, so a link swapped in cannot redirect the change.
+        let private = match Dir::open(root, false) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                bail!("{}: {}", root.display(), crate::os::regain(root))
+            }
+            opened => opened.and_then(|d| d.set_private_store()),
+        };
+        Ok(private.err().map(|e| {
+            format!(
+                "{} cannot be kept private to you ({e}), so it is used as it is: what is kept there is sealed, \
+                 but whoever else can open it could delete it",
+                root.display()
+            )
+        }))
+    }
+
+    fn with(root: PathBuf, min_free: u64, make: bool, warning: Option<String>, shut: Option<String>) -> Self {
         Store {
+            make,
             root,
             min_free: AtomicU64::new(min_free),
             usage: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             walks: Mutex::new(HashMap::new()),
             banned: Mutex::new(HashSet::new()),
+            warning,
+            shut: Mutex::new(shut),
+            opening: Mutex::new(()),
+            late_warning: Mutex::new(None),
         }
     }
 
@@ -294,7 +378,8 @@ impl Store {
         tmp.push(format!(".tmp{}", rand::random::<u64>()));
         self.change(owner, || {
             let res = (|| -> io::Result<()> {
-                dir.create_file(&tmp)?.write_all(data)?;
+                // With the store's own permissions, not a list of its own (see `create_plain`).
+                dir.create_plain(&tmp)?.write_all(data)?;
                 dir.rename(&tmp, &dir, name)
             })();
             if res.is_err() {
@@ -520,7 +605,54 @@ mod tests {
 
     fn store(min_free: u64) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("sdb-test-store-{}", rand::random::<u64>()));
-        (Store::new(dir.clone(), min_free), dir)
+        (Store::new(dir.clone(), min_free).unwrap(), dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_that_cannot_be_made_private_is_used_with_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let top = std::env::temp_dir().join(format!("sdb-test-store-{}", rand::random::<u64>()));
+        // One reached through a link cannot be changed through a handle that refuses links,
+        // as one another account owns cannot: it is used all the same, and said to be.
+        fs::create_dir_all(top.join("real")).unwrap();
+        std::os::unix::fs::symlink(top.join("real"), top.join("link")).unwrap();
+        let s = Store::new(top.join("link"), 0).unwrap();
+        assert!(s.warning.as_deref().is_some_and(|w| w.contains("used as it is")), "{:?}", s.warning);
+        s.put_chunk(OWNER, &[1; 32], b"sealed", 1 << 20).unwrap();
+        assert_eq!(s.get_chunk(OWNER, &[1; 32]).unwrap(), b"sealed");
+        assert!(store(0).0.warning.is_none(), "a store of one's own");
+        // One this account may not open at all says how to get it back.
+        fs::create_dir_all(top.join("shut")).unwrap();
+        fs::set_permissions(top.join("shut"), fs::Permissions::from_mode(0o300)).unwrap();
+        if !crate::os::is_root() {
+            let err = format!("{:#}", Store::new(top.join("shut"), 0).err().unwrap());
+            assert!(err.contains("chown"), "{err}");
+            // This node's own store is given all the same, shut until it can be opened.
+            let own = Store::new_or_shut(top.join("shut"), 0, true);
+            assert!(!own.ready() && own.shut().is_some_and(|w| w.contains("chown")));
+            assert!(own.put_chunk(OWNER, &[1; 32], b"sealed", 1 << 20).is_err());
+            fs::set_permissions(top.join("shut"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(own.ready() && own.shut().is_none());
+            assert!(own.late_warning().is_none(), "opened, and private");
+            own.put_chunk(OWNER, &[1; 32], b"sealed", 1 << 20).unwrap();
+        }
+        fs::set_permissions(top.join("shut"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(top).unwrap();
+    }
+
+    #[test]
+    fn a_store_put_elsewhere_is_not_made_while_its_folder_is_away() {
+        let top = std::env::temp_dir().join(format!("sdb-test-away-{}", rand::random::<u64>()));
+        fs::create_dir_all(&top).unwrap();
+        let s = Store::new_or_shut(top.join("drive/store"), 0, false);
+        assert!(!s.ready() && s.shut().is_some_and(|w| w.contains("is not there")), "{:?}", s.shut());
+        assert!(!top.join("drive").exists(), "nothing was made where the drive goes");
+        // Back, it is used.
+        fs::create_dir_all(top.join("drive/store")).unwrap();
+        assert!(s.ready());
+        s.put_chunk(OWNER, &[1; 32], b"sealed", 1 << 20).unwrap();
+        fs::remove_dir_all(top).unwrap();
     }
 
     #[test]
@@ -566,7 +698,7 @@ mod tests {
         s.delete_chunks(OWNER, &[[1; 32]]);
         s.put_chunk(OWNER, &[3; 32], b"z", 8192).unwrap();
         // A fresh store sees the same usage by scanning the disk.
-        assert_eq!(Store::new(dir.clone(), 0).usage(OWNER).unwrap(), 8192);
+        assert_eq!(Store::new(dir.clone(), 0).unwrap().usage(OWNER).unwrap(), 8192);
         fs::remove_dir_all(dir).unwrap();
     }
 

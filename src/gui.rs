@@ -1352,7 +1352,7 @@ impl Gui {
                     .entry("restore-to".into())
                     .or_insert_with(|| Path::new(&home).join("cahoots-restore").to_string_lossy().into_owned());
                 ui.add(egui::TextEdit::singleline(to).desired_width(300.0));
-                let to = to.replacen('~', &home, 1);
+                let to = crate::os::expand_home(to);
                 if ui.add_enabled(!self.picked.is_empty() && !to.is_empty(), egui::Button::new("Restore")).clicked() {
                     let cmd = Cmd::Restore {
                         snap: self.snaps[self.cur].id.clone(),
@@ -1659,7 +1659,7 @@ impl Gui {
                     let home = crate::os::home_text().unwrap_or_default();
                     // The system's own folder chooser, opened where the box points if that exists.
                     if ui.button("Browse...").on_hover_text("Choose the folder in a dialog").clicked() {
-                        let typed = PathBuf::from(text.trim().replacen('~', &home, 1));
+                        let typed = PathBuf::from(crate::os::expand_home(text.trim()));
                         let start = [typed, PathBuf::from(crate::os::DRIVES), PathBuf::from(&home)]
                             .into_iter()
                             .find(|p| p.is_dir())
@@ -1672,7 +1672,7 @@ impl Gui {
                             *text = dir.display().to_string();
                         }
                     }
-                    let path = crate::os::real_path(text.trim().replacen('~', &home, 1)).ok().filter(|p| p.is_dir());
+                    let path = crate::os::real_path(crate::os::expand_home(text.trim())).ok().filter(|p| p.is_dir());
                     if ui.add_enabled(path.is_some(), egui::Button::new("Add")).clicked() {
                         if let Some(path) = path {
                             let name = path
@@ -1722,8 +1722,8 @@ impl Gui {
                 let mut it = got.into_iter();
                 let mut next = || it.next().unwrap_or_default();
                 let (name, endpoint, bucket, region, prefix, ca) = (next(), next(), next(), next(), next(), next());
-                let home = crate::os::home_text().unwrap_or_default();
-                let ca_pem = if ca.is_empty() { Ok(None) } else { std::fs::read_to_string(ca.replacen('~', &home, 1)).map(Some) };
+                let ca_pem =
+                    if ca.is_empty() { Ok(None) } else { std::fs::read_to_string(crate::os::expand_home(&ca)).map(Some) };
                 match ca_pem {
                     Ok(ca_pem) => {
                         let cmd = Cmd::CloudAdd(CloudAdd {

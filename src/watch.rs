@@ -173,6 +173,7 @@ pub async fn run(node: Arc<Node>, out: Out) {
             }
             if last_alert.elapsed() > Duration::from_secs(3600) {
                 last_alert = Instant::now();
+                node.recheck_store().await;
                 let w = node.warnings();
                 if !w.is_empty() && (w != alerted || last_notice.elapsed() > Duration::from_secs(86400)) {
                     last_notice = Instant::now();

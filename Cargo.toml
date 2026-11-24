@@ -18,6 +18,17 @@ eframe = { version = "0.37.0", optional = true, default-features = false, featur
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.37.0", optional = true, default-features = false, features = ["clipboard", "default_fonts", "wgpu"] }
 winapi-util = "0.1.11"
+# For the calls in os::windows::sys.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 windows-registry = "0.6.1"
 
 # Puts the icon and the program's name into the Windows programs.
@@ -49,6 +60,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 rusty-s3 = "0.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+unicode-normalization = "0.1.26"
 tokio = { version = "1.54.1", features = ["full"] }
 toml = "1.2.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "std"] }
@@ -83,6 +95,10 @@ strip = true
 inherits = "release"
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+# A clock that tests of deadlines can stop.
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 [features]
 default = ["gui"]
