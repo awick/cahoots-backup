@@ -26,7 +26,7 @@ jobs:
     outputs:
       version: ${{ steps.read.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: read
         env:
           GH_TOKEN: ${{ github.token }}
@@ -52,19 +52,29 @@ jobs:
           # The older Ubuntu, so the binaries also run on systems with an older C library.
           - { name: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { name: linux-arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
-          # With cahootsw.exe, the same program without a console. It also runs on Arm.
+          # With cahootsw.exe, the same program without a console.
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            features: --features windowed
+          - name: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
             features: --features windowed
     # On Windows too, where it is Git Bash.
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust
         run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
+      # One of the libraries builds part of itself with clang there.
+      - name: clang for Arm Windows
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: |
+          command -v clang >/dev/null || choco install llvm -y --no-progress
+          echo 'C:\Program Files\LLVM\bin' >>"$GITHUB_PATH"
       - name: Build
         run: cargo build --profile dist --locked --target ${{ matrix.target }} ${{ matrix.features }}
       - name: Package
@@ -79,7 +89,7 @@ jobs:
             cp target/${{ matrix.target }}/dist/cahoots "$dir/"
             tar -czf "$dir.tar.gz" "$dir"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: |
@@ -95,7 +105,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - name: Release
@@ -123,7 +133,7 @@ jobs:
           - { arch: amd64, os: ubuntu-24.04 }
           - { arch: arm64, os: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build, try and push
         env:
           VERSION: ${{ needs.version.outputs.version }}
