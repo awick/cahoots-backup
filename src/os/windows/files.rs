@@ -530,7 +530,7 @@ mod tests {
     /// Whether only this user and the system may open `path`; with `own`, by a list of its
     /// own that takes nothing from the folder it is in.
     fn only_mine(path: &Path, own: bool) -> bool {
-        let (text, me) = (dacl(path), super::super::sys::user().unwrap());
+        let (text, me) = (dacl(path), super::super::sys::user_as_listed().unwrap());
         let (flags, entries) = text.strip_prefix("D:").unwrap().split_once('(').unwrap();
         let who: Vec<&str> =
             entries.split(')').filter_map(|e| e.rsplit(';').next()).filter(|w| !w.is_empty()).collect();
@@ -621,10 +621,11 @@ mod tests {
         held.set_private_store().unwrap();
         held.set_private_store().unwrap();
         let me = super::super::sys::user().unwrap().to_string();
-        assert_eq!(who(&dir), (true, vec![me.clone(), "SY".into(), "BA".into()]), "{}", dacl(&dir));
+        let listed = super::super::sys::user_as_listed().unwrap();
+        assert_eq!(who(&dir), (true, vec![listed.clone(), "SY".into(), "BA".into()]), "{}", dacl(&dir));
         // A chunk file has no list of its own: whoever may open the store may open it.
         drop(held.sub("friend".as_ref()).unwrap().create_plain("c".as_ref()).unwrap());
-        assert_eq!(who(&dir.join("friend/c")), (false, vec![me.clone(), "SY".into(), "BA".into()]));
+        assert_eq!(who(&dir.join("friend/c")), (false, vec![listed, "SY".into(), "BA".into()]));
         assert!(held.sub("friend".as_ref()).unwrap().create_plain("c".as_ref()).is_err(), "the name is taken");
         drop(held);
         // Another account's, which this one has full control of (as one is once given it, see

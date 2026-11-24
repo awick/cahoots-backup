@@ -259,6 +259,15 @@ fn security(h: &impl AsRawHandle, what: u32) -> io::Result<Descriptor> {
     Ok(Descriptor(Local(sd)))
 }
 
+/// This user as Windows writes them in a list of who may do what: by id, or by the short
+/// name it has for a few accounts (`LA`, the administrator a computer starts out with, which
+/// is who a GitHub runner works as).
+#[cfg(test)]
+pub fn user_as_listed() -> io::Result<String> {
+    let text = Descriptor::new(&format!("D:(A;;FA;;;{})", user()?))?.dacl_text()?;
+    Ok(text.trim_end_matches(')').rsplit(';').next().unwrap_or_default().to_string())
+}
+
 /// Who owns what `h` has open.
 pub fn owner(h: &impl AsRawHandle) -> io::Result<String> {
     let sd = security(h, OWNER_SECURITY_INFORMATION)?;

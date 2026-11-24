@@ -265,9 +265,9 @@ mod tests {
         let _listener = listen(&home).unwrap();
         let s = connect(&home).await.expect("the daemon's own pipe");
         // Nobody else may open the pipe at all.
-        let me = sys::user().unwrap();
+        let (me, listed) = (sys::user().unwrap(), sys::user_as_listed().unwrap());
         let dacl = sys::dacl(&s).unwrap();
-        assert!(dacl.starts_with("D:P") && dacl.ends_with(&format!("(A;;FA;;;{me})(A;;FA;;;SY)")), "{dacl}");
+        assert!(dacl.starts_with("D:P") && dacl.ends_with(&format!("(A;;FA;;;{listed})(A;;FA;;;SY)")), "{dacl}");
         drop(s);
         #[cfg(feature = "gui")]
         {
